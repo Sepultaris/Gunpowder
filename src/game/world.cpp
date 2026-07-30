@@ -1212,23 +1212,23 @@ void World::buildDirectionalSunHorizon(
             }
     };
 
-    cells_.forEachAllocatedPage(
-        [&](std::size_t firstIndex,
-            const SparseGrid<Material>::Page& page) {
+    cells_.forEachAllocatedChunk(
+        [&](int chunkX, int chunkY,
+            const SparseGrid<Material>::Chunk& chunk) {
             const float maximumPerpendicularCoordinate =
                 minimumPerpendicularCoordinate +
                 static_cast<float>(sampleCount) / samplesPerCell;
-            const std::size_t pageEnd =
-                std::min(cells_.size(), firstIndex + page.size());
-            std::size_t cursor = firstIndex;
-            while (cursor < pageEnd) {
-                const int y = static_cast<int>(
-                    cursor / static_cast<std::size_t>(width));
-                const int beginX = static_cast<int>(
-                    cursor % static_cast<std::size_t>(width));
-                const int rowCells = std::min(
-                    width - beginX,
-                    static_cast<int>(pageEnd - cursor));
+            const int chunkMinX =
+                chunkX * SparseGrid<Material>::chunkSize;
+            const int chunkMinY =
+                chunkY * SparseGrid<Material>::chunkSize;
+            const int chunkMaxX = std::min(
+                width, chunkMinX + SparseGrid<Material>::chunkSize);
+            const int chunkMaxY = std::min(
+                height, chunkMinY + SparseGrid<Material>::chunkSize);
+            for (int y = chunkMinY; y < chunkMaxY; ++y) {
+                const int beginX = chunkMinX;
+                const int rowCells = chunkMaxX - chunkMinX;
                 const int endX = beginX + rowCells;
                 const std::array<float, 4> segmentCorners{
                     perpendicularCoordinate(
@@ -1253,7 +1253,10 @@ void World::buildDirectionalSunHorizon(
                     *segmentMinimum - projectedHalfExtent <=
                         maximumPerpendicularCoordinate) {
                     const std::size_t localBegin =
-                        cursor - firstIndex;
+                        static_cast<std::size_t>(
+                            y - chunkMinY) *
+                        static_cast<std::size_t>(
+                            SparseGrid<Material>::chunkSize);
                     for (int offset = 0; offset < rowCells; ++offset) {
                         const int x = beginX + offset;
                         const float perpendicular =
@@ -1267,14 +1270,13 @@ void World::buildDirectionalSunHorizon(
                             continue;
                         }
                         if (isSkyOccluder(
-                                page[localBegin +
-                                     static_cast<std::size_t>(
-                                         offset)])) {
+                                chunk[localBegin +
+                                      static_cast<std::size_t>(
+                                          offset)])) {
                             rasterizeCell(x, y);
                         }
                     }
                 }
-                cursor += static_cast<std::size_t>(rowCells);
             }
         });
 

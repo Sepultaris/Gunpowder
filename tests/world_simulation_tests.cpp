@@ -97,6 +97,58 @@ float averageLiquidSurface(const gunpowder::World& world,
 } // namespace
 
 int main() {
+    gunpowder::ChunkGrid<std::uint8_t> spatialChunks(
+        130, 130, 0);
+    spatialChunks.set(63, 63, 11);
+    spatialChunks.set(64, 64, 22);
+    spatialChunks.set(129, 129, 33);
+    spatialChunks.set(128, 0, 0);
+    if (!spatialChunks.hasChunk(0, 0) ||
+        !spatialChunks.hasChunk(1, 1) ||
+        !spatialChunks.hasChunk(2, 2) ||
+        spatialChunks.hasChunk(2, 0) ||
+        spatialChunks.allocatedChunkCount() != 3) {
+        std::cerr << "Spatial chunk allocation crossed a chunk boundary\n";
+        return 1;
+    }
+    if (spatialChunks.get(63, 63) != 11 ||
+        spatialChunks.get(64, 64) != 22 ||
+        spatialChunks.get(129, 129) != 33 ||
+        spatialChunks.get(0, 129) != 0) {
+        std::cerr << "Spatial chunk address mapping is incorrect\n";
+        return 1;
+    }
+
+    std::array<bool, 9> visitedChunks{};
+    spatialChunks.forEachAllocatedChunk(
+        [&](int chunkX, int chunkY, const auto&) {
+            visitedChunks[static_cast<std::size_t>(
+                chunkY * spatialChunks.chunksWide() + chunkX)] = true;
+        });
+    if (!visitedChunks[0] || !visitedChunks[4] ||
+        !visitedChunks[8]) {
+        std::cerr << "Allocated chunk traversal lost spatial coordinates\n";
+        return 1;
+    }
+
+    spatialChunks.set(129, 129, 0);
+    spatialChunks.releaseDefaultChunksOutside(0, 0, 64, 64);
+    if (spatialChunks.hasChunk(2, 2) ||
+        !spatialChunks.hasChunk(0, 0) ||
+        spatialChunks.get(64, 64) != 22) {
+        std::cerr << "Default chunk reclamation removed persistent state\n";
+        return 1;
+    }
+
+    const auto copiedSpatialChunks = spatialChunks;
+    spatialChunks.reset(7);
+    if (copiedSpatialChunks.get(64, 64) != 22 ||
+        spatialChunks.get(64, 64) != 7 ||
+        spatialChunks.allocatedChunkCount() != 0) {
+        std::cerr << "Spatial chunk copy/reset was not isolated\n";
+        return 1;
+    }
+
     gunpowder::SparseGrid<std::uint8_t> streamedState(
         4096, 2048, 0);
     const std::size_t distantState =

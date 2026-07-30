@@ -33,7 +33,9 @@ struct MaterialSimulationTimings {
     std::uint32_t activeLiquidChunks = 0;
     std::uint32_t activeGasChunks = 0;
     std::uint32_t activeThermalChunks = 0;
+    std::uint32_t activeGranularMicrotiles = 0;
     std::uint32_t activeLiquidMicrotiles = 0;
+    std::uint32_t activeGasMicrotiles = 0;
     std::uint32_t activeThermalMicrotiles = 0;
     std::uint32_t liquidPreparationCellVisits = 0;
     std::uint32_t liquidHeadSummaryHits = 0;

@@ -2671,11 +2671,19 @@ void World::updateMaterials() {
     std::uint32_t activeLiquidChunkCount = 0;
     std::uint32_t activeGasChunkCount = 0;
     std::uint32_t activeThermalChunkCount = 0;
+    std::uint32_t activeGranularMicrotileCount = 0;
     std::uint32_t activeLiquidMicrotileCount = 0;
+    std::uint32_t activeGasMicrotileCount = 0;
     std::uint32_t activeThermalMicrotileCount = 0;
+    constexpr std::size_t granularSystem =
+        std::countr_zero(
+            static_cast<unsigned int>(granularActivity));
     constexpr std::size_t liquidSystem =
         std::countr_zero(
             static_cast<unsigned int>(liquidActivity));
+    constexpr std::size_t gasSystem =
+        std::countr_zero(
+            static_cast<unsigned int>(gasActivity));
     constexpr std::size_t thermalSystem =
         std::countr_zero(
             static_cast<unsigned int>(thermalActivity));
@@ -2701,10 +2709,18 @@ void World::updateMaterials() {
                 materialChunkActivity_[
                     static_cast<std::size_t>(
                         chunkY * chunkColumns + chunkX)];
+            activeGranularMicrotileCount +=
+                static_cast<std::uint32_t>(
+                    std::popcount(
+                        activity.microtiles[granularSystem]));
             activeLiquidMicrotileCount +=
                 static_cast<std::uint32_t>(
                     std::popcount(
                         activity.microtiles[liquidSystem]));
+            activeGasMicrotileCount +=
+                static_cast<std::uint32_t>(
+                    std::popcount(
+                        activity.microtiles[gasSystem]));
             activeThermalMicrotileCount +=
                 static_cast<std::uint32_t>(
                     std::popcount(
@@ -2720,8 +2736,12 @@ void World::updateMaterials() {
         activeGasChunkCount;
     materialSimulationTimings_.activeThermalChunks =
         activeThermalChunkCount;
+    materialSimulationTimings_.activeGranularMicrotiles =
+        activeGranularMicrotileCount;
     materialSimulationTimings_.activeLiquidMicrotiles =
         activeLiquidMicrotileCount;
+    materialSimulationTimings_.activeGasMicrotiles =
+        activeGasMicrotileCount;
     materialSimulationTimings_.activeThermalMicrotiles =
         activeThermalMicrotileCount;
     for (int chunkY = firstChunkY; chunkY < finalChunkY; ++chunkY) {
@@ -2739,8 +2759,28 @@ void World::updateMaterials() {
             const int endY = std::min(
                 bounds.maxY, (chunkY + 1) * chunkSize);
             for (int y = beginY; y < endY; ++y) {
-                for (int x = beginX; x < endX; ++x) {
-                    moved_.set(indexOf(x, y), 0);
+                for (int microtileX = 0;
+                     microtileX < materialMicrotilesPerAxis;
+                     ++microtileX) {
+                    const int tileOriginX =
+                        chunkX * chunkSize +
+                        microtileX *
+                            materialMicrotileSize;
+                    const int tileBeginX =
+                        std::max(beginX, tileOriginX);
+                    const int tileEndX = std::min(
+                        endX,
+                        tileOriginX +
+                            materialMicrotileSize);
+                    if (tileBeginX >= tileEndX ||
+                        !materialMicrotileActive(
+                            tileBeginX, y)) {
+                        continue;
+                    }
+                    for (int x = tileBeginX;
+                         x < tileEndX; ++x) {
+                        moved_.set(indexOf(x, y), 0);
+                    }
                 }
             }
         }
@@ -2772,10 +2812,23 @@ void World::updateMaterials() {
                                  granularActivity)) {
           continue;
         }
-        const int beginX = std::max(bounds.minX, chunkX * chunkSize);
-        const int endX = std::min(bounds.maxX, (chunkX + 1) * chunkSize);
-        for (int localStep = 0; localStep < endX - beginX; ++localStep) {
-          const int x = scanRight ? beginX + localStep : endX - 1 - localStep;
+        const int chunkOriginX = chunkX * chunkSize;
+        for (int tileStep = 0; tileStep < materialMicrotilesPerAxis;
+             ++tileStep) {
+          const int microtileX =
+              scanRight ? tileStep : materialMicrotilesPerAxis - 1 - tileStep;
+          const int tileOriginX =
+              chunkOriginX + microtileX * materialMicrotileSize;
+          const int beginX = std::max(bounds.minX, tileOriginX);
+          const int endX =
+              std::min(bounds.maxX, tileOriginX + materialMicrotileSize);
+          if (beginX >= endX ||
+              !materialMicrotileActive(beginX, y, granularActivity)) {
+            continue;
+          }
+          for (int localStep = 0; localStep < endX - beginX; ++localStep) {
+            const int x =
+                scanRight ? beginX + localStep : endX - 1 - localStep;
           const std::size_t index = indexOf(x, y);
           if (moved_[index] != 0) {
             continue;
@@ -2850,6 +2903,7 @@ void World::updateMaterials() {
             granularVelocityY_[destination] = 0.0F;
             granularFallRemainder_[destination] = 0.0F;
           }
+          }
         }
       }
     }
@@ -2903,17 +2957,41 @@ void World::updateMaterials() {
                                  gasActivity)) {
           continue;
         }
-        const int beginX = std::max(bounds.minX, chunkX * chunkSize);
-        const int endX = std::min(bounds.maxX, (chunkX + 1) * chunkSize);
-        const int rowWidth = endX - beginX;
-        const int rowOffset =
-            rowWidth > 1
-                ? std::uniform_int_distribution<int>(0, rowWidth - 1)(random_)
-                : 0;
-        for (int localStep = 0; localStep < rowWidth; ++localStep) {
-          const int rowPosition = (localStep + rowOffset) % rowWidth;
-          const int x =
-              scanRight ? beginX + rowPosition : endX - 1 - rowPosition;
+        const int chunkOriginX = chunkX * chunkSize;
+        const int microtileOffset =
+            std::uniform_int_distribution<int>(
+                0, materialMicrotilesPerAxis - 1)(random_);
+        for (int tileStep = 0;
+             tileStep < materialMicrotilesPerAxis; ++tileStep) {
+          const int microtileX =
+              (tileStep + microtileOffset) %
+              materialMicrotilesPerAxis;
+          const int tileOriginX =
+              chunkOriginX +
+              microtileX * materialMicrotileSize;
+          const int beginX =
+              std::max(bounds.minX, tileOriginX);
+          const int endX = std::min(
+              bounds.maxX,
+              tileOriginX + materialMicrotileSize);
+          if (beginX >= endX ||
+              !materialMicrotileActive(
+                  beginX, y, gasActivity)) {
+            continue;
+          }
+          const int rowWidth = endX - beginX;
+          const int rowOffset =
+              rowWidth > 1
+                  ? std::uniform_int_distribution<int>(
+                        0, rowWidth - 1)(random_)
+                  : 0;
+          for (int localStep = 0;
+               localStep < rowWidth; ++localStep) {
+            const int rowPosition =
+                (localStep + rowOffset) % rowWidth;
+            const int x =
+                scanRight ? beginX + rowPosition
+                          : endX - 1 - rowPosition;
           const std::size_t index = indexOf(x, y);
           if (moved_[index] != 0) {
             continue;
@@ -3030,6 +3108,7 @@ void World::updateMaterials() {
               }
               gasDrift_[index] = static_cast<std::int8_t>(-drift);
             }
+          }
           }
         }
       }

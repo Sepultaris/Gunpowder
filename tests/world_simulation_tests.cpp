@@ -207,6 +207,19 @@ int main() {
         std::cerr << "Smoke woke unrelated material systems\n";
         return 1;
     }
+    const auto smokeMicrotile =
+        activityWorld.materialMicrotileActivityForTest(
+            activityX, activityY);
+    const auto distantSmokeMicrotile =
+        activityWorld.materialMicrotileActivityForTest(
+            activityX + 24, activityY);
+    if (smokeMicrotile[0] || smokeMicrotile[1] ||
+        !smokeMicrotile[2] || !smokeMicrotile[3] ||
+        distantSmokeMicrotile[2] ||
+        distantSmokeMicrotile[3]) {
+        std::cerr << "Smoke wake escaped its microtile halo\n";
+        return 1;
+    }
 
     activityWorld.setCellForTest(
         activityX, activityY, gunpowder::Material::air);
@@ -219,6 +232,21 @@ int main() {
     if (!topologyActivity[0] || !topologyActivity[1] ||
         !topologyActivity[2] || !topologyActivity[3]) {
         std::cerr << "A changed solid boundary did not wake its neighbors\n";
+        return 1;
+    }
+    const auto sandMicrotile =
+        activityWorld.materialMicrotileActivityForTest(
+            activityX, activityY);
+    const auto distantSandMicrotile =
+        activityWorld.materialMicrotileActivityForTest(
+            activityX + 24, activityY);
+    if (!sandMicrotile[0] || !sandMicrotile[1] ||
+        !sandMicrotile[2] || !sandMicrotile[3] ||
+        distantSandMicrotile[0] ||
+        distantSandMicrotile[1] ||
+        distantSandMicrotile[2] ||
+        distantSandMicrotile[3]) {
+        std::cerr << "Solid-boundary wake escaped its microtile halo\n";
         return 1;
     }
 

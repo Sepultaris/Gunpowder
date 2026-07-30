@@ -139,6 +139,14 @@ public:
         return chunks_[chunkKey(chunkX, chunkY)] != nullptr;
     }
 
+    // Allocate sparse storage before a parallel pass. Workers may then safely
+    // write distinct cells without racing the lazy-allocation path.
+    void ensureChunkAllocated(int chunkX, int chunkY) {
+        assert(chunkX >= 0 && chunkX < chunksWide_);
+        assert(chunkY >= 0 && chunkY < chunksHigh_);
+        (void)ensureChunk(chunkKey(chunkX, chunkY));
+    }
+
     [[nodiscard]] bool hasPage(int pageX, int pageY) const {
         return hasChunk(pageX, pageY);
     }

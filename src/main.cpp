@@ -599,6 +599,10 @@ bool drawDeveloperUi(bool* open,
             materialTimings.liquidGravityConflicts,
             materialTimings.liquidLateralConflicts);
         ImGui::TextDisabled(
+            "Liquid vertical phase: %u column passes | %u parallel moves",
+            materialTimings.parallelLiquidColumnVisits,
+            materialTimings.parallelLiquidVerticalMoves);
+        ImGui::TextDisabled(
             "Liquid prep %u cells | Edge cache %u columns | "
             "Equalization seeds %u cells",
             materialTimings.liquidPreparationCellVisits,

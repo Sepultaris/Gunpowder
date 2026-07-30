@@ -2670,6 +2670,8 @@ void World::updateMaterials() {
     currentLiquidMoveConflicts_ = 0;
     currentLiquidGravityConflicts_ = 0;
     currentLiquidLateralConflicts_ = 0;
+    currentParallelLiquidColumnVisits_ = 0;
+    currentParallelLiquidVerticalMoves_ = 0;
     rebuildLiquidWorklist_ = true;
     constexpr int chunkColumns =
         (width + chunkSize - 1) / chunkSize;
@@ -3844,6 +3846,10 @@ void World::updateMaterials() {
         currentLiquidGravityConflicts_;
     materialSimulationTimings_.liquidLateralConflicts =
         currentLiquidLateralConflicts_;
+    materialSimulationTimings_.parallelLiquidColumnVisits =
+        currentParallelLiquidColumnVisits_;
+    materialSimulationTimings_.parallelLiquidVerticalMoves =
+        currentParallelLiquidVerticalMoves_;
 }
 
 void World::cacheLiquidColumnHeads(const ActiveBounds& bounds) {
@@ -4325,31 +4331,30 @@ void World::updateLiquids(const ActiveBounds& bounds, bool waterOnly) {
         return liquidEqualizationReservation_[target] == 0 &&
                moved_[target] == 0 && isOpen(cells_[target]);
     };
+    const auto accumulateLiquidMomentum = [](int previous, int impulse) {
+        if (impulse == 0) {
+            return previous * 3 / 4;
+        }
+        const bool reversing =
+            previous != 0 && ((previous < 0) != (impulse < 0));
+        const int retained =
+            reversing ? previous / 4 : previous * 3 / 4;
+        return std::clamp(retained + impulse * 3 / 4, -127, 127);
+    };
     const auto moveLiquid = [&](int fromX, int fromY, int toX, int toY,
-                                 int flowX, int flowY) {
+                                  int flowX, int flowY) {
         const std::size_t from = indexOf(fromX, fromY);
         const std::size_t to = indexOf(toX, toY);
         const int previousFlowX =
             static_cast<int>(liquidFlowX_[from]);
         const int previousFlowY =
             static_cast<int>(liquidFlowY_[from]);
-        const auto accumulateMomentum = [](int previous, int impulse) {
-            if (impulse == 0) {
-                return previous * 3 / 4;
-            }
-            const bool reversing =
-                previous != 0 && ((previous < 0) != (impulse < 0));
-            const int retained = reversing ? previous / 4
-                                           : previous * 3 / 4;
-            return std::clamp(retained + impulse * 3 / 4,
-                              -127, 127);
-        };
         swapCells(fromX, fromY, toX, toY);
         liquidAmount_[to] = maximumLiquidMass;
         liquidFlowX_[to] = static_cast<std::int8_t>(
-            accumulateMomentum(previousFlowX, flowX));
+            accumulateLiquidMomentum(previousFlowX, flowX));
         liquidFlowY_[to] = static_cast<std::int8_t>(
-            accumulateMomentum(previousFlowY, flowY));
+            accumulateLiquidMomentum(previousFlowY, flowY));
         moved_[from] = toY > fromY ? 2 : 1;
         moved_[to] = 1;
         for (int offsetY = -1; offsetY <= 1; ++offsetY) {
@@ -4612,9 +4617,270 @@ void World::updateLiquids(const ActiveBounds& bounds, bool waterOnly) {
         }
     }
     if (!useParallelLiquidTransport) {
+        struct VerticalMoveSideEffects {
+            std::size_t source = 0;
+            std::size_t destination = 0;
+            std::uint8_t activityMask = 0;
+        };
+
+        // Direct downward transport is column-local. Owning complete columns
+        // gives each worker disjoint writable cells while retaining the live
+        // bottom-up cascade that snapshot proposals lost. Sparse metadata is
+        // allocated serially before workers enter the grid.
+        const int firstColumn = std::max(0, bounds.minX);
+        const int finalColumn = std::min(width, bounds.maxX);
+        const int columnCount = std::max(0, finalColumn - firstColumn);
+        const std::size_t verticalJobCount =
+            liquidWorklist_.empty() || columnCount == 0
+                ? 0
+                : std::min<std::size_t>(
+                      materialExecutor().workerCount(),
+                      static_cast<std::size_t>(
+                          (columnCount + 31) / 32));
+        std::vector<std::size_t> columnOffsets(
+            static_cast<std::size_t>(columnCount) + 1, 0);
+        for (std::size_t source : liquidWorklist_) {
+            const int x = static_cast<int>(
+                source % static_cast<std::size_t>(width));
+            if (x >= firstColumn && x < finalColumn) {
+                ++columnOffsets[static_cast<std::size_t>(
+                    x - firstColumn + 1)];
+            }
+        }
+        for (std::size_t column = 1;
+             column < columnOffsets.size(); ++column) {
+            columnOffsets[column] += columnOffsets[column - 1];
+        }
+        if (verticalJobCount > 1) {
+            for (int column = 0; column < columnCount; ++column) {
+                currentParallelLiquidColumnVisits_ +=
+                    columnOffsets[static_cast<std::size_t>(
+                        column + 1)] !=
+                            columnOffsets[static_cast<std::size_t>(
+                                column)]
+                        ? 1U
+                        : 0U;
+            }
+        }
+        std::vector<std::size_t> columnWriteOffsets = columnOffsets;
+        std::vector<std::size_t> columnSources(
+            columnOffsets.empty() ? 0 : columnOffsets.back());
+        for (std::size_t source : liquidWorklist_) {
+            const int x = static_cast<int>(
+                source % static_cast<std::size_t>(width));
+            if (x < firstColumn || x >= finalColumn) {
+                continue;
+            }
+            const std::size_t column = static_cast<std::size_t>(
+                x - firstColumn);
+            columnSources[columnWriteOffsets[column]++] = source;
+        }
+
+        if (verticalJobCount > 1) {
+            std::vector<std::uint32_t> storageChunks;
+            storageChunks.reserve(liquidWorklist_.size() / 16 + 1);
+            constexpr int chunkColumns =
+                (width + chunkSize - 1) / chunkSize;
+            for (std::size_t source : liquidWorklist_) {
+                const int x = static_cast<int>(
+                    source % static_cast<std::size_t>(width));
+                const int y = static_cast<int>(
+                    source / static_cast<std::size_t>(width));
+                storageChunks.push_back(static_cast<std::uint32_t>(
+                    (y / chunkSize) * chunkColumns +
+                    x / chunkSize));
+                if ((y + 1) / chunkSize != y / chunkSize) {
+                    storageChunks.push_back(static_cast<std::uint32_t>(
+                        ((y + 1) / chunkSize) * chunkColumns +
+                        x / chunkSize));
+                }
+            }
+            std::sort(storageChunks.begin(), storageChunks.end());
+            storageChunks.erase(
+                std::unique(storageChunks.begin(), storageChunks.end()),
+                storageChunks.end());
+            for (std::uint32_t key : storageChunks) {
+                const int chunkX =
+                    static_cast<int>(key) % chunkColumns;
+                const int chunkY =
+                    static_cast<int>(key) / chunkColumns;
+                cells_.ensureChunkAllocated(chunkX, chunkY);
+                liquidAmount_.ensureChunkAllocated(chunkX, chunkY);
+                liquidFlowX_.ensureChunkAllocated(chunkX, chunkY);
+                liquidFlowY_.ensureChunkAllocated(chunkX, chunkY);
+                liquidHeadDepth_.ensureChunkAllocated(chunkX, chunkY);
+                liquidFoam_.ensureChunkAllocated(chunkX, chunkY);
+                liquidEqualizationReservation_.ensureChunkAllocated(
+                    chunkX, chunkY);
+                heat_.ensureChunkAllocated(chunkX, chunkY);
+                burnProgress_.ensureChunkAllocated(chunkX, chunkY);
+                gasLifetime_.ensureChunkAllocated(chunkX, chunkY);
+                gasDrift_.ensureChunkAllocated(chunkX, chunkY);
+                granularVelocityY_.ensureChunkAllocated(chunkX, chunkY);
+                granularFallRemainder_.ensureChunkAllocated(
+                    chunkX, chunkY);
+                moved_.ensureChunkAllocated(chunkX, chunkY);
+            }
+        }
+
+        std::vector<std::vector<VerticalMoveSideEffects>>
+            verticalSideEffects(verticalJobCount);
+        std::vector<std::uint32_t> verticalProposals(
+            verticalJobCount, 0);
+        std::vector<std::uint32_t> verticalAccepted(
+            verticalJobCount, 0);
+        const std::size_t verticalJobDivisor =
+            std::max<std::size_t>(1, verticalJobCount);
+        materialExecutor().run(
+            verticalJobCount > 1 ? verticalJobCount : 0,
+            [&](std::size_t jobIndex) {
+                const int beginColumn =
+                    columnCount * static_cast<int>(jobIndex) /
+                    static_cast<int>(verticalJobDivisor);
+                const int endColumn =
+                    columnCount * static_cast<int>(jobIndex + 1) /
+                    static_cast<int>(verticalJobDivisor);
+                auto& sideEffects = verticalSideEffects[jobIndex];
+                for (int localColumn = beginColumn;
+                     localColumn < endColumn; ++localColumn) {
+                    const int x = firstColumn + localColumn;
+                    const std::size_t begin =
+                        columnOffsets[static_cast<std::size_t>(
+                            localColumn)];
+                    const std::size_t end =
+                        columnOffsets[static_cast<std::size_t>(
+                            localColumn + 1)];
+                    for (std::size_t position = end;
+                         position > begin; --position) {
+                        const std::size_t source =
+                            columnSources[position - 1];
+                        const int y = static_cast<int>(
+                            source /
+                            static_cast<std::size_t>(width));
+                        const Material material = cells_[source];
+                        if (!isLiquid(material) ||
+                            (waterOnly &&
+                             material != Material::water) ||
+                            moved_[source] != 0 ||
+                            y >= height - 1 ||
+                            !targetInBounds(x, y + 1)) {
+                            continue;
+                        }
+                        liquidAmount_[source] = maximumLiquidMass;
+                        const std::size_t destination =
+                            indexOf(x, y + 1);
+                        const Material destinationMaterial =
+                            cells_[destination];
+                        const bool densitySwap =
+                            material == Material::water &&
+                            destinationMaterial == Material::oil &&
+                            liquidEqualizationReservation_[
+                                destination] == 0 &&
+                            moved_[destination] != 1;
+                        const bool directFall =
+                            liquidEqualizationReservation_[
+                                destination] == 0 &&
+                            (moved_[destination] == 0 ||
+                             moved_[destination] == 2) &&
+                            isOpen(destinationMaterial);
+                        if (!densitySwap && !directFall) {
+                            continue;
+                        }
+
+                        ++verticalProposals[jobIndex];
+                        const int previousFlowX =
+                            static_cast<int>(liquidFlowX_[source]);
+                        const int previousFlowY =
+                            static_cast<int>(liquidFlowY_[source]);
+                        std::swap(cells_[source], cells_[destination]);
+                        std::swap(liquidAmount_[source],
+                                  liquidAmount_[destination]);
+                        std::swap(liquidFlowX_[source],
+                                  liquidFlowX_[destination]);
+                        std::swap(liquidFlowY_[source],
+                                  liquidFlowY_[destination]);
+                        std::swap(liquidHeadDepth_[source],
+                                  liquidHeadDepth_[destination]);
+                        std::swap(liquidFoam_[source],
+                                  liquidFoam_[destination]);
+                        std::swap(heat_[source], heat_[destination]);
+                        std::swap(burnProgress_[source],
+                                  burnProgress_[destination]);
+                        std::swap(gasLifetime_[source],
+                                  gasLifetime_[destination]);
+                        std::swap(gasDrift_[source],
+                                  gasDrift_[destination]);
+                        std::swap(granularVelocityY_[source],
+                                  granularVelocityY_[destination]);
+                        std::swap(granularFallRemainder_[source],
+                                  granularFallRemainder_[destination]);
+                        liquidAmount_[destination] =
+                            maximumLiquidMass;
+                        liquidFlowX_[destination] =
+                            static_cast<std::int8_t>(
+                                accumulateLiquidMomentum(
+                                    previousFlowX, 0));
+                        liquidFlowY_[destination] =
+                            static_cast<std::int8_t>(
+                                accumulateLiquidMomentum(
+                                    previousFlowY,
+                                    densitySwap ? 96 : 127));
+                        moved_[source] = 2;
+                        moved_[destination] = 1;
+                        sideEffects.push_back({
+                            source,
+                            destination,
+                            static_cast<std::uint8_t>(
+                                materialActivityMask(material) |
+                                materialActivityMask(
+                                    destinationMaterial)),
+                        });
+                        ++verticalAccepted[jobIndex];
+                    }
+                }
+            });
+        for (std::size_t jobIndex = 0;
+             jobIndex < verticalJobCount; ++jobIndex) {
+            currentLiquidMoveProposals_ +=
+                verticalProposals[jobIndex];
+            currentLiquidMovesAccepted_ +=
+                verticalAccepted[jobIndex];
+            currentParallelLiquidVerticalMoves_ +=
+                verticalAccepted[jobIndex];
+            for (const VerticalMoveSideEffects& effect :
+                 verticalSideEffects[jobIndex]) {
+                const int sourceX = static_cast<int>(
+                    effect.source %
+                    static_cast<std::size_t>(width));
+                const int sourceY = static_cast<int>(
+                    effect.source /
+                    static_cast<std::size_t>(width));
+                const int destinationX = static_cast<int>(
+                    effect.destination %
+                    static_cast<std::size_t>(width));
+                const int destinationY = static_cast<int>(
+                    effect.destination /
+                    static_cast<std::size_t>(width));
+                markMaterialActive(
+                    sourceX, sourceY, effect.activityMask);
+                markMaterialActive(
+                    destinationX, destinationY,
+                    effect.activityMask);
+                for (int offsetY = -1; offsetY <= 1; ++offsetY) {
+                    for (int offsetX = -1;
+                         offsetX <= 1; ++offsetX) {
+                        enqueueNext(
+                            destinationX + offsetX,
+                            destinationY + offsetY);
+                    }
+                }
+            }
+        }
+
         // The worklist is row-sorted, so reverse iteration is a true
         // bottom-up pass. Each accepted move is visible to the next source,
-        // allowing a vertical stream to fall coherently within this substep.
+        // allowing diagonal and boundary movement to resolve against the live
+        // result of the parallel column-owned vertical phase.
         for (auto iterator = liquidWorklist_.rbegin();
              iterator != liquidWorklist_.rend(); ++iterator) {
             const std::size_t source = *iterator;

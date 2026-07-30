@@ -53,6 +53,8 @@ struct MaterialSimulationTimings {
     std::uint32_t liquidMoveConflicts = 0;
     std::uint32_t liquidGravityConflicts = 0;
     std::uint32_t liquidLateralConflicts = 0;
+    std::uint32_t parallelLiquidColumnVisits = 0;
+    std::uint32_t parallelLiquidVerticalMoves = 0;
     std::uint32_t liquidPreparationCellVisits = 0;
     std::uint32_t liquidHeadSummaryHits = 0;
     std::uint32_t liquidEqualizationSeedVisits = 0;
@@ -419,6 +421,8 @@ private:
     std::uint32_t currentLiquidMoveConflicts_ = 0;
     std::uint32_t currentLiquidGravityConflicts_ = 0;
     std::uint32_t currentLiquidLateralConflicts_ = 0;
+    std::uint32_t currentParallelLiquidColumnVisits_ = 0;
+    std::uint32_t currentParallelLiquidVerticalMoves_ = 0;
     std::vector<MaterialChunkActivity> materialChunkActivity_;
     std::vector<std::unique_ptr<LiquidChunkColumnSummary>>
         liquidChunkColumnSummaries_;

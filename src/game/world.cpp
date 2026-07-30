@@ -2665,6 +2665,9 @@ void World::updateMaterials() {
     currentLiquidEqualizationSeedVisits_ = 0;
     currentEqualizedComponents_ = 0;
     currentEqualizedCells_ = 0;
+    currentLiquidMoveProposals_ = 0;
+    currentLiquidMovesAccepted_ = 0;
+    currentLiquidMoveConflicts_ = 0;
     rebuildLiquidWorklist_ = true;
     constexpr int chunkColumns =
         (width + chunkSize - 1) / chunkSize;
@@ -2744,6 +2747,8 @@ void World::updateMaterials() {
         activeGasChunkCount;
     materialSimulationTimings_.activeThermalChunks =
         activeThermalChunkCount;
+    materialSimulationTimings_.parallelLiquidChunks =
+        activeLiquidChunkCount;
     materialSimulationTimings_.activeGranularMicrotiles =
         activeGranularMicrotileCount;
     materialSimulationTimings_.activeLiquidMicrotiles =
@@ -3827,6 +3832,12 @@ void World::updateMaterials() {
         currentEqualizedComponents_;
     materialSimulationTimings_.equalizedCells =
         currentEqualizedCells_;
+    materialSimulationTimings_.liquidMoveProposals =
+        currentLiquidMoveProposals_;
+    materialSimulationTimings_.liquidMovesAccepted =
+        currentLiquidMovesAccepted_;
+    materialSimulationTimings_.liquidMoveConflicts =
+        currentLiquidMoveConflicts_;
 }
 
 void World::cacheLiquidColumnHeads(const ActiveBounds& bounds) {
@@ -4000,6 +4011,15 @@ void World::updateLiquids(const ActiveBounds& bounds, bool waterOnly) {
         return material == Material::air || material == Material::fire ||
                material == Material::smoke || material == Material::steam;
     };
+    const auto& liquidSelectionCells =
+        std::as_const(cells_);
+    const auto materialAt = [&](int x, int y) {
+        if (x < 0 || x >= width ||
+            y < 0 || y >= height) {
+            return Material::rock;
+        }
+        return liquidSelectionCells[indexOf(x, y)];
+    };
     const auto isCandidate = [&](std::size_t index) {
         const int x = static_cast<int>(
             index % static_cast<std::size_t>(width));
@@ -4019,19 +4039,19 @@ void World::updateLiquids(const ActiveBounds& bounds, bool waterOnly) {
         }
         const bool freeSurface =
             y <= bounds.minY ||
-            cell(x, y - 1) != material ||
-            cell(x - 1, y - 1) != material ||
-            cell(x + 1, y - 1) != material;
+            materialAt(x, y - 1) != material ||
+            materialAt(x - 1, y - 1) != material ||
+            materialAt(x + 1, y - 1) != material;
         const bool canDescend =
-            isOpen(cell(x, y + 1)) ||
-            isOpen(cell(x - 1, y + 1)) ||
-            isOpen(cell(x + 1, y + 1));
+            isOpen(materialAt(x, y + 1)) ||
+            isOpen(materialAt(x - 1, y + 1)) ||
+            isOpen(materialAt(x + 1, y + 1));
         const bool lateralBoundary =
-            isOpen(cell(x - 1, y)) ||
-            isOpen(cell(x + 1, y));
+            isOpen(materialAt(x - 1, y)) ||
+            isOpen(materialAt(x + 1, y));
         const bool densityBoundary =
             material == Material::water &&
-            cell(x, y + 1) == Material::oil;
+            materialAt(x, y + 1) == Material::oil;
         const bool carriesMomentum =
             std::abs(static_cast<int>(liquidFlowX_[index])) > 10 ||
             std::abs(static_cast<int>(liquidFlowY_[index])) > 10;
@@ -4047,73 +4067,176 @@ void World::updateLiquids(const ActiveBounds& bounds, bool waterOnly) {
         const int firstChunkX = bounds.minX / chunkSize;
         const int finalChunkX =
             (bounds.maxX + chunkSize - 1) / chunkSize;
-        liquidWorklist_.clear();
-        for (int y = bounds.minY; y < bounds.maxY; ++y) {
-            const std::size_t rowWorkBegin = liquidWorklist_.size();
-            const int chunkY = y / chunkSize;
-            for (int chunkX = firstChunkX; chunkX < finalChunkX;
-                 ++chunkX) {
+        const int firstChunkY = bounds.minY / chunkSize;
+        const int finalChunkY =
+            (bounds.maxY + chunkSize - 1) / chunkSize;
+        struct LiquidCandidateJob {
+            int chunkX = 0;
+            int chunkY = 0;
+            std::vector<std::size_t> candidates;
+        };
+        std::array<std::vector<LiquidCandidateJob>, 4>
+            phaseJobs;
+        for (int chunkY = firstChunkY;
+             chunkY < finalChunkY; ++chunkY) {
+            for (int chunkX = firstChunkX;
+                 chunkX < finalChunkX; ++chunkX) {
                 if (!materialChunkActive(
                         chunkX * chunkSize,
                         chunkY * chunkSize,
                         liquidActivity)) {
                     continue;
                 }
-                const int chunkOriginX =
-                    chunkX * chunkSize;
-                for (int microtileX = 0;
-                     microtileX < materialMicrotilesPerAxis;
-                     ++microtileX) {
-                    const int tileOriginX =
-                        chunkOriginX +
-                        microtileX *
-                            materialMicrotileSize;
-                    const int beginX = std::max(
-                        bounds.minX, tileOriginX);
-                    const int endX = std::min(
-                        bounds.maxX,
-                        tileOriginX +
-                            materialMicrotileSize);
-                    if (beginX >= endX ||
-                        !materialMicrotileActive(
-                            beginX, y, liquidActivity)) {
-                        continue;
-                    }
-                    for (int x = beginX; x < endX; ++x) {
-                        moved_.set(indexOf(x, y), 0);
-                    }
-                    if (y >= height - 1) {
-                        continue;
-                    }
-                    for (int x = beginX; x < endX; ++x) {
-                        const std::size_t index =
-                            indexOf(x, y);
-                        if (liquidEqualizationReservation_[index] ==
-                                0 &&
-                            isCandidate(index)) {
-                            liquidWorklist_.push_back(index);
+                const int phase =
+                    (chunkX & 1) |
+                    ((chunkY & 1) << 1);
+                auto& job = phaseJobs[
+                    static_cast<std::size_t>(
+                        phase)].emplace_back();
+                job.chunkX = chunkX;
+                job.chunkY = chunkY;
+                job.candidates.reserve(
+                    static_cast<std::size_t>(
+                        chunkSize * chunkSize / 4));
+            }
+        }
+
+        liquidWorklist_.clear();
+        ParallelExecutor& executor =
+            materialExecutor();
+        for (auto& jobs : phaseJobs) {
+            executor.run(
+                jobs.size(),
+                [&](std::size_t jobIndex) {
+                    LiquidCandidateJob& job =
+                        jobs[jobIndex];
+                    const int chunkOriginX =
+                        job.chunkX * chunkSize;
+                    const int chunkOriginY =
+                        job.chunkY * chunkSize;
+                    const int beginY = std::max(
+                        bounds.minY,
+                        chunkOriginY);
+                    const int endY = std::min(
+                        bounds.maxY,
+                        chunkOriginY + chunkSize);
+                    for (int y = beginY;
+                         y < endY; ++y) {
+                        for (int microtileX = 0;
+                             microtileX <
+                                 materialMicrotilesPerAxis;
+                             ++microtileX) {
+                            const int tileOriginX =
+                                chunkOriginX +
+                                microtileX *
+                                    materialMicrotileSize;
+                            const int beginX =
+                                std::max(
+                                    bounds.minX,
+                                    tileOriginX);
+                            const int endX = std::min(
+                                bounds.maxX,
+                                tileOriginX +
+                                    materialMicrotileSize);
+                            if (beginX >= endX ||
+                                !materialMicrotileActive(
+                                    beginX, y,
+                                    liquidActivity)) {
+                                continue;
+                            }
+                            for (int x = beginX;
+                                 x < endX; ++x) {
+                                moved_.set(
+                                    indexOf(x, y), 0);
+                            }
+                            if (y >= height - 1) {
+                                continue;
+                            }
+                            for (int x = beginX;
+                                 x < endX; ++x) {
+                                const std::size_t
+                                    index =
+                                        indexOf(x, y);
+                                if (isCandidate(
+                                        index)) {
+                                    job.candidates
+                                        .push_back(
+                                            index);
+                                }
+                            }
                         }
                     }
-                }
-            }
-            std::shuffle(
-                liquidWorklist_.begin() +
-                    static_cast<std::ptrdiff_t>(rowWorkBegin),
-                liquidWorklist_.end(), random_);
+                });
         }
+        for (const auto& jobs : phaseJobs) {
+            for (const LiquidCandidateJob& job :
+                 jobs) {
+                liquidWorklist_.insert(
+                    liquidWorklist_.end(),
+                    job.candidates.begin(),
+                    job.candidates.end());
+            }
+        }
+        std::sort(
+            liquidWorklist_.begin(),
+            liquidWorklist_.end());
         rebuildLiquidWorklist_ = false;
     } else {
         // Generation-stamped insertion keeps this frontier unique without a
         // sort. Clear movement markers for liquid cells and their open targets
         // before filtering the raw neighborhood to current candidates.
+        // Clearing remains serial because a frontier can touch an unallocated
+        // neighbor chunk; concurrent lazy allocation of that sparse chunk
+        // would otherwise race.
         for (std::size_t index : liquidWorklist_) {
             moved_.set(index, 0);
         }
-        std::erase_if(
-            liquidWorklist_,
-            [&](std::size_t index) {
-                return !isCandidate(index);
+        const std::size_t filterJobCount =
+            liquidWorklist_.empty()
+                ? 0
+                : std::min<std::size_t>(
+                      materialExecutor()
+                          .workerCount(),
+                      (liquidWorklist_.size() +
+                       255) /
+                          256);
+        std::vector<std::vector<std::size_t>>
+            filteredCandidates(filterJobCount);
+        materialExecutor().run(
+            filterJobCount,
+            [&](std::size_t jobIndex) {
+                const std::size_t begin =
+                    liquidWorklist_.size() *
+                    jobIndex / filterJobCount;
+                const std::size_t end =
+                    liquidWorklist_.size() *
+                    (jobIndex + 1) /
+                    filterJobCount;
+                auto& candidates =
+                    filteredCandidates[jobIndex];
+                candidates.reserve(end - begin);
+                for (std::size_t workIndex =
+                         begin;
+                     workIndex < end;
+                     ++workIndex) {
+                    const std::size_t index =
+                        liquidWorklist_[workIndex];
+                    if (isCandidate(index)) {
+                        candidates.push_back(index);
+                    }
+                }
             });
+        liquidWorklist_.clear();
+        for (const auto& candidates :
+             filteredCandidates) {
+            liquidWorklist_.insert(
+                liquidWorklist_.end(),
+                candidates.begin(),
+                candidates.end());
+        }
+        std::sort(
+            liquidWorklist_.begin(),
+            liquidWorklist_.end());
     }
     currentLiquidCandidateVisits_ +=
         static_cast<std::uint32_t>(std::min<std::size_t>(
@@ -4207,73 +4330,290 @@ void World::updateLiquids(const ActiveBounds& bounds, bool waterOnly) {
     currentLiquidSelectionMs_ +=
         elapsedMilliseconds(selectionBegin, selectionEnd);
 
-    // The gathered rows are stored top-to-bottom, so reverse iteration is a
-    // true bottom-up gravity pass. A stream can follow cells vacated earlier
-    // in the same pass without imposing a left/right row pattern.
-    for (auto iterator = liquidWorklist_.rbegin();
-         iterator != liquidWorklist_.rend(); ++iterator) {
-        const std::size_t source = *iterator;
+    struct LiquidGravityOption {
+        std::size_t destination = 0;
+        int flowX = 0;
+        int flowY = 0;
+        bool densitySwap = false;
+    };
+    struct LiquidGravityProposal {
+        std::size_t source = 0;
+        Material material = Material::air;
+        std::array<LiquidGravityOption, 3> options{};
+        std::uint8_t optionCount = 0;
+        std::uint32_t priority = 0;
+    };
+    const auto liquidPriority =
+        [&](std::size_t source,
+            std::uint64_t salt = 0) {
+            std::uint64_t value =
+                source ^ salt ^
+                (materialStep_ *
+                 0x9E3779B97F4A7C15ULL) ^
+                (static_cast<std::uint64_t>(
+                     liquidFrontierGeneration_) *
+                 0xD1B54A32D192ED03ULL);
+            value ^= value >> 30U;
+            value *= 0xBF58476D1CE4E5B9ULL;
+            value ^= value >> 27U;
+            value *= 0x94D049BB133111EBULL;
+            value ^= value >> 31U;
+            return static_cast<std::uint32_t>(
+                value ^ (value >> 32U));
+        };
+    const auto& gravityCells =
+        std::as_const(cells_);
+    const auto& gravityMoved =
+        std::as_const(moved_);
+    const auto& gravityReservations =
+        std::as_const(
+            liquidEqualizationReservation_);
+    const auto& gravityFlowX =
+        std::as_const(liquidFlowX_);
+    const std::size_t gravityJobCount =
+        liquidWorklist_.empty()
+            ? 0
+            : std::min<std::size_t>(
+                  materialExecutor().workerCount(),
+                  (liquidWorklist_.size() + 255) /
+                      256);
+    std::vector<std::vector<LiquidGravityProposal>>
+        gravityJobProposals(gravityJobCount);
+    materialExecutor().run(
+        gravityJobCount,
+        [&](std::size_t jobIndex) {
+            const std::size_t begin =
+                liquidWorklist_.size() * jobIndex /
+                gravityJobCount;
+            const std::size_t end =
+                liquidWorklist_.size() *
+                (jobIndex + 1) / gravityJobCount;
+            auto& proposals =
+                gravityJobProposals[jobIndex];
+            proposals.reserve(end - begin);
+            for (std::size_t workIndex = begin;
+                 workIndex < end; ++workIndex) {
+                const std::size_t source =
+                    liquidWorklist_[workIndex];
+                const int x = static_cast<int>(
+                    source %
+                    static_cast<std::size_t>(width));
+                const int y = static_cast<int>(
+                    source /
+                    static_cast<std::size_t>(width));
+                const Material material =
+                    gravityCells[source];
+                if (!isLiquid(material) ||
+                    (waterOnly &&
+                     material != Material::water) ||
+                    gravityMoved[source] != 0 ||
+                    y >= height - 1) {
+                    continue;
+                }
+
+                LiquidGravityProposal proposal;
+                proposal.source = source;
+                proposal.material = material;
+                proposal.priority =
+                    liquidPriority(source);
+                const auto addFallOption =
+                    [&](int targetX, int targetY,
+                        int flowX, int flowY) {
+                        if (!targetInBounds(
+                                targetX, targetY) ||
+                            proposal.optionCount >=
+                                proposal.options.size()) {
+                            return;
+                        }
+                        const std::size_t target =
+                            indexOf(
+                                targetX, targetY);
+                        if (gravityReservations[target] !=
+                                0 ||
+                            gravityMoved[target] == 1) {
+                            return;
+                        }
+                        const Material targetMaterial =
+                            gravityCells[target];
+                        if (!isOpen(targetMaterial) &&
+                            targetMaterial != material) {
+                            return;
+                        }
+                        proposal.options[
+                            proposal.optionCount++] = {
+                            target, flowX, flowY, false,
+                        };
+                    };
+
+                const std::size_t below =
+                    indexOf(x, y + 1);
+                if (material == Material::water &&
+                    gravityCells[below] ==
+                        Material::oil &&
+                    gravityReservations[below] == 0 &&
+                    gravityMoved[below] != 1) {
+                    proposal.options[
+                        proposal.optionCount++] = {
+                        below, 0, 96, true,
+                    };
+                } else {
+                    addFallOption(
+                        x, y + 1, 0, 127);
+                    const int firstDirection =
+                        gravityFlowX[source] == 0
+                            ? ((proposal.priority &
+                                1U) == 0
+                                   ? -1
+                                   : 1)
+                            : (gravityFlowX[source] < 0
+                                   ? -1
+                                   : 1);
+                    addFallOption(
+                        x + firstDirection,
+                        y + 1,
+                        firstDirection * 84,
+                        112);
+                    addFallOption(
+                        x - firstDirection,
+                        y + 1,
+                        -firstDirection * 84,
+                        112);
+                }
+                if (proposal.optionCount != 0) {
+                    proposals.push_back(proposal);
+                }
+            }
+        });
+
+    std::vector<LiquidGravityProposal>
+        gravityProposals;
+    for (const auto& jobProposals :
+         gravityJobProposals) {
+        gravityProposals.insert(
+            gravityProposals.end(),
+            jobProposals.begin(),
+            jobProposals.end());
+    }
+    std::sort(
+        gravityProposals.begin(),
+        gravityProposals.end(),
+        [](const LiquidGravityProposal& first,
+           const LiquidGravityProposal& second) {
+            if (first.source != second.source) {
+                return first.source > second.source;
+            }
+            return first.priority < second.priority;
+        });
+    currentLiquidMoveProposals_ +=
+        static_cast<std::uint32_t>(
+            std::min<std::size_t>(
+                gravityProposals.size(),
+                std::numeric_limits<
+                    std::uint32_t>::max() -
+                    currentLiquidMoveProposals_));
+    for (const LiquidGravityProposal& proposal :
+         gravityProposals) {
+        if (moved_[proposal.source] != 0 ||
+            cells_[proposal.source] !=
+                proposal.material) {
+            ++currentLiquidMoveConflicts_;
+            continue;
+        }
+        const int sourceX = static_cast<int>(
+            proposal.source %
+            static_cast<std::size_t>(width));
+        const int sourceY = static_cast<int>(
+            proposal.source /
+            static_cast<std::size_t>(width));
+        bool accepted = false;
+        for (std::size_t optionIndex = 0;
+             optionIndex < proposal.optionCount;
+             ++optionIndex) {
+            const LiquidGravityOption& option =
+                proposal.options[optionIndex];
+            const int destinationX =
+                static_cast<int>(
+                    option.destination %
+                    static_cast<std::size_t>(
+                        width));
+            const int destinationY =
+                static_cast<int>(
+                    option.destination /
+                    static_cast<std::size_t>(
+                        width));
+            bool available = false;
+            if (option.densitySwap) {
+                available =
+                    proposal.material ==
+                        Material::water &&
+                    cells_[option.destination] ==
+                        Material::oil &&
+                    liquidEqualizationReservation_[
+                        option.destination] == 0 &&
+                    moved_[option.destination] != 1;
+            } else {
+                available = canFallInto(
+                    destinationX,
+                    destinationY);
+            }
+            if (!available) {
+                continue;
+            }
+            moveLiquid(
+                sourceX, sourceY,
+                destinationX, destinationY,
+                option.flowX, option.flowY);
+            ++currentLiquidMovesAccepted_;
+            accepted = true;
+            break;
+        }
+        if (!accepted) {
+            ++currentLiquidMoveConflicts_;
+        }
+    }
+
+    // Impact metadata is resolved after transport, once destination locks
+    // make it clear which cells actually remained supported.
+    for (std::size_t source : liquidWorklist_) {
         const int x = static_cast<int>(
-            source % static_cast<std::size_t>(width));
+            source %
+            static_cast<std::size_t>(width));
         const int y = static_cast<int>(
-            source / static_cast<std::size_t>(width));
+            source /
+            static_cast<std::size_t>(width));
         const Material material = cells_[source];
         if (!isLiquid(material) ||
-            (waterOnly && material != Material::water) ||
-            moved_[source] != 0 ||
-            y >= height - 1) {
+            (waterOnly &&
+             material != Material::water) ||
+            moved_[source] != 0) {
             continue;
         }
-        liquidAmount_[source] = maximumLiquidMass;
-
-        const std::size_t belowIndex = indexOf(x, y + 1);
-        const Material below = cells_[belowIndex];
-        if (material == Material::water &&
-            below == Material::oil &&
-            liquidEqualizationReservation_[belowIndex] == 0 &&
-            moved_[belowIndex] != 1) {
-            moveLiquid(x, y, x, y + 1, 0, 96);
-            continue;
-        }
-        if (canFallInto(x, y + 1)) {
-            moveLiquid(x, y, x, y + 1, 0, 127);
-            continue;
-        }
-
-        const int firstDirection =
-            liquidFlowX_[source] == 0
-                ? (coin(random_) == 0 ? -1 : 1)
-                : (liquidFlowX_[source] < 0 ? -1 : 1);
-        for (int direction : {firstDirection, -firstDirection}) {
-            if (canFallInto(x + direction, y + 1)) {
-                moveLiquid(x, y, x + direction, y + 1,
-                           direction * 84, 112);
-                break;
-            }
-        }
-
-        if (moved_[source] != 0) {
-            continue;
-        }
-
-        // A fast falling water cell that meets support turns its downward
-        // momentum into short-lived foam and an occasional spray particle.
-        // The foam remains metadata; no material cells are created or lost.
+        liquidAmount_[source] =
+            maximumLiquidMass;
         const int impactSpeed =
-            static_cast<int>(liquidFlowY_[source]);
+            static_cast<int>(
+                liquidFlowY_[source]);
         const bool impactExposed =
             isOpen(cell(x - 1, y)) ||
             isOpen(cell(x + 1, y)) ||
             isOpen(cell(x, y - 1));
         if (material == Material::water &&
-            impactSpeed > 72 && impactExposed) {
-            liquidFoam_[source] = static_cast<std::uint8_t>(
-                std::max<int>(liquidFoam_[source],
-                              std::min(255, 72 + impactSpeed)));
+            impactSpeed > 72 &&
+            impactExposed) {
+            liquidFoam_[source] =
+                static_cast<std::uint8_t>(
+                    std::max<int>(
+                        liquidFoam_[source],
+                        std::min(
+                            255,
+                            72 + impactSpeed)));
             liquidFlowY_[source] = 0;
-            if (impactSpeed > 104 && percent(random_) < 4) {
+            if (impactSpeed > 104 &&
+                percent(random_) < 4) {
                 const float direction =
-                    coin(random_) == 0 ? -1.0F : 1.0F;
+                    coin(random_) == 0
+                        ? -1.0F
+                        : 1.0F;
                 emitParticle({
                     {static_cast<float>(x) + 0.5F,
                      static_cast<float>(y) + 0.2F},
@@ -4286,8 +4626,9 @@ void World::updateLiquids(const ActiveBounds& bounds, bool waterOnly) {
                 });
             }
         } else {
-            liquidFlowY_[source] = static_cast<std::int8_t>(
-                impactSpeed * 2 / 3);
+            liquidFlowY_[source] =
+                static_cast<std::int8_t>(
+                    impactSpeed * 2 / 3);
         }
     }
     const auto gravityEnd =
@@ -4295,164 +4636,383 @@ void World::updateLiquids(const ActiveBounds& bounds, bool waterOnly) {
     currentLiquidGravityMs_ +=
         elapsedMilliseconds(selectionEnd, gravityEnd);
 
-    // Surface relaxation remains randomized and destination-locked. This is
-    // the part that must not cascade through newly vacated cells, because
-    // doing so recreates horizontal shelves.
-    std::shuffle(liquidWorklist_.begin(), liquidWorklist_.end(),
-                 random_);
-    for (std::size_t source : liquidWorklist_) {
-        const int x = static_cast<int>(source %
-                                       static_cast<std::size_t>(width));
-        const int y = static_cast<int>(source /
-                                       static_cast<std::size_t>(width));
-        if (!materialMicrotileActive(
-                x, y, liquidActivity)) {
-            continue;
-        }
-        const Material material = cells_[source];
-        if (!isLiquid(material) ||
-            (waterOnly && material != Material::water) ||
-            moved_[source] != 0) {
-            continue;
-        }
-        liquidAmount_[source] = maximumLiquidMass;
-        const int firstDirection =
-            liquidFlowX_[source] == 0
-                ? (coin(random_) == 0 ? -1 : 1)
-                : (liquidFlowX_[source] < 0 ? -1 : 1);
-        // A slope's boundary may still have liquid immediately above it.
-        // Treat diagonal sky exposure as surface too; otherwise those cells
-        // lock into a staircase and the pool freezes as a mound.
-        const bool touchesFreeSurface =
-            cell(x, y - 1) != material ||
-            cell(x - 1, y - 1) != material ||
-            cell(x + 1, y - 1) != material;
-        const int headDepth =
-            static_cast<int>(liquidHeadDepth_[source]);
-        const bool hasLateralOutlet =
-            isOpen(cell(x - 1, y)) ||
-            isOpen(cell(x + 1, y));
-        const int pressureThreshold =
-            material == Material::water ? scaledCell(2)
-                                        : scaledCell(5);
-        const bool pressureDriven =
-            hasLateralOutlet && headDepth >= pressureThreshold;
-        if (!touchesFreeSurface && !pressureDriven) {
-            liquidFlowX_[source] = static_cast<std::int8_t>(
-                static_cast<int>(liquidFlowX_[source]) * 3 / 4);
-            liquidFlowY_[source] = static_cast<std::int8_t>(
-                static_cast<int>(liquidFlowY_[source]) * 2 / 3);
-            continue;
-        }
-
-        const int baseSearchDistance =
-            material == Material::water ? scaledCell(12)
-                                        : scaledCell(3);
-        const int pressureReach =
-            material == Material::water
-                ? std::min(headDepth, scaledCell(10))
-                : std::min(headDepth / 3, scaledCell(2));
-        const int momentumReach =
-            std::abs(static_cast<int>(liquidFlowX_[source])) /
-            (material == Material::water ? 8 : 18);
-        const int searchDistance =
-            baseSearchDistance + pressureReach + momentumReach;
-        struct LateralPath {
-            int direction = 0;
-            int openRun = 0;
-            int dropDistance = 0;
-            int fallDepth = 0;
+    // Lateral path search is read-only and considerably more expensive than
+    // committing a move, so workers evaluate both directions against one
+    // stable post-gravity snapshot. The serial resolver retains destination
+    // locking and prevents newly vacated cells from cascading sideways.
+    struct LiquidLateralProposal {
+        std::size_t source = 0;
+        std::size_t destination = 0;
+        Material material = Material::air;
+        int flowX = 0;
+        int flowY = 0;
+        std::int8_t restingFlowX = 0;
+        std::int8_t restingFlowY = 0;
+        std::uint32_t priority = 0;
+        bool moving = false;
+    };
+    const auto& lateralCells =
+        std::as_const(cells_);
+    const auto& lateralMoved =
+        std::as_const(moved_);
+    const auto& lateralReservations =
+        std::as_const(
+            liquidEqualizationReservation_);
+    const auto& lateralFlowX =
+        std::as_const(liquidFlowX_);
+    const auto& lateralFlowY =
+        std::as_const(liquidFlowY_);
+    const auto& lateralHeadDepth =
+        std::as_const(liquidHeadDepth_);
+    const auto lateralMaterialAt =
+        [&](int x, int y) {
+            if (x < 0 || x >= width ||
+                y < 0 || y >= height) {
+                return Material::rock;
+            }
+            return lateralCells[indexOf(x, y)];
         };
-        std::array<LateralPath, 2> paths{{
-            {firstDirection, 0, 0, 0},
-            {-firstDirection, 0, 0, 0},
-        }};
-        for (LateralPath& path : paths) {
-            for (int distance = 1; distance <= searchDistance;
-                 ++distance) {
-                const int targetX = x + path.direction * distance;
-                if (targetX < bounds.minX ||
-                    targetX >= bounds.maxX) {
-                    break;
+    const std::size_t lateralJobCount =
+        liquidWorklist_.empty()
+            ? 0
+            : std::min<std::size_t>(
+                  materialExecutor().workerCount(),
+                  (liquidWorklist_.size() + 255) /
+                      256);
+    std::vector<std::vector<LiquidLateralProposal>>
+        lateralJobProposals(lateralJobCount);
+    materialExecutor().run(
+        lateralJobCount,
+        [&](std::size_t jobIndex) {
+            const std::size_t begin =
+                liquidWorklist_.size() * jobIndex /
+                lateralJobCount;
+            const std::size_t end =
+                liquidWorklist_.size() *
+                (jobIndex + 1) / lateralJobCount;
+            auto& proposals =
+                lateralJobProposals[jobIndex];
+            proposals.reserve(end - begin);
+            for (std::size_t workIndex = begin;
+                 workIndex < end; ++workIndex) {
+                const std::size_t source =
+                    liquidWorklist_[workIndex];
+                const int x = static_cast<int>(
+                    source %
+                    static_cast<std::size_t>(width));
+                const int y = static_cast<int>(
+                    source /
+                    static_cast<std::size_t>(width));
+                const Material material =
+                    lateralCells[source];
+                if (!materialMicrotileActive(
+                        x, y, liquidActivity) ||
+                    !isLiquid(material) ||
+                    (waterOnly &&
+                     material != Material::water) ||
+                    lateralMoved[source] != 0) {
+                    continue;
                 }
-                const std::size_t target =
-                    indexOf(targetX, y);
-                if (liquidEqualizationReservation_[target] != 0 ||
-                    !isOpen(cell(targetX, y))) {
-                    break;
-                }
-                path.openRun = distance;
-                if (isOpen(cell(targetX, y + 1))) {
-                    path.dropDistance = distance;
-                    const int maximumFallProbe =
-                        material == Material::water
-                            ? scaledCell(12)
-                            : scaledCell(4);
-                    for (int fall = 1;
-                         fall <= maximumFallProbe &&
-                         targetInBounds(targetX, y + fall) &&
-                         isOpen(cell(targetX, y + fall));
-                         ++fall) {
-                        path.fallDepth = fall;
-                    }
-                    break;
-                }
-            }
-        }
 
-        const LateralPath* chosen = nullptr;
-        const bool firstHasDrop = paths[0].dropDistance > 0;
-        const bool secondHasDrop = paths[1].dropDistance > 0;
-        if (firstHasDrop || secondHasDrop) {
-            if (!firstHasDrop) {
-                chosen = &paths[1];
-            } else if (!secondHasDrop) {
-                chosen = &paths[0];
-            } else {
-                // Prefer the side with the lower reachable liquid head.
-                // Distance is only a tie-breaker, so a reservoir drains
-                // toward the genuinely lower outlet instead of alternating.
-                chosen =
-                    paths[0].fallDepth != paths[1].fallDepth
-                        ? (paths[0].fallDepth > paths[1].fallDepth
-                               ? &paths[0]
-                               : &paths[1])
-                        : (paths[0].dropDistance <=
-                                   paths[1].dropDistance
-                               ? &paths[0]
-                               : &paths[1]);
+                LiquidLateralProposal proposal;
+                proposal.source = source;
+                proposal.destination = source;
+                proposal.material = material;
+                proposal.priority =
+                    liquidPriority(
+                        source,
+                        0xA24BAED4963EE407ULL);
+                const int currentFlowX =
+                    static_cast<int>(
+                        lateralFlowX[source]);
+                const int currentFlowY =
+                    static_cast<int>(
+                        lateralFlowY[source]);
+                const int firstDirection =
+                    currentFlowX == 0
+                        ? ((proposal.priority &
+                            1U) == 0
+                               ? -1
+                               : 1)
+                        : (currentFlowX < 0
+                               ? -1
+                               : 1);
+                const bool touchesFreeSurface =
+                    lateralMaterialAt(
+                        x, y - 1) != material ||
+                    lateralMaterialAt(
+                        x - 1, y - 1) !=
+                        material ||
+                    lateralMaterialAt(
+                        x + 1, y - 1) !=
+                        material;
+                const int headDepth =
+                    static_cast<int>(
+                        lateralHeadDepth[source]);
+                const bool hasLateralOutlet =
+                    isOpen(lateralMaterialAt(
+                        x - 1, y)) ||
+                    isOpen(lateralMaterialAt(
+                        x + 1, y));
+                const int pressureThreshold =
+                    material == Material::water
+                        ? scaledCell(2)
+                        : scaledCell(5);
+                const bool pressureDriven =
+                    hasLateralOutlet &&
+                    headDepth >=
+                        pressureThreshold;
+                if (!touchesFreeSurface &&
+                    !pressureDriven) {
+                    proposal.restingFlowX =
+                        static_cast<std::int8_t>(
+                            currentFlowX * 3 / 4);
+                    proposal.restingFlowY =
+                        static_cast<std::int8_t>(
+                            currentFlowY * 2 / 3);
+                    proposals.push_back(proposal);
+                    continue;
+                }
+
+                const int baseSearchDistance =
+                    material == Material::water
+                        ? scaledCell(12)
+                        : scaledCell(3);
+                const int pressureReach =
+                    material == Material::water
+                        ? std::min(
+                              headDepth,
+                              scaledCell(10))
+                        : std::min(
+                              headDepth / 3,
+                              scaledCell(2));
+                const int momentumReach =
+                    std::abs(currentFlowX) /
+                    (material == Material::water
+                         ? 8
+                         : 18);
+                const int searchDistance =
+                    baseSearchDistance +
+                    pressureReach +
+                    momentumReach;
+                struct LateralPath {
+                    int direction = 0;
+                    int openRun = 0;
+                    int dropDistance = 0;
+                    int fallDepth = 0;
+                };
+                std::array<LateralPath, 2> paths{{
+                    {firstDirection, 0, 0, 0},
+                    {-firstDirection, 0, 0, 0},
+                }};
+                for (LateralPath& path : paths) {
+                    for (int distance = 1;
+                         distance <= searchDistance;
+                         ++distance) {
+                        const int targetX =
+                            x + path.direction *
+                                    distance;
+                        if (targetX <
+                                bounds.minX ||
+                            targetX >=
+                                bounds.maxX) {
+                            break;
+                        }
+                        const std::size_t target =
+                            indexOf(targetX, y);
+                        if (lateralReservations[
+                                target] != 0 ||
+                            lateralMoved[target] != 0 ||
+                            !isOpen(
+                                lateralCells[
+                                    target])) {
+                            break;
+                        }
+                        path.openRun = distance;
+                        if (isOpen(
+                                lateralMaterialAt(
+                                    targetX,
+                                    y + 1))) {
+                            path.dropDistance =
+                                distance;
+                            const int
+                                maximumFallProbe =
+                                    material ==
+                                            Material::water
+                                        ? scaledCell(12)
+                                        : scaledCell(4);
+                            for (int fall = 1;
+                                 fall <=
+                                     maximumFallProbe &&
+                                 targetInBounds(
+                                     targetX,
+                                     y + fall) &&
+                                 isOpen(
+                                     lateralMaterialAt(
+                                         targetX,
+                                         y + fall));
+                                 ++fall) {
+                                path.fallDepth = fall;
+                            }
+                            break;
+                        }
+                    }
+                }
+
+                const LateralPath* chosen = nullptr;
+                const bool firstHasDrop =
+                    paths[0].dropDistance > 0;
+                const bool secondHasDrop =
+                    paths[1].dropDistance > 0;
+                if (firstHasDrop ||
+                    secondHasDrop) {
+                    if (!firstHasDrop) {
+                        chosen = &paths[1];
+                    } else if (!secondHasDrop) {
+                        chosen = &paths[0];
+                    } else {
+                        chosen =
+                            paths[0].fallDepth !=
+                                    paths[1].fallDepth
+                                ? (paths[0]
+                                               .fallDepth >
+                                           paths[1]
+                                               .fallDepth
+                                       ? &paths[0]
+                                       : &paths[1])
+                                : (paths[0]
+                                               .dropDistance <=
+                                           paths[1]
+                                               .dropDistance
+                                       ? &paths[0]
+                                       : &paths[1]);
+                    }
+                } else if (
+                    paths[0].openRun > 0 ||
+                    paths[1].openRun > 0) {
+                    chosen =
+                        paths[0].openRun >=
+                                paths[1].openRun
+                            ? &paths[0]
+                            : &paths[1];
+                }
+                const int chosenDistance =
+                    chosen == nullptr
+                        ? 0
+                        : (chosen->dropDistance > 0
+                               ? chosen
+                                     ->dropDistance
+                               : chosen->openRun);
+                if (chosenDistance > 0) {
+                    proposal.destination =
+                        indexOf(
+                            x +
+                                chosen->direction *
+                                    chosenDistance,
+                            y);
+                    proposal.flowX =
+                        chosen->direction *
+                        std::min(
+                            127,
+                            (material ==
+                                     Material::water
+                                 ? 82
+                                 : 45) +
+                                headDepth *
+                                    (material ==
+                                             Material::water
+                                         ? 3
+                                         : 1));
+                    proposal.moving = true;
+                }
+                proposal.restingFlowX =
+                    static_cast<std::int8_t>(
+                        currentFlowX * 2 / 3);
+                proposal.restingFlowY = 0;
+                proposals.push_back(proposal);
             }
-        } else if (paths[0].openRun > 0 ||
-                   paths[1].openRun > 0) {
-            chosen = paths[0].openRun >= paths[1].openRun
-                         ? &paths[0]
-                         : &paths[1];
-        }
-        const int chosenDistance =
-            chosen == nullptr
-                ? 0
-                : (chosen->dropDistance > 0
-                       ? chosen->dropDistance
-                       : chosen->openRun);
-        if (chosenDistance > 0 &&
-            canMoveSidewaysInto(
-                x + chosen->direction * chosenDistance, y)) {
-            const int direction = chosen->direction;
-            const int pressureImpulse = std::min(
-                127,
-                (material == Material::water ? 82 : 45) +
-                    headDepth *
-                        (material == Material::water ? 3 : 1));
-            moveLiquid(x, y,
-                       x + direction * chosenDistance, y,
-                       direction * pressureImpulse,
-                       0);
+        });
+
+    std::vector<LiquidLateralProposal>
+        lateralProposals;
+    for (const auto& jobProposals :
+         lateralJobProposals) {
+        lateralProposals.insert(
+            lateralProposals.end(),
+            jobProposals.begin(),
+            jobProposals.end());
+    }
+    std::sort(
+        lateralProposals.begin(),
+        lateralProposals.end(),
+        [](const LiquidLateralProposal& first,
+           const LiquidLateralProposal& second) {
+            if (first.moving != second.moving) {
+                return first.moving >
+                       second.moving;
+            }
+            if (first.priority != second.priority) {
+                return first.priority <
+                       second.priority;
+            }
+            return first.source < second.source;
+        });
+    for (const LiquidLateralProposal& proposal :
+         lateralProposals) {
+        if (!proposal.moving) {
             continue;
         }
-
-        liquidFlowX_[source] = static_cast<std::int8_t>(
-            static_cast<int>(liquidFlowX_[source]) * 2 / 3);
-        liquidFlowY_[source] = 0;
+        ++currentLiquidMoveProposals_;
+        const int destinationX =
+            static_cast<int>(
+                proposal.destination %
+                static_cast<std::size_t>(width));
+        const int destinationY =
+            static_cast<int>(
+                proposal.destination /
+                static_cast<std::size_t>(width));
+        if (moved_[proposal.source] != 0 ||
+            cells_[proposal.source] !=
+                proposal.material ||
+            !canMoveSidewaysInto(
+                destinationX, destinationY)) {
+            ++currentLiquidMoveConflicts_;
+            if (cells_[proposal.source] ==
+                    proposal.material &&
+                moved_[proposal.source] == 0) {
+                liquidFlowX_[proposal.source] =
+                    proposal.restingFlowX;
+                liquidFlowY_[proposal.source] =
+                    proposal.restingFlowY;
+            }
+            continue;
+        }
+        const int sourceX = static_cast<int>(
+            proposal.source %
+            static_cast<std::size_t>(width));
+        const int sourceY = static_cast<int>(
+            proposal.source /
+            static_cast<std::size_t>(width));
+        moveLiquid(
+            sourceX, sourceY,
+            destinationX, destinationY,
+            proposal.flowX, proposal.flowY);
+        ++currentLiquidMovesAccepted_;
+    }
+    for (const LiquidLateralProposal& proposal :
+         lateralProposals) {
+        if (proposal.moving ||
+            moved_[proposal.source] != 0 ||
+            cells_[proposal.source] !=
+                proposal.material) {
+            continue;
+        }
+        liquidAmount_[proposal.source] =
+            maximumLiquidMass;
+        liquidFlowX_[proposal.source] =
+            proposal.restingFlowX;
+        liquidFlowY_[proposal.source] =
+            proposal.restingFlowY;
     }
     const auto lateralEnd =
         std::chrono::steady_clock::now();

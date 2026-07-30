@@ -804,6 +804,127 @@ int main() {
         return 1;
     }
 
+    gunpowder::World firstParallelLiquidWorld;
+    gunpowder::World secondParallelLiquidWorld;
+    for (int y = 28; y <= 150; ++y) {
+        for (int x = 48; x <= 90; ++x) {
+            const bool boundary =
+                x == 48 || x == 90 ||
+                y == 150;
+            const gunpowder::Material material =
+                boundary
+                    ? gunpowder::Material::stone
+                    : gunpowder::Material::air;
+            firstParallelLiquidWorld.setCellForTest(
+                x, y, material);
+            secondParallelLiquidWorld.setCellForTest(
+                x, y, material);
+        }
+    }
+    for (int y = 48; y <= 63; ++y) {
+        for (int x = 60; x <= 67; ++x) {
+            firstParallelLiquidWorld.setCellForTest(
+                x, y, gunpowder::Material::water);
+            secondParallelLiquidWorld.setCellForTest(
+                x, y, gunpowder::Material::water);
+        }
+    }
+    for (int y = 64; y <= 79; ++y) {
+        for (int x = 60; x <= 67; ++x) {
+            firstParallelLiquidWorld.setCellForTest(
+                x, y, gunpowder::Material::oil);
+            secondParallelLiquidWorld.setCellForTest(
+                x, y, gunpowder::Material::oil);
+        }
+    }
+    const std::uint64_t parallelWaterMass =
+        massOf(firstParallelLiquidWorld,
+               gunpowder::Material::water);
+    const std::uint64_t parallelOilMass =
+        massOf(firstParallelLiquidWorld,
+               gunpowder::Material::oil);
+    bool usedParallelLiquidScheduler = false;
+    bool acceptedLiquidTransfer = false;
+    gunpowder::InputState parallelLiquidInput;
+    for (int tick = 0; tick < 120; ++tick) {
+        firstParallelLiquidWorld.update(
+            1.0F / 30.0F, parallelLiquidInput);
+        secondParallelLiquidWorld.update(
+            1.0F / 30.0F, parallelLiquidInput);
+        const auto& timings =
+            firstParallelLiquidWorld
+                .materialSimulationTimings();
+        usedParallelLiquidScheduler =
+            usedParallelLiquidScheduler ||
+            timings.parallelLiquidChunks >= 2;
+        acceptedLiquidTransfer =
+            acceptedLiquidTransfer ||
+            timings.liquidMovesAccepted > 0;
+    }
+    if (massOf(firstParallelLiquidWorld,
+               gunpowder::Material::water) !=
+            parallelWaterMass ||
+        massOf(firstParallelLiquidWorld,
+               gunpowder::Material::oil) !=
+            parallelOilMass) {
+        std::cerr
+            << "Parallel liquid transfers changed water or oil mass\n";
+        return 1;
+    }
+    float waterYTotal = 0.0F;
+    float oilYTotal = 0.0F;
+    int waterCells = 0;
+    int oilCells = 0;
+    for (int y = 29; y < 150; ++y) {
+        for (int x = 49; x < 90; ++x) {
+            const gunpowder::Material material =
+                firstParallelLiquidWorld.cell(x, y);
+            if (material ==
+                gunpowder::Material::water) {
+                waterYTotal += static_cast<float>(y);
+                ++waterCells;
+            } else if (
+                material ==
+                gunpowder::Material::oil) {
+                oilYTotal += static_cast<float>(y);
+                ++oilCells;
+            }
+        }
+    }
+    const float averageWaterY =
+        waterYTotal /
+        static_cast<float>(std::max(1, waterCells));
+    const float averageOilY =
+        oilYTotal /
+        static_cast<float>(std::max(1, oilCells));
+    if (waterCells == 0 || oilCells == 0 ||
+        averageOilY >= averageWaterY ||
+        !usedParallelLiquidScheduler ||
+        !acceptedLiquidTransfer) {
+        std::cerr
+            << "Parallel liquid transport did not preserve density "
+               "separation across chunk seams (oil "
+            << averageOilY << ", water "
+            << averageWaterY << ")\n";
+        return 1;
+    }
+    if (!std::equal(
+            firstParallelLiquidWorld.materials().begin(),
+            firstParallelLiquidWorld.materials().end(),
+            secondParallelLiquidWorld.materials().begin()) ||
+        !std::equal(
+            firstParallelLiquidWorld.liquidFlowX().begin(),
+            firstParallelLiquidWorld.liquidFlowX().end(),
+            secondParallelLiquidWorld.liquidFlowX().begin()) ||
+        !std::equal(
+            firstParallelLiquidWorld.liquidFlowY().begin(),
+            firstParallelLiquidWorld.liquidFlowY().end(),
+            secondParallelLiquidWorld.liquidFlowY().begin())) {
+        std::cerr
+            << "Parallel liquid transfers are not deterministic\n";
+        return 1;
+    }
+
     gunpowder::World firstThermalWorld;
     gunpowder::World secondThermalWorld;
     constexpr std::array<std::pair<int, int>, 4> heatSources{{

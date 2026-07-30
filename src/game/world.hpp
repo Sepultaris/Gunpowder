@@ -39,6 +39,7 @@ struct MaterialSimulationTimings {
     std::uint32_t activeThermalMicrotiles = 0;
     std::uint32_t materialWorkerThreads = 1;
     std::uint32_t parallelGranularChunks = 0;
+    std::uint32_t parallelLiquidChunks = 0;
     std::uint32_t parallelGasChunks = 0;
     std::uint32_t parallelThermalChunks = 0;
     std::uint32_t granularMoveProposals = 0;
@@ -47,6 +48,9 @@ struct MaterialSimulationTimings {
     std::uint32_t gasMoveProposals = 0;
     std::uint32_t gasMovesAccepted = 0;
     std::uint32_t gasMoveConflicts = 0;
+    std::uint32_t liquidMoveProposals = 0;
+    std::uint32_t liquidMovesAccepted = 0;
+    std::uint32_t liquidMoveConflicts = 0;
     std::uint32_t liquidPreparationCellVisits = 0;
     std::uint32_t liquidHeadSummaryHits = 0;
     std::uint32_t liquidEqualizationSeedVisits = 0;
@@ -408,6 +412,9 @@ private:
     std::uint32_t currentLiquidEqualizationSeedVisits_ = 0;
     std::uint32_t currentEqualizedComponents_ = 0;
     std::uint32_t currentEqualizedCells_ = 0;
+    std::uint32_t currentLiquidMoveProposals_ = 0;
+    std::uint32_t currentLiquidMovesAccepted_ = 0;
+    std::uint32_t currentLiquidMoveConflicts_ = 0;
     std::vector<MaterialChunkActivity> materialChunkActivity_;
     std::vector<std::unique_ptr<LiquidChunkColumnSummary>>
         liquidChunkColumnSummaries_;

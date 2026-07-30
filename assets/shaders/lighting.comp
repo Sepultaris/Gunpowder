@@ -1,0 +1,1529 @@
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(binding = 0) uniform usampler2D materialTexture;
+layout(rgba8ui, binding = 1) uniform uimage2D lightingIntermediate;
+layout(rgba8ui, binding = 3) uniform uimage2D derivedImage;
+layout(rgba8ui, binding = 10) uniform uimage2D lightingFinal;
+layout(binding = 11) uniform sampler2D historyImage;
+layout(std430, binding = 12) readonly buffer SceneLightBuffer {
+    vec4 playerLight;
+    vec4 fireLights[64];
+    uvec4 lightCounts;
+} sceneLights;
+layout(rgba16f, binding = 13) uniform image2D giIntermediate;
+layout(rgba16f, binding = 14) uniform image2D giFinal;
+struct LightTile {
+    uint count;
+    uint indices[64];
+};
+layout(std430, binding = 16) readonly buffer LightTileBuffer {
+    LightTile tiles[];
+} lightTileBuffer;
+layout(std430, binding = 17) readonly buffer OccupancyHierarchy {
+    // xy: 8x8 dimensions, zw: 32x32 dimensions
+    uvec4 dimensions;
+    uint occupied[];
+} occupancyHierarchy;
+layout(rgba16f, binding = 18) uniform image2D sunTransmittanceImage;
+
+layout(push_constant) uniform TraceSettings {
+    // x/y: absolute world origin, z: packed options, w: rays per light
+    ivec4 originAndOptions;
+    // x: soft radius, y: solid transmission,
+    // z: smoke transmission, w: steam transmission
+    vec4 transmission;
+    // x: GI intensity, y: bounce distance, z: history weight,
+    // w: bit-packed history camera offset
+    vec4 indirect;
+    // xy: direction from the cell toward the sun,
+    // z: daylight intensity, w: angular softness in radians
+    vec4 celestial;
+    // xy: current camera origin minus the cached origin,
+    // z: cache validity, w: nonzero while generating the cache
+    ivec4 sunCache;
+} trace;
+
+const float goldenAngle = 2.39996323;
+const int lightingResolutionScale = 1;
+const int shadowFilterRadius = 3;
+const int visibilityFilterRadius = 2;
+const int shadowTileWidth = 8 + shadowFilterRadius * 2;
+const int shadowTileHeight = 8 + shadowFilterRadius * 2;
+// A mild sigma ~= 1.65 Gaussian. The samples are already resident in shared
+// memory for the edge-aware GI filter, so this changes weighting without
+// adding another image pass or any global texture reads.
+const float giGaussianWeights[7] = float[](
+    0.1915, 0.4804, 0.8324, 1.0,
+    0.8324, 0.4804, 0.1915);
+shared vec4 shadowTile[shadowTileWidth * shadowTileHeight];
+shared vec3 giTile[shadowTileWidth * shadowTileHeight];
+shared uint solidTile[shadowTileWidth * shadowTileHeight];
+
+bool isSolid(uint material) {
+    return material == 1 || material == 2 || material == 3 ||
+           material == 9 || material == 10 || material == 11;
+}
+
+bool isLiquid(uint material) {
+    return material == 4u || material == 5u;
+}
+
+float mediumIor(uint material) {
+    if (material == 4u) {
+        return 1.333;
+    }
+    if (material == 5u) {
+        return 1.470;
+    }
+    return 1.0;
+}
+
+float interfaceFresnel(
+    vec2 incoming, vec2 normal, float incidentIor,
+    float transmittedIor) {
+    float f0 =
+        (incidentIor - transmittedIor) /
+        (incidentIor + transmittedIor);
+    f0 *= f0;
+    float cosine =
+        clamp(-dot(normalize(incoming), normal), 0.0, 1.0);
+    return f0 + (1.0 - f0) *
+        pow(1.0 - cosine, 5.0);
+}
+
+vec3 liquidPathTransmission(uint material, float distanceCells) {
+    vec3 absorption =
+        material == 4u
+            ? vec3(0.055, 0.018, 0.006)
+            : vec3(0.025, 0.075, 0.140);
+    return exp(-absorption * max(distanceCells, 0.0));
+}
+
+float surfaceAt(
+    ivec2 cell, ivec2 extent, uint surfaceMaterial);
+vec2 surfaceNormal(
+    ivec2 cell, ivec2 extent, uint surfaceMaterial,
+    vec2 fallback);
+
+uint giFilterClass(uint material) {
+    if (isSolid(material)) {
+        return 1u;
+    }
+    if (material == 4u) {
+        return 2u;
+    }
+    if (material == 5u) {
+        return 3u;
+    }
+    return 0u;
+}
+
+float unpackGi(uvec4 packedLighting) {
+    uint packedGi =
+        (packedLighting.b << 4u) | (packedLighting.a >> 4u);
+    return float(packedGi) / 4095.0;
+}
+
+uint unpackMaterial(uvec4 packedLighting) {
+    return packedLighting.a & 15u;
+}
+
+vec3 unpackGiColor(vec4 packedGi) {
+    return packedGi.rgb;
+}
+
+vec4 packGiColor(vec3 gi, uint material) {
+    return vec4(
+        clamp(gi, vec3(0.0), vec3(1.0)),
+        float(material & 15u));
+}
+
+float giLuminance(vec3 gi) {
+    return dot(gi, vec3(0.2126, 0.7152, 0.0722));
+}
+
+uvec4 packLighting(vec2 visibility, float gi, uint material) {
+    uint packedGi = uint(round(clamp(gi, 0.0, 1.0) * 4095.0));
+    return uvec4(
+        round(clamp(visibility, vec2(0.0), vec2(1.0)) * 255.0),
+        packedGi >> 4u,
+        ((packedGi & 15u) << 4u) | (material & 15u));
+}
+
+vec2 softRayOffset(int index, int rayCount, float radius) {
+    if (index == 0 || rayCount <= 1 || radius <= 0.0) {
+        return vec2(0.0);
+    }
+    float normalizedRadius =
+        sqrt(float(index) / float(rayCount - 1));
+    float angle = float(index - 1) * goldenAngle;
+    return vec2(cos(angle), sin(angle)) *
+           radius * normalizedRadius;
+}
+
+uint materialAtPosition(vec2 position, ivec2 extent) {
+    ivec2 cell = ivec2(floor(position));
+    if (any(lessThan(cell, ivec2(0))) ||
+        any(greaterThanEqual(cell, extent))) {
+        return 0u;
+    }
+    return texelFetch(materialTexture, cell, 0).r;
+}
+
+float inspectStraightLightPath(
+    vec2 startPosition, vec2 targetPosition,
+    float solidTransmission, ivec2 extent,
+    out int liquidInterfaceCount, out vec2 interfacePosition,
+    out ivec2 interfaceLiquidCell, out uint incidentMaterial,
+    out uint transmittedMaterial) {
+    vec2 displacement = targetPosition - startPosition;
+    float pathLength = length(displacement);
+    liquidInterfaceCount = 0;
+    interfacePosition = startPosition;
+    interfaceLiquidCell = ivec2(floor(startPosition));
+    incidentMaterial = materialAtPosition(startPosition, extent);
+    transmittedMaterial = incidentMaterial;
+    if (pathLength < 0.001) {
+        return 1.0;
+    }
+
+    vec2 direction = displacement / pathLength;
+    vec2 position = startPosition;
+    vec2 previousPosition = position;
+    ivec2 previousCell = ivec2(floor(position));
+    uint previousMaterial =
+        materialAtPosition(position, extent);
+    float visibility = 1.0;
+    float traveled = 0.0;
+    for (int step = 0; step < 2048; ++step) {
+        float advance = min(0.72, pathLength - traveled);
+        if (advance <= 0.0001) {
+            break;
+        }
+        previousPosition = position;
+        position += direction * advance;
+        traveled += advance;
+        ivec2 cell = ivec2(floor(position));
+        if (all(equal(cell, previousCell))) {
+            if (traveled >= pathLength) {
+                break;
+            }
+            continue;
+        }
+
+        uint material = materialAtPosition(position, extent);
+        if (isSolid(material)) {
+            return solidTransmission;
+        }
+        if (material == 7u) {
+            visibility *= trace.transmission.z;
+        } else if (material == 8u) {
+            visibility *= trace.transmission.w;
+        } else if (material == 4u) {
+            visibility *= 0.997;
+        } else if (material == 5u) {
+            visibility *= 0.988;
+        }
+
+        float previousIor = mediumIor(previousMaterial);
+        float nextIor = mediumIor(material);
+        if (abs(previousIor - nextIor) > 0.001 &&
+            (isLiquid(previousMaterial) || isLiquid(material))) {
+            ++liquidInterfaceCount;
+            if (liquidInterfaceCount == 1) {
+                interfacePosition =
+                    (previousPosition + position) * 0.5;
+                interfaceLiquidCell =
+                    isLiquid(material) ? cell : previousCell;
+                incidentMaterial = previousMaterial;
+                transmittedMaterial = material;
+            }
+        }
+        previousCell = cell;
+        previousMaterial = material;
+        if (visibility < 0.002 || traveled >= pathLength) {
+            break;
+        }
+    }
+    return visibility;
+}
+
+float traceStraightLightSegment(
+    vec2 startPosition, vec2 targetPosition,
+    float solidTransmission, ivec2 extent) {
+    int ignoredInterfaceCount;
+    vec2 ignoredInterfacePosition;
+    ivec2 ignoredLiquidCell;
+    uint ignoredIncidentMaterial;
+    uint ignoredTransmittedMaterial;
+    return inspectStraightLightPath(
+        startPosition, targetPosition, solidTransmission, extent,
+        ignoredInterfaceCount, ignoredInterfacePosition,
+        ignoredLiquidCell, ignoredIncidentMaterial,
+        ignoredTransmittedMaterial);
+}
+
+float traceVisibility(
+    ivec2 startCell, vec2 absoluteLightPosition,
+    float solidTransmission) {
+    ivec2 extent = textureSize(materialTexture, 0);
+    vec2 targetPosition =
+        absoluteLightPosition -
+        vec2(trace.originAndOptions.xy);
+    vec2 startPosition = vec2(startCell) + vec2(0.5);
+    int interfaceCount;
+    vec2 initialInterfacePosition;
+    ivec2 liquidCell;
+    uint incidentMaterial;
+    uint transmittedMaterial;
+    float straightVisibility = inspectStraightLightPath(
+        startPosition, targetPosition, solidTransmission, extent,
+        interfaceCount, initialInterfacePosition, liquidCell,
+        incidentMaterial, transmittedMaterial);
+    if (straightVisibility <= 0.0 || interfaceCount != 1) {
+        // Zero interfaces need no optical solve. Multiple interfaces require
+        // a more expensive multi-surface path search; straight visibility is
+        // stable and preferable to a fabricated connection.
+        return straightVisibility;
+    }
+
+    uint liquidMaterial =
+        isLiquid(incidentMaterial)
+            ? incidentMaterial
+            : transmittedMaterial;
+    vec2 geometricDirection =
+        normalize(targetPosition - startPosition);
+    vec2 interfaceNormal = surfaceNormal(
+        liquidCell, extent, liquidMaterial, geometricDirection);
+    vec2 tangent =
+        vec2(-interfaceNormal.y, interfaceNormal.x);
+    float startTangent =
+        dot(startPosition - initialInterfacePosition, tangent);
+    float targetTangent =
+        dot(targetPosition - initialInterfacePosition, tangent);
+    float startHeight = abs(dot(
+        startPosition - initialInterfacePosition,
+        interfaceNormal));
+    float targetHeight = abs(dot(
+        targetPosition - initialInterfacePosition,
+        interfaceNormal));
+    if (startHeight < 0.02 || targetHeight < 0.02) {
+        return straightVisibility;
+    }
+
+    float incidentIor = mediumIor(incidentMaterial);
+    float transmittedIor = mediumIor(transmittedMaterial);
+    float lower = min(startTangent, targetTangent);
+    float upper = max(startTangent, targetTangent);
+    for (int iteration = 0; iteration < 14; ++iteration) {
+        float candidate = (lower + upper) * 0.5;
+        float incidentSlope =
+            (candidate - startTangent) /
+            sqrt((candidate - startTangent) *
+                     (candidate - startTangent) +
+                 startHeight * startHeight);
+        float transmittedSlope =
+            (candidate - targetTangent) /
+            sqrt((candidate - targetTangent) *
+                     (candidate - targetTangent) +
+                 targetHeight * targetHeight);
+        float derivative =
+            incidentIor * incidentSlope +
+            transmittedIor * transmittedSlope;
+        if (derivative < 0.0) {
+            lower = candidate;
+        } else {
+            upper = candidate;
+        }
+    }
+    float crossingTangent = (lower + upper) * 0.5;
+    // The local cell normal is only a trustworthy surface approximation near
+    // the originally observed crossing.
+    crossingTangent = clamp(
+        crossingTangent, -24.0, 24.0);
+    vec2 crossingPosition =
+        initialInterfacePosition +
+        tangent * crossingTangent;
+    vec2 incomingDirection =
+        normalize(crossingPosition - startPosition);
+    vec2 outgoingDirection =
+        normalize(targetPosition - crossingPosition);
+    vec2 refractionNormal = interfaceNormal;
+    if (dot(refractionNormal, incomingDirection) > 0.0) {
+        refractionNormal = -refractionNormal;
+    }
+    vec2 refractedDirection = refract(
+        incomingDirection, refractionNormal,
+        incidentIor / transmittedIor);
+    if (length(refractedDirection) < 0.001 ||
+        dot(normalize(refractedDirection), outgoingDirection) < 0.992) {
+        return straightVisibility;
+    }
+
+    vec2 incidentEnd =
+        crossingPosition - incomingDirection * 0.06;
+    vec2 transmittedStart =
+        crossingPosition + outgoingDirection * 0.06;
+    float incidentVisibility = traceStraightLightSegment(
+        startPosition, incidentEnd, solidTransmission, extent);
+    float transmittedVisibility = traceStraightLightSegment(
+        transmittedStart, targetPosition, solidTransmission, extent);
+    float fresnel = interfaceFresnel(
+        incomingDirection, refractionNormal,
+        incidentIor, transmittedIor);
+    return incidentVisibility * transmittedVisibility *
+           (1.0 - fresnel);
+}
+
+float traceSunMediaTransmittance(ivec2 startCell) {
+    ivec2 extent = textureSize(materialTexture, 0);
+    int rayCount = clamp(
+        (trace.originAndOptions.w >> 16) & 0xffff, 1, 16);
+    float visibilitySum = 0.0;
+    for (int rayIndex = 0; rayIndex < rayCount; ++rayIndex) {
+        float centeredSample =
+            rayCount <= 1
+                ? 0.0
+                : float(rayIndex) / float(rayCount - 1) * 2.0 - 1.0;
+        float angle = centeredSample * trace.celestial.w;
+        float cosine = cos(angle);
+        float sine = sin(angle);
+        vec2 baseDirection = normalize(trace.celestial.xy);
+        vec2 direction = vec2(
+            baseDirection.x * cosine - baseDirection.y * sine,
+            baseDirection.x * sine + baseDirection.y * cosine);
+        vec2 position =
+            vec2(startCell) + vec2(0.5) + direction * 0.72;
+        ivec2 previousCell = startCell;
+        float visibility = 1.0;
+        for (int step = 0; step < 2048; ++step) {
+            position += direction * 0.82;
+            ivec2 sampleCell = ivec2(floor(position));
+            if (any(lessThan(sampleCell, ivec2(0))) ||
+                any(greaterThanEqual(sampleCell, extent))) {
+                break;
+            }
+            if (all(equal(sampleCell, previousCell))) {
+                continue;
+            }
+            uint material =
+                texelFetch(materialTexture, sampleCell, 0).r;
+            // Solid sun occlusion comes from the camera-independent
+            // whole-world horizon. Rechecking solids only inside the current
+            // texture made shadows change when a blocker crossed the screen
+            // edge. This local pass is exclusively for participating media.
+            if (material == 7u) {
+                visibility *= trace.transmission.z;
+            } else if (material == 8u) {
+                visibility *= trace.transmission.w;
+            } else if (material == 4u) {
+                visibility *= 0.997;
+            } else if (material == 5u) {
+                visibility *= 0.988;
+            }
+            previousCell = sampleCell;
+            if (visibility < 0.002) {
+                visibility = 0.0;
+                break;
+            }
+        }
+        visibilitySum += visibility;
+    }
+    return visibilitySum / float(rayCount);
+}
+
+bool findLiquidExit(
+    vec2 startPosition, vec2 direction, uint liquidMaterial,
+    ivec2 extent, out vec2 exitPosition, out ivec2 liquidCell,
+    out ivec2 outsideCell, out float distanceInLiquid) {
+    direction = normalize(direction);
+    vec2 position = startPosition;
+    ivec2 previousCell = ivec2(floor(position));
+    liquidCell = previousCell;
+    outsideCell = previousCell;
+    distanceInLiquid = 0.0;
+    for (int step = 0; step < 1024; ++step) {
+        position += direction * 0.64;
+        distanceInLiquid += 0.64;
+        ivec2 cell = ivec2(floor(position));
+        if (any(lessThan(cell, ivec2(0))) ||
+            any(greaterThanEqual(cell, extent))) {
+            exitPosition = position;
+            outsideCell = clamp(
+                cell, ivec2(0), extent - ivec2(1));
+            return true;
+        }
+        if (all(equal(cell, previousCell))) {
+            continue;
+        }
+        uint material =
+            texelFetch(materialTexture, cell, 0).r;
+        if (material != liquidMaterial) {
+            exitPosition =
+                position - direction * 0.32;
+            liquidCell = previousCell;
+            outsideCell = cell;
+            return true;
+        }
+        previousCell = cell;
+        liquidCell = cell;
+    }
+    return false;
+}
+
+vec2 smoothedLiquidOpticalNormal(
+    ivec2 surfaceCell, ivec2 extent, uint liquidMaterial,
+    vec2 fallback) {
+    // A cell-exact four-neighbor normal changes discontinuously whenever the
+    // free surface advances by one simulation cell. Build the optical normal
+    // from a 5x5 Gaussian-like density footprint instead. Reflections may
+    // retain their small ripple normals; direct sunlight uses this stable,
+    // low-frequency surface only.
+    vec2 gradient = vec2(0.0);
+    for (int offsetY = -2; offsetY <= 2; ++offsetY) {
+        for (int offsetX = -2; offsetX <= 2; ++offsetX) {
+            ivec2 sampleCell =
+                surfaceCell + ivec2(offsetX, offsetY);
+            if (any(lessThan(sampleCell, ivec2(0))) ||
+                any(greaterThanEqual(sampleCell, extent))) {
+                continue;
+            }
+            uvec4 sampleData =
+                texelFetch(materialTexture, sampleCell, 0);
+            if (sampleData.r != liquidMaterial) {
+                continue;
+            }
+            float density = float(sampleData.g) / 255.0;
+            float weightX =
+                abs(offsetX) == 0
+                    ? 6.0
+                    : (abs(offsetX) == 1 ? 4.0 : 1.0);
+            float weightY =
+                abs(offsetY) == 0
+                    ? 6.0
+                    : (abs(offsetY) == 1 ? 4.0 : 1.0);
+            gradient -=
+                vec2(offsetX, offsetY) *
+                density * weightX * weightY;
+        }
+    }
+    if (length(gradient) < 0.001) {
+        gradient = fallback;
+    }
+    vec2 normal = normalize(gradient);
+    // Direct sun enters a pool through its macroscopic upper surface. Clamp
+    // cell-sized cliffs so one newly occupied cell cannot throw a sample far
+    // across the scene.
+    float slope =
+        clamp(normal.x / max(-normal.y, 0.25), -0.85, 0.85);
+    return normalize(vec2(slope, -1.0));
+}
+
+float traceRefractedSunVisibility(ivec2 startCell) {
+    ivec2 extent = textureSize(materialTexture, 0);
+    uint liquidMaterial =
+        texelFetch(materialTexture, startCell, 0).r;
+    if (!isLiquid(liquidMaterial)) {
+        return -1.0;
+    }
+
+    int rayCount = clamp(
+        (trace.originAndOptions.w >> 16) & 0xffff, 1, 16);
+    float visibilitySum = 0.0;
+    vec2 startPosition =
+        vec2(startCell) + vec2(0.5);
+    for (int rayIndex = 0; rayIndex < 16; ++rayIndex) {
+        if (rayIndex >= rayCount) {
+            break;
+        }
+        float centeredSample =
+            rayCount <= 1
+                ? 0.0
+                : float(rayIndex) /
+                      float(rayCount - 1) * 2.0 - 1.0;
+        float angle = centeredSample * trace.celestial.w;
+        float cosine = cos(angle);
+        float sine = sin(angle);
+        vec2 baseDirection =
+            normalize(trace.celestial.xy);
+        vec2 externalDirection = normalize(vec2(
+            baseDirection.x * cosine -
+                baseDirection.y * sine,
+            baseDirection.x * sine +
+                baseDirection.y * cosine));
+        // Begin with the physically correct direction for the overwhelmingly
+        // common horizontal free surface. Starting with the external
+        // direction allowed a submerged solid to be encountered before the
+        // first surface refinement; that path then fell back to the
+        // unrefracted world horizon and produced a second shadow angle.
+        vec2 initialOutwardNormal = vec2(0.0, -1.0);
+        vec2 incomingSunlight = -externalDirection;
+        if (dot(incomingSunlight, initialOutwardNormal) > 0.0) {
+            initialOutwardNormal = -initialOutwardNormal;
+        }
+        vec2 initialLightInside = refract(
+            incomingSunlight, initialOutwardNormal,
+            1.0 / mediumIor(liquidMaterial));
+        vec2 internalDirection =
+            length(initialLightInside) > 0.001
+                ? -normalize(initialLightInside)
+                : externalDirection;
+        vec2 exitPosition = startPosition;
+        ivec2 surfaceLiquidCell = startCell;
+        ivec2 outsideCell = startCell;
+        float distanceInLiquid = 0.0;
+        bool validExit = false;
+        vec2 opticalNormal = initialOutwardNormal;
+
+        // Locate a provisional surface using the stable horizontal-interface
+        // direction, then evaluate the expensive 5x5 optical normal exactly
+        // once. The old iterative solve evaluated it four times per ray.
+        validExit = findLiquidExit(
+            startPosition, internalDirection, liquidMaterial,
+            extent, exitPosition, surfaceLiquidCell,
+            outsideCell, distanceInLiquid);
+        if (validExit) {
+            uint outsideMaterial =
+                texelFetch(materialTexture, outsideCell, 0).r;
+            if (isSolid(outsideMaterial)) {
+                validExit = false;
+            } else {
+                opticalNormal = smoothedLiquidOpticalNormal(
+                    surfaceLiquidCell, extent,
+                    liquidMaterial, -externalDirection);
+                if (dot(-externalDirection, opticalNormal) > 0.0) {
+                    opticalNormal = -opticalNormal;
+                }
+                // Trace the physical sunlight forward from air into liquid,
+                // then reverse it to obtain the receiver-to-sun direction.
+                vec2 lightInside = refract(
+                    -externalDirection, opticalNormal,
+                    1.0 / mediumIor(liquidMaterial));
+                if (length(lightInside) < 0.001) {
+                    validExit = false;
+                } else {
+                    internalDirection = -normalize(lightInside);
+                }
+            }
+        }
+
+        // Retrace once with the solved direction. This retains the refracted
+        // shadow angle while avoiding repeated normal reconstruction.
+        if (validExit) {
+            validExit = findLiquidExit(
+                startPosition, internalDirection, liquidMaterial,
+                extent, exitPosition, surfaceLiquidCell,
+                outsideCell, distanceInLiquid);
+            if (validExit) {
+                uint outsideMaterial =
+                    texelFetch(materialTexture, outsideCell, 0).r;
+                if (isSolid(outsideMaterial)) {
+                    validExit = false;
+                }
+            }
+        }
+        if (!validExit) {
+            // A ray blocked before reaching the water surface contributes no
+            // light. A closed or unresolved liquid volume likewise cannot
+            // receive direct sun; never substitute the unrefracted horizon.
+            continue;
+        }
+
+        vec2 outwardNormal = opticalNormal;
+        vec2 incidentNormal = -outwardNormal;
+        if (dot(incidentNormal, internalDirection) > 0.0) {
+            incidentNormal = -incidentNormal;
+        }
+        float fresnel = interfaceFresnel(
+            internalDirection, incidentNormal,
+            mediumIor(liquidMaterial), 1.0);
+        float visibility =
+            pow(liquidMaterial == 4u ? 0.997 : 0.988,
+                distanceInLiquid) *
+            (1.0 - fresnel);
+
+        ivec2 horizonCell = clamp(
+            outsideCell, ivec2(0), extent - ivec2(1));
+        visibility *=
+            float(imageLoad(derivedImage, horizonCell).a) /
+            255.0;
+
+        // Beyond the exit, the ray follows the true external sun direction.
+        vec2 position =
+            exitPosition + externalDirection * 0.72;
+        ivec2 previousCell = horizonCell;
+        for (int step = 0; step < 2048; ++step) {
+            position += externalDirection * 0.82;
+            ivec2 sampleCell = ivec2(floor(position));
+            if (any(lessThan(sampleCell, ivec2(0))) ||
+                any(greaterThanEqual(sampleCell, extent))) {
+                break;
+            }
+            if (all(equal(sampleCell, previousCell))) {
+                continue;
+            }
+            uint material =
+                texelFetch(
+                    materialTexture, sampleCell, 0).r;
+            if (isSolid(material)) {
+                visibility = 0.0;
+                break;
+            }
+            if (material == 7u) {
+                visibility *= trace.transmission.z;
+            } else if (material == 8u) {
+                visibility *= trace.transmission.w;
+            }
+            previousCell = sampleCell;
+            if (visibility < 0.002) {
+                visibility = 0.0;
+                break;
+            }
+        }
+        visibilitySum += visibility;
+    }
+    return visibilitySum / float(rayCount);
+}
+
+float traceSunVisibility(ivec2 startCell) {
+    if (trace.celestial.z <= 0.0001) {
+        return 0.0;
+    }
+    float refractedVisibility =
+        traceRefractedSunVisibility(startCell);
+    if (refractedVisibility >= 0.0) {
+        return refractedVisibility;
+    }
+    float worldVisibility =
+        float(imageLoad(derivedImage, startCell).a) / 255.0;
+    if (worldVisibility < 0.002) {
+        return 0.0;
+    }
+    ivec2 cachedCell = startCell + trace.sunCache.xy;
+    ivec2 cacheExtent = imageSize(sunTransmittanceImage);
+    float mediaTransmittance;
+    if (trace.sunCache.z != 0 &&
+        all(greaterThanEqual(cachedCell, ivec2(0))) &&
+        all(lessThan(cachedCell, cacheExtent))) {
+        mediaTransmittance =
+            imageLoad(sunTransmittanceImage, cachedCell).r;
+    } else {
+        // Camera reprojection exposes only a narrow edge strip. Trace those
+        // cells live so motion never reveals an uninitialized cache border.
+        mediaTransmittance =
+            traceSunMediaTransmittance(startCell);
+    }
+    return min(mediaTransmittance, worldVisibility);
+}
+
+float lightFalloff(vec2 worldPosition, vec4 light) {
+    if (light.z <= 0.0 || light.w <= 0.0) {
+        return 0.0;
+    }
+    float distanceToLight = distance(worldPosition, light.xy);
+    if (distanceToLight >= light.z) {
+        return 0.0;
+    }
+    float falloff =
+        clamp(1.0 - distanceToLight / light.z, 0.0, 1.0);
+    falloff = falloff * falloff * (3.0 - 2.0 * falloff);
+    return falloff * light.w;
+}
+
+float tracedLight(
+    ivec2 cell, vec2 worldPosition, vec4 light,
+    out float opaqueCenterRay) {
+    float falloff = lightFalloff(worldPosition, light);
+    opaqueCenterRay = 0.0;
+    if (falloff <= 0.0) {
+        return 0.0;
+    }
+    int rayCount = clamp(
+        trace.originAndOptions.w & 0xffff, 1, 1024);
+    float visibility = 0.0;
+    for (int rayIndex = 0; rayIndex < rayCount; ++rayIndex) {
+        vec2 target =
+            light.xy + softRayOffset(
+                rayIndex, rayCount, trace.transmission.x);
+        if (rayIndex == 0) {
+            float opaqueVisibility =
+                traceVisibility(cell, target, 0.0);
+            opaqueCenterRay =
+                falloff * opaqueVisibility;
+            visibility +=
+                opaqueVisibility > 0.0
+                    ? opaqueVisibility
+                    : trace.transmission.y;
+        } else {
+            visibility += traceVisibility(
+                cell, target, trace.transmission.y);
+        }
+    }
+    return falloff * visibility / float(rayCount);
+}
+
+uint hashUint(uint value) {
+    value ^= value >> 16;
+    value *= 0x7feb352du;
+    value ^= value >> 15;
+    value *= 0x846ca68bu;
+    value ^= value >> 16;
+    return value;
+}
+
+float pathRandom(ivec2 cell, int rayIndex, int bounceIndex) {
+    uint frameSeed =
+        (uint(trace.originAndOptions.z) >> 17u) & 0x3fffu;
+    uint spatialSeed =
+        uint(cell.x) * 0x9e3779b9u ^
+        uint(cell.y) * 0x85ebca6bu ^
+        uint(rayIndex + 1) * 0xc2b2ae35u ^
+        uint(bounceIndex + 7) * 0x27d4eb2fu;
+    float baseSample =
+        float(hashUint(spatialSeed)) / 4294967295.0;
+    // Advancing through a golden-ratio sequence covers direction space
+    // evenly over time without replacing the entire pattern with unrelated
+    // white noise every frame.
+    return fract(
+        baseSample + float(frameSeed) * 0.61803398875);
+}
+
+float solidAt(ivec2 cell, ivec2 extent) {
+    if (any(lessThan(cell, ivec2(0))) ||
+        any(greaterThanEqual(cell, extent))) {
+        return 1.0;
+    }
+    return isSolid(texelFetch(materialTexture, cell, 0).r)
+               ? 1.0
+               : 0.0;
+}
+
+float surfaceAt(
+    ivec2 cell, ivec2 extent, uint surfaceMaterial) {
+    if (any(lessThan(cell, ivec2(0))) ||
+        any(greaterThanEqual(cell, extent))) {
+        return isLiquid(surfaceMaterial) ? 0.0 : 1.0;
+    }
+    uint material =
+        texelFetch(materialTexture, cell, 0).r;
+    if (isLiquid(surfaceMaterial)) {
+        return material == surfaceMaterial ? 1.0 : 0.0;
+    }
+    return isSolid(material) ? 1.0 : 0.0;
+}
+
+bool isExposedLiquidSurface(
+    ivec2 cell, ivec2 extent, uint material) {
+    return surfaceAt(cell + ivec2(-1, 0), extent, material) < 0.5 ||
+           surfaceAt(cell + ivec2(1, 0), extent, material) < 0.5 ||
+           surfaceAt(cell + ivec2(0, -1), extent, material) < 0.5 ||
+           surfaceAt(cell + ivec2(0, 1), extent, material) < 0.5;
+}
+
+vec2 surfaceNormal(
+    ivec2 cell, ivec2 extent, uint surfaceMaterial,
+    vec2 fallback) {
+    vec2 normal = vec2(
+        surfaceAt(
+            cell + ivec2(-1, 0), extent, surfaceMaterial) -
+            surfaceAt(
+                cell + ivec2(1, 0), extent, surfaceMaterial),
+        surfaceAt(
+            cell + ivec2(0, -1), extent, surfaceMaterial) -
+            surfaceAt(
+                cell + ivec2(0, 1), extent, surfaceMaterial));
+    if (length(normal) < 0.01) {
+        normal = -fallback;
+    }
+    return normalize(normal);
+}
+
+vec3 surfaceReflectance(uint material) {
+    if (material == 4u) {
+        return vec3(0.36, 0.56, 0.78);
+    }
+    if (material == 5u) {
+        return vec3(0.55, 0.33, 0.16);
+    }
+    if (material == 9u) {
+        return vec3(0.72, 0.39, 0.13);
+    }
+    if (material == 10u) {
+        return vec3(0.85, 0.74, 0.48);
+    }
+    if (material == 11u) {
+        return vec3(0.72, 0.80, 0.86);
+    }
+    if (material == 2u) {
+        return vec3(0.90, 0.68, 0.28);
+    }
+    if (material == 1u) {
+        return vec3(0.56, 0.32, 0.12);
+    }
+    return vec3(0.50, 0.55, 0.68);
+}
+
+bool hierarchyBlockEmpty(ivec2 cell, int blockSize) {
+    if (any(lessThan(cell, ivec2(0)))) {
+        return false;
+    }
+    if (blockSize == 32) {
+        ivec2 block = cell / 32;
+        if (any(greaterThanEqual(
+                block, ivec2(occupancyHierarchy.dimensions.zw)))) {
+            return false;
+        }
+        uint smallBlockCount =
+            occupancyHierarchy.dimensions.x *
+            occupancyHierarchy.dimensions.y;
+        uint index =
+            smallBlockCount +
+            uint(block.y) * occupancyHierarchy.dimensions.z +
+            uint(block.x);
+        return occupancyHierarchy.occupied[index] == 0u;
+    }
+    ivec2 block = cell / 8;
+    if (any(greaterThanEqual(
+            block, ivec2(occupancyHierarchy.dimensions.xy)))) {
+        return false;
+    }
+    uint index =
+        uint(block.y) * occupancyHierarchy.dimensions.x +
+        uint(block.x);
+    return occupancyHierarchy.occupied[index] == 0u;
+}
+
+float distanceToGridBoundary(
+    vec2 position, vec2 direction, float blockSize) {
+    vec2 block = floor(position / blockSize);
+    vec2 minimumBoundary = block * blockSize;
+    vec2 maximumBoundary = minimumBoundary + vec2(blockSize);
+    float distanceX =
+        direction.x > 0.000001
+            ? (maximumBoundary.x - position.x) / direction.x
+            : (direction.x < -0.000001
+                   ? (position.x - minimumBoundary.x) /
+                         -direction.x
+                   : 1.0e30);
+    float distanceY =
+        direction.y > 0.000001
+            ? (maximumBoundary.y - position.y) / direction.y
+            : (direction.y < -0.000001
+                   ? (position.y - minimumBoundary.y) /
+                         -direction.y
+                   : 1.0e30);
+    return min(distanceX, distanceY);
+}
+
+bool marchToSurface(
+    vec2 startPosition, vec2 direction, float maximumDistance,
+    ivec2 extent, out ivec2 hitCell, out ivec2 openCell,
+    out float hitDistance) {
+    direction = normalize(direction);
+    vec2 position = startPosition;
+    ivec2 cell = ivec2(floor(position));
+    openCell = cell;
+    float distanceAlongRay = 0.0;
+    hitDistance = maximumDistance;
+
+    // Empty 32x32 blocks jump directly to their boundary. Occupied large
+    // blocks retry at 8x8, then fall back to exact one-cell traversal.
+    for (int step = 0; step < 512; ++step) {
+        float blockSize = 1.0;
+        if (hierarchyBlockEmpty(cell, 32)) {
+            blockSize = 32.0;
+        } else if (hierarchyBlockEmpty(cell, 8)) {
+            blockSize = 8.0;
+        }
+        float advance =
+            distanceToGridBoundary(position, direction, blockSize) +
+            0.001;
+        distanceAlongRay += advance;
+        if (distanceAlongRay > maximumDistance) {
+            break;
+        }
+        position += direction * advance;
+        ivec2 previousCell =
+            ivec2(floor(position - direction * 0.002));
+        cell = ivec2(floor(position));
+        if (any(lessThan(cell, ivec2(0))) ||
+            any(greaterThanEqual(cell, extent))) {
+            return false;
+        }
+        uint material =
+            texelFetch(materialTexture, cell, 0).r;
+        uint previousMaterial =
+            texelFetch(materialTexture, previousCell, 0).r;
+        if (isSolid(material)) {
+            hitCell = cell;
+            hitDistance = distanceAlongRay;
+            return true;
+        }
+        // A liquid is only a surface where the material changes. Interior
+        // liquid cells remain traversable, avoiding a false bounce per cell.
+        if (isLiquid(previousMaterial) &&
+            material != previousMaterial) {
+            hitCell = previousCell;
+            openCell = cell;
+            hitDistance = distanceAlongRay;
+            return true;
+        }
+        if (isLiquid(material) &&
+            material != previousMaterial) {
+            hitCell = cell;
+            openCell = previousCell;
+            hitDistance = distanceAlongRay;
+            return true;
+        }
+        openCell = cell;
+    }
+    return false;
+}
+
+vec3 directLightAt(ivec2 cell) {
+    ivec2 extent = imageSize(giFinal);
+    ivec2 sampleCell =
+        clamp(cell, ivec2(0), extent - ivec2(1));
+    // The direct pass stores [0, 2] RGB irradiance at half scale.
+    return unpackGiColor(imageLoad(giFinal, sampleCell)) * 2.0;
+}
+
+vec2 initialPathDirection(
+    ivec2 cell, int rayIndex, int rayCount, vec2 normal,
+    bool surfaceCell) {
+    float randomRotation = pathRandom(cell, rayIndex, 0);
+    if (surfaceCell) {
+        vec2 tangent = vec2(-normal.y, normal.x);
+        float spread =
+            (float(rayIndex) + randomRotation) /
+                float(max(rayCount, 1)) *
+                2.0 -
+            1.0;
+        return normalize(normal + tangent * spread * 1.35);
+    }
+    float angle =
+        ((float(rayIndex) + randomRotation) /
+         float(max(rayCount, 1))) *
+        6.28318530718;
+    return vec2(cos(angle), sin(angle));
+}
+
+vec2 bouncedDirection(
+    ivec2 cell, int rayIndex, int bounceIndex, vec2 normal) {
+    vec2 tangent = vec2(-normal.y, normal.x);
+    float spread =
+        pathRandom(cell, rayIndex, bounceIndex) * 2.0 - 1.0;
+    return normalize(normal + tangent * spread * 1.45);
+}
+
+vec2 specularBouncedDirection(
+    ivec2 cell, int rayIndex, int bounceIndex, vec2 incoming,
+    vec2 normal, uint material) {
+    vec2 reflected = reflect(normalize(incoming), normal);
+    vec2 tangent = vec2(-normal.y, normal.x);
+    float spread =
+        pathRandom(cell, rayIndex, bounceIndex) * 2.0 - 1.0;
+    float roughness = material == 4u ? 0.24 : 0.16;
+    return normalize(
+        reflected + tangent * spread * roughness);
+}
+
+vec3 traceGlobalIllumination(
+    ivec2 cell, ivec2 extent, int rayCount, int bounceCount,
+    float maximumDistance, float intensity) {
+    if (bounceCount <= 0 || intensity <= 0.0) {
+        return vec3(0.0);
+    }
+    uint centerMaterial =
+        texelFetch(materialTexture, cell, 0).r;
+    // Solid GI starts in the outward hemisphere. Liquid GI starts inside the
+    // medium and samples all directions so transmitted paths can leave
+    // through the refractive interface instead of behaving like a mirror.
+    bool surfaceCell = isSolid(centerMaterial);
+    vec2 fallback = vec2(0.0, 1.0);
+    vec2 initialNormal =
+        surfaceCell
+            ? surfaceNormal(
+                  cell, extent, centerMaterial, fallback)
+                    : vec2(0.0);
+    vec2 initialPosition = vec2(cell) + vec2(0.5);
+    if (surfaceCell) {
+        initialPosition += initialNormal * 0.8;
+    }
+
+    vec3 indirectLight = vec3(0.0);
+    for (int rayIndex = 0; rayIndex < 32; ++rayIndex) {
+        if (rayIndex >= rayCount) {
+            break;
+        }
+        vec2 position = initialPosition;
+        vec2 direction = initialPathDirection(
+            cell, rayIndex, rayCount, initialNormal, surfaceCell);
+        vec3 throughput = vec3(1.0);
+        float remainingDistance = maximumDistance;
+        int opaqueBounces = 0;
+        for (int pathEvent = 0; pathEvent < 16; ++pathEvent) {
+            if (opaqueBounces >= bounceCount ||
+                remainingDistance <= 0.01) {
+                break;
+            }
+            ivec2 mediumCell = clamp(
+                ivec2(floor(position)),
+                ivec2(0), extent - ivec2(1));
+            uint incidentMaterial =
+                texelFetch(materialTexture, mediumCell, 0).r;
+            ivec2 hitCell;
+            ivec2 openCell;
+            float hitDistance;
+            if (!marchToSurface(
+                    position, direction, remainingDistance, extent,
+                    hitCell, openCell, hitDistance)) {
+                break;
+            }
+            remainingDistance -= hitDistance;
+            if (isLiquid(incidentMaterial)) {
+                throughput *= liquidPathTransmission(
+                    incidentMaterial, hitDistance);
+            }
+
+            float distanceAttenuation =
+                1.0 - hitDistance /
+                          max(maximumDistance, 0.01) * 0.45;
+            uint hitMaterial =
+                texelFetch(materialTexture, hitCell, 0).r;
+            vec2 boundaryPosition =
+                position + direction * hitDistance;
+            if (isLiquid(hitMaterial)) {
+                uint transmittedMaterial =
+                    isLiquid(incidentMaterial)
+                        ? texelFetch(
+                              materialTexture, openCell, 0).r
+                        : hitMaterial;
+                float incidentIor =
+                    mediumIor(incidentMaterial);
+                float transmittedIor =
+                    mediumIor(transmittedMaterial);
+                vec2 normal =
+                    surfaceNormal(
+                        hitCell, extent, hitMaterial, direction);
+                if (dot(normal, direction) > 0.0) {
+                    normal = -normal;
+                }
+                vec2 refracted = refract(
+                    direction, normal,
+                    incidentIor / transmittedIor);
+                float fresnel = interfaceFresnel(
+                    direction, normal,
+                    incidentIor, transmittedIor);
+                if (length(refracted) < 0.001) {
+                    direction =
+                        normalize(reflect(direction, normal));
+                } else {
+                    direction = normalize(refracted);
+                    throughput *= 1.0 - fresnel;
+                }
+                position =
+                    boundaryPosition + direction * 0.10;
+                if (max(throughput.r,
+                        max(throughput.g, throughput.b)) < 0.015) {
+                    break;
+                }
+                // Transparent interfaces alter the path but do not consume
+                // an indirect diffuse bounce.
+                continue;
+            }
+
+            throughput *=
+                surfaceReflectance(hitMaterial) * 0.58;
+            indirectLight +=
+                directLightAt(openCell) * throughput *
+                distanceAttenuation;
+            if (max(throughput.r,
+                    max(throughput.g, throughput.b)) < 0.015) {
+                break;
+            }
+            vec2 normal =
+                surfaceNormal(
+                    hitCell, extent, hitMaterial, direction);
+            // The normal must face the side the ray arrived from. Without
+            // this correction, ambiguous corner normals can launch the next
+            // bounce into the solid and make a thin wall look transmissive.
+            if (dot(normal, direction) > 0.0) {
+                normal = -normal;
+            }
+            direction =
+                hitMaterial == 11u
+                    ? specularBouncedDirection(
+                          hitCell, rayIndex, opaqueBounces + 1,
+                          direction, normal, hitMaterial)
+                    : bouncedDirection(
+                          hitCell, rayIndex, opaqueBounces + 1,
+                          normal);
+            opaqueBounces += 1;
+            vec2 reflectedPosition =
+                vec2(hitCell) + vec2(0.5) + normal * 0.72;
+            ivec2 reflectedCell =
+                ivec2(floor(reflectedPosition));
+            position =
+                surfaceAt(
+                    reflectedCell, extent, hitMaterial) > 0.5
+                    ? vec2(openCell) + vec2(0.5)
+                    : reflectedPosition;
+        }
+    }
+    return clamp(
+        indirectLight / float(max(rayCount, 1)) * intensity,
+        vec3(0.0), vec3(1.0));
+}
+
+bool filterPathMatchesMaterialClass(
+    int centerX, int centerY, int offsetX, int offsetY,
+    uint centerSolid) {
+    int steps = max(abs(offsetX), abs(offsetY));
+    for (int step = 1; step < steps; ++step) {
+        vec2 alongPath =
+            vec2(offsetX, offsetY) *
+            (float(step) / float(steps));
+        ivec2 pathOffset = ivec2(round(alongPath));
+        int pathIndex =
+            (centerY + pathOffset.y) * shadowTileWidth +
+            centerX + pathOffset.x;
+        if (solidTile[pathIndex] != centerSolid) {
+            return false;
+        }
+    }
+    return true;
+}
+
+ivec2 historyCameraOffset() {
+    uint packedOffset = floatBitsToUint(trace.indirect.w);
+    int offsetX = int(packedOffset & 0xffffu);
+    int offsetY = int((packedOffset >> 16u) & 0xffffu);
+    if (offsetX >= 32768) {
+        offsetX -= 65536;
+    }
+    if (offsetY >= 32768) {
+        offsetY -= 65536;
+    }
+    return ivec2(offsetX, offsetY);
+}
+
+bool loadHistory(
+    ivec2 cell, ivec2 extent, uint currentMaterial,
+    out vec4 history) {
+    if ((trace.originAndOptions.z & (1 << 16)) == 0) {
+        return false;
+    }
+    ivec2 historyCell = cell + historyCameraOffset();
+    if (any(lessThan(historyCell, ivec2(0))) ||
+        any(greaterThanEqual(historyCell, extent))) {
+        return false;
+    }
+    history = texelFetch(historyImage, historyCell, 0);
+    return uint(round(history.a)) == currentMaterial;
+}
+
+void filterVisibility(ivec2 cell, ivec2 extent) {
+    ivec2 groupBase = ivec2(gl_WorkGroupID.xy) * ivec2(8);
+    uint localIndex =
+        gl_LocalInvocationID.y * 8u + gl_LocalInvocationID.x;
+    for (uint index = localIndex;
+         index < uint(shadowTileWidth * shadowTileHeight);
+         index += 64u) {
+        int tileX = int(index % uint(shadowTileWidth));
+        int tileY = int(index / uint(shadowTileWidth));
+        ivec2 sampleCell = clamp(
+            groupBase +
+                ivec2(tileX - shadowFilterRadius,
+                      tileY - shadowFilterRadius),
+            ivec2(0), extent - ivec2(1));
+        uvec4 rawVisibility =
+            imageLoad(lightingIntermediate, sampleCell);
+        vec4 rawGi =
+            imageLoad(giIntermediate, sampleCell);
+        uvec4 derived = imageLoad(derivedImage, sampleCell);
+        shadowTile[index] = vec4(
+            vec2(rawVisibility.rg) / 255.0,
+            0.0,
+            float(derived.g) / 255.0);
+        giTile[index] = unpackGiColor(rawGi);
+        uint material =
+            texelFetch(materialTexture, sampleCell, 0).r;
+        solidTile[index] = giFilterClass(material);
+    }
+    barrier();
+
+    if (any(greaterThanEqual(cell, extent))) {
+        return;
+    }
+    int centerX =
+        int(gl_LocalInvocationID.x) + shadowFilterRadius;
+    int centerY =
+        int(gl_LocalInvocationID.y) + shadowFilterRadius;
+    uint centerSolid =
+        solidTile[centerY * shadowTileWidth + centerX];
+    vec4 filtered = vec4(0.0);
+    vec3 filteredGi = vec3(0.0);
+    float giWeight = 0.0;
+    float directVisibilityWeight = 0.0;
+    float sunVisibilityWeight = 0.0;
+    vec3 giMinimum = vec3(1.0);
+    vec3 giMaximum = vec3(0.0);
+    for (int offsetY = -shadowFilterRadius;
+         offsetY <= shadowFilterRadius; ++offsetY) {
+        for (int offsetX = -shadowFilterRadius;
+             offsetX <= shadowFilterRadius; ++offsetX) {
+            int tileIndex =
+                (centerY + offsetY) * shadowTileWidth +
+                centerX + offsetX;
+            if (solidTile[tileIndex] != centerSolid) {
+                continue;
+            }
+            if (!filterPathMatchesMaterialClass(
+                    centerX, centerY, offsetX, offsetY,
+                    centerSolid)) {
+                continue;
+            }
+            float weight =
+                giGaussianWeights[offsetX + shadowFilterRadius] *
+                giGaussianWeights[offsetY + shadowFilterRadius];
+            filteredGi += giTile[tileIndex] * weight;
+            giWeight += weight;
+            if (abs(offsetX) <= visibilityFilterRadius &&
+                abs(offsetY) <= visibilityFilterRadius) {
+                float visibilityWeightAtSample =
+                    float(visibilityFilterRadius + 1 -
+                          abs(offsetX)) *
+                    float(visibilityFilterRadius + 1 -
+                          abs(offsetY));
+                filtered.rg +=
+                    shadowTile[tileIndex].rg *
+                    visibilityWeightAtSample;
+                directVisibilityWeight +=
+                    visibilityWeightAtSample;
+            }
+            int sunFilterRadius =
+                centerSolid == 2u || centerSolid == 3u
+                    ? shadowFilterRadius
+                    : visibilityFilterRadius;
+            if (abs(offsetX) <= sunFilterRadius &&
+                abs(offsetY) <= sunFilterRadius) {
+                float sunWeight =
+                    centerSolid == 2u || centerSolid == 3u
+                        ? weight
+                        : float(sunFilterRadius + 1 -
+                                abs(offsetX)) *
+                              float(sunFilterRadius + 1 -
+                                    abs(offsetY));
+                filtered.a +=
+                    shadowTile[tileIndex].a * sunWeight;
+                sunVisibilityWeight += sunWeight;
+            }
+            giMinimum =
+                min(giMinimum, giTile[tileIndex]);
+            giMaximum =
+                max(giMaximum, giTile[tileIndex]);
+        }
+    }
+    filtered.rg /= max(directVisibilityWeight, 1.0);
+    filtered.a /= max(sunVisibilityWeight, 1.0);
+    filteredGi /= max(giWeight, 1.0);
+    uint currentMaterial =
+        texelFetch(materialTexture, cell, 0).r;
+    vec4 history;
+    if (loadHistory(
+            cell, extent, currentMaterial, history)) {
+        vec3 historyGi =
+            clamp(unpackGiColor(history), giMinimum, giMaximum);
+        float difference = max(
+            abs(historyGi.r - filteredGi.r),
+            max(abs(historyGi.g - filteredGi.g),
+                abs(historyGi.b - filteredGi.b)));
+        float stableWeight =
+            clamp(trace.indirect.z, 0.0, 0.985);
+        float response =
+            smoothstep(0.12, 0.42, difference);
+        float responsiveWeight = mix(
+            stableWeight, min(stableWeight, 0.28),
+            response);
+        filteredGi =
+            mix(filteredGi, historyGi, responsiveWeight);
+    }
+    filtered.b = giLuminance(filteredGi);
+    imageStore(lightingFinal, cell,
+               packLighting(filtered.rg, filtered.b,
+                            currentMaterial));
+    imageStore(giFinal, cell,
+               packGiColor(filteredGi, currentMaterial));
+    uvec4 derived = imageLoad(derivedImage, cell);
+    derived.g = uint(round(clamp(filtered.a, 0.0, 1.0) * 255.0));
+    imageStore(derivedImage, cell, derived);
+}
+
+void main() {
+    ivec2 outputCell = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 extent = imageSize(lightingIntermediate);
+    if (trace.sunCache.w != 0) {
+        if (any(greaterThanEqual(outputCell, extent))) {
+            return;
+        }
+        ivec2 materialExtent = textureSize(materialTexture, 0);
+        ivec2 cell = min(
+            outputCell * lightingResolutionScale +
+                ivec2(lightingResolutionScale / 2),
+            materialExtent - ivec2(1));
+        // Cells already blocked by the whole-world solid horizon cannot
+        // receive sunlight, so their participating-media result is unused.
+        // Avoid the long march for the majority of enclosed tomb cells.
+        float worldVisibility =
+            float(imageLoad(derivedImage, cell).a) / 255.0;
+        uint material =
+            texelFetch(materialTexture, cell, 0).r;
+        float mediaTransmittance =
+            worldVisibility < 0.002 || isLiquid(material)
+                ? 1.0
+                : traceSunMediaTransmittance(cell);
+        imageStore(
+            sunTransmittanceImage, outputCell,
+            vec4(mediaTransmittance, 0.0, 0.0, 1.0));
+        return;
+    }
+    bool filterStage = (trace.originAndOptions.z & 2) != 0;
+    if (filterStage) {
+        filterVisibility(outputCell, extent);
+        return;
+    }
+    if (any(greaterThanEqual(outputCell, extent))) {
+        return;
+    }
+
+    ivec2 materialExtent = textureSize(materialTexture, 0);
+    ivec2 cell = min(
+        outputCell * lightingResolutionScale +
+            ivec2(lightingResolutionScale / 2),
+        materialExtent - ivec2(1));
+    uint material =
+        texelFetch(materialTexture, cell, 0).r;
+    bool giStage = (trace.originAndOptions.z & 4) != 0;
+    bool debugMode = (trace.originAndOptions.z & 1) != 0;
+
+    if (giStage) {
+        uvec4 cachedDirect =
+            imageLoad(lightingFinal, outputCell);
+        vec2 visibility = vec2(cachedDirect.rg) / 255.0;
+        vec3 indirectLight = vec3(0.0);
+        if (!debugMode) {
+            bool reusedHistory = false;
+            bool adaptiveSampling =
+                (trace.originAndOptions.z & 8) != 0;
+            vec4 history;
+            if (adaptiveSampling &&
+                loadHistory(
+                    outputCell, extent, material, history)) {
+                uint frameSeed =
+                    (uint(trace.originAndOptions.z) >> 17u) &
+                    0x3fffu;
+                float directIllumination =
+                    unpackGi(cachedDirect) * 2.0;
+                uint updatePeriod =
+                    directIllumination > 0.08 ? 2u : 4u;
+                uint updatePhase =
+                    (uint(outputCell.x) +
+                     uint(outputCell.y) * 3u + frameSeed) &
+                    (updatePeriod - 1u);
+                if (updatePhase != 0u) {
+                    indirectLight = unpackGiColor(history);
+                    reusedHistory = true;
+                }
+            }
+            if (!reusedHistory) {
+                int bounceCount =
+                    (trace.originAndOptions.z >> 4) & 15;
+                int giRayCount =
+                    (trace.originAndOptions.z >> 8) & 255;
+                indirectLight = traceGlobalIllumination(
+                    cell, materialExtent, giRayCount, bounceCount,
+                    trace.indirect.y, trace.indirect.x);
+            }
+        }
+        imageStore(
+            lightingIntermediate, outputCell,
+            packLighting(
+                visibility, giLuminance(indirectLight), material));
+        imageStore(
+            giIntermediate, outputCell,
+            packGiColor(indirectLight, material));
+        return;
+    }
+
+    vec2 worldPosition =
+        vec2(trace.originAndOptions.xy + cell) + vec2(0.5);
+    float playerUnshadowed =
+        lightFalloff(worldPosition, sceneLights.playerLight);
+    float opaqueDirectIllumination = 0.0;
+    float playerTraced =
+        tracedLight(
+            cell, worldPosition, sceneLights.playerLight,
+            opaqueDirectIllumination);
+    vec3 directRadiance =
+        opaqueDirectIllumination * vec3(1.00, 0.88, 0.69);
+    float sunVisibility = traceSunVisibility(cell);
+    uvec4 derived = imageLoad(derivedImage, outputCell);
+    derived.g =
+        uint(round(clamp(sunVisibility, 0.0, 1.0) * 255.0));
+    imageStore(derivedImage, outputCell, derived);
+    opaqueDirectIllumination +=
+        sunVisibility * trace.celestial.z;
+    directRadiance +=
+        sunVisibility * trace.celestial.z *
+        vec3(1.00, 0.82, 0.56);
+    float fireUnshadowed = 0.0;
+    float fireTraced = 0.0;
+    if (!debugMode) {
+        uint tileColumns =
+            uint((extent.x + 7) / 8);
+        uint tileIndex =
+            gl_WorkGroupID.y * tileColumns +
+            gl_WorkGroupID.x;
+        uint tileLightCount =
+            lightTileBuffer.tiles[tileIndex].count;
+        for (uint tileLight = 0u;
+             tileLight < tileLightCount; ++tileLight) {
+            uint index =
+                lightTileBuffer.tiles[tileIndex]
+                    .indices[tileLight];
+            fireUnshadowed +=
+                lightFalloff(worldPosition, sceneLights.fireLights[index]);
+            float fireDirect = 0.0;
+            fireTraced += tracedLight(
+                cell, worldPosition, sceneLights.fireLights[index],
+                fireDirect);
+            opaqueDirectIllumination += fireDirect;
+            directRadiance += fireDirect *
+                vec3(1.18, 0.43, 0.10);
+        }
+    }
+
+    vec2 visibility = vec2(1.0);
+    if (!debugMode) {
+        visibility.x =
+            playerUnshadowed <= 0.0001
+                ? 1.0
+                : clamp(playerTraced / playerUnshadowed, 0.0, 1.0);
+        visibility.y =
+            fireUnshadowed <= 0.0001
+                ? 1.0
+                : clamp(fireTraced / fireUnshadowed, 0.0, 1.0);
+    }
+    float directIllumination =
+        min(opaqueDirectIllumination, 2.0);
+    imageStore(
+        lightingFinal, outputCell,
+        packLighting(
+            visibility, directIllumination * 0.5, material));
+    imageStore(
+        giFinal, outputCell,
+        packGiColor(directRadiance * 0.5, material));
+}

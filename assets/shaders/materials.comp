@@ -1,0 +1,942 @@
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+const uint AIR = 0u;
+const uint DIRT = 1u;
+const uint SAND = 2u;
+const uint ROCK = 3u;
+const uint WATER = 4u;
+const uint OIL = 5u;
+const uint FIRE = 6u;
+const uint SMOKE = 7u;
+const uint STEAM = 8u;
+const uint WOOD = 9u;
+const uint STONE = 10u;
+const uint METAL = 11u;
+
+struct Cell {
+    uint material;
+    uint liquidAmount;
+    int flowX;
+    int flowY;
+    float heat;
+    float burnProgress;
+    float gasLifetime;
+    int gasDrift;
+    float density;
+    float momentumX;
+    float momentumY;
+    float totalEnergy;
+};
+
+layout(std430, binding = 7) buffer StateA {
+    Cell stateA[];
+};
+
+layout(std430, binding = 8) buffer StateB {
+    Cell stateB[];
+};
+
+struct LiquidFlux {
+    ivec4 water;
+    ivec4 oil;
+};
+
+layout(std430, binding = 9) buffer LiquidFluxBuffer {
+    LiquidFlux liquidFlux[];
+};
+
+layout(push_constant) uniform MaterialPush {
+    ivec4 region;
+    uvec4 options;
+} pushData;
+
+uint cellIndex(ivec2 position) {
+    return uint(position.y * pushData.region.x + position.x);
+}
+
+bool inside(ivec2 position) {
+    return all(greaterThanEqual(position, ivec2(0))) &&
+           position.x < pushData.region.x &&
+           position.y < pushData.region.y;
+}
+
+Cell boundaryCell() {
+    return Cell(ROCK, 0u, 0, 0, 0.0, 0.0, 0.0, 0,
+                0.0, 0.0, 0.0, 0.0);
+}
+
+Cell readCell(ivec2 position) {
+    if (!inside(position)) {
+        return boundaryCell();
+    }
+    uint index = cellIndex(position);
+    return pushData.options.y == 0u ? stateA[index] : stateB[index];
+}
+
+void writeCell(ivec2 position, Cell cell) {
+    uint index = cellIndex(position);
+    if (pushData.options.y == 0u) {
+        stateB[index] = cell;
+    } else {
+        stateA[index] = cell;
+    }
+}
+
+uint hashValue(uvec3 value) {
+    value = value * 1664525u + 1013904223u;
+    value.x += value.y * value.z;
+    value.y += value.z * value.x;
+    value.z += value.x * value.y;
+    value ^= value >> 16u;
+    value.x += value.y * value.z;
+    return value.x ^ value.y ^ value.z;
+}
+
+uint randomAt(ivec2 position, uint stream) {
+    ivec2 world = position + pushData.region.zw;
+    return hashValue(uvec3(world, pushData.options.z + stream));
+}
+
+bool isLiquid(uint material) {
+    return material == WATER || material == OIL;
+}
+
+bool isGas(uint material) {
+    return material == AIR || material == FIRE ||
+           material == SMOKE || material == STEAM;
+}
+
+bool isOpenGas(uint material) {
+    return material == AIR || material == FIRE ||
+           material == SMOKE || material == STEAM;
+}
+
+bool targetAcceptsLiquid(ivec2 position, uint material) {
+    Cell target = readCell(position);
+    if (target.material == material) {
+        return true;
+    }
+    if (!isGas(target.material)) {
+        return false;
+    }
+    if (material == WATER) {
+        return true;
+    }
+
+    // A cell cannot hold both liquids. Reserve contested empty cells for
+    // denser water so simultaneous water and oil fluxes cannot overwrite and
+    // destroy one another's mass.
+    const ivec2 neighbors[4] = ivec2[](
+        ivec2(-1, 0), ivec2(1, 0),
+        ivec2(0, -1), ivec2(0, 1));
+    for (int index = 0; index < 4; ++index) {
+        Cell neighbor = readCell(position + neighbors[index]);
+        if (neighbor.material == WATER && neighbor.liquidAmount > 0u) {
+            return false;
+        }
+    }
+    return true;
+}
+
+Cell makeAir() {
+    return Cell(AIR, 0u, 0, 0, 0.0, 0.0, 0.0, 0,
+                1.0, 0.0, 0.0, 2.5);
+}
+
+Cell makeSmoke(ivec2 position, float heat) {
+    float variation = float(
+        ((position.x + pushData.region.z) * 37 +
+         (position.y + pushData.region.w) * 17) & 7);
+    int drift = (randomAt(position, 41u) & 1u) == 0u ? -1 : 1;
+    return Cell(SMOKE, 0u, 0, -64, max(heat, 0.12), 0.0,
+                10.0 + variation * 0.8, drift,
+                1.08, 0.0, -0.12, 2.8);
+}
+
+bool isFluid(uint material) {
+    return isGas(material) || isLiquid(material);
+}
+
+float referenceDensity(uint material) {
+    if (material == WATER) {
+        return 8.0;
+    }
+    if (material == OIL) {
+        return 6.6;
+    }
+    if (material == STEAM) {
+        return 0.72;
+    }
+    if (material == SMOKE) {
+        return 1.08;
+    }
+    if (material == FIRE) {
+        return 0.68;
+    }
+    return 1.0;
+}
+
+float heatCapacityRatio(uint material) {
+    return isLiquid(material) ? 4.4 : 1.4;
+}
+
+float pressureOffset(uint material) {
+    return material == WATER ? 4.0 : (material == OIL ? 3.0 : 0.0);
+}
+
+float restingEnergy(uint material) {
+    if (!isFluid(material)) {
+        return 0.0;
+    }
+    float gamma = heatCapacityRatio(material);
+    float offset = pressureOffset(material);
+    return (1.0 + gamma * offset) / (gamma - 1.0);
+}
+
+void resetFluidState(inout Cell cell) {
+    cell.density = referenceDensity(cell.material);
+    cell.momentumX = 0.0;
+    cell.momentumY = cell.material == STEAM ? -0.12 : 0.0;
+    cell.totalEnergy = restingEnergy(cell.material);
+    if (cell.material == FIRE) {
+        cell.totalEnergy += 1.5;
+    } else if (cell.material == SMOKE) {
+        cell.totalEnergy += max(cell.heat, 0.12) * 0.8;
+    }
+}
+
+float neighborAverageHeat(ivec2 position) {
+    return (readCell(position + ivec2(-1, 0)).heat +
+            readCell(position + ivec2(1, 0)).heat +
+            readCell(position + ivec2(0, -1)).heat +
+            readCell(position + ivec2(0, 1)).heat) * 0.25;
+}
+
+void updateHeatAndCombustion(ivec2 position) {
+    Cell cell = readCell(position);
+    uint originalMaterial = cell.material;
+    Cell left = readCell(position + ivec2(-1, 0));
+    Cell right = readCell(position + ivec2(1, 0));
+    Cell above = readCell(position + ivec2(0, -1));
+    Cell below = readCell(position + ivec2(0, 1));
+
+    cell.heat = clamp(
+        (cell.heat * 0.87 + neighborAverageHeat(position) * 0.13) * 0.992,
+        0.0, 1.0);
+    if (cell.material == WATER) {
+        cell.heat *= 0.72;
+    }
+
+    bool touchesWater =
+        left.material == WATER || right.material == WATER ||
+        above.material == WATER || below.material == WATER;
+    bool exposedToAir =
+        isOpenGas(left.material) || isOpenGas(right.material) ||
+        isOpenGas(above.material) || isOpenGas(below.material);
+    bool touchesFire =
+        left.material == FIRE || right.material == FIRE ||
+        above.material == FIRE || below.material == FIRE;
+
+    if (cell.material == FIRE) {
+        cell.heat = max(0.0, cell.heat - 0.045);
+        if (touchesWater) {
+            cell.heat *= 0.55;
+        }
+        if (cell.heat < 0.10) {
+            cell = makeSmoke(position, cell.heat);
+        }
+    } else if (cell.material == SMOKE) {
+        cell.heat *= 0.975;
+        cell.gasLifetime -= 1.0 / 30.0;
+        if (cell.gasLifetime <= 0.0) {
+            cell = makeAir();
+        }
+    } else if (cell.material == STEAM) {
+        cell.heat *= 0.92;
+        if (cell.heat < 0.055) {
+            cell.material = WATER;
+            cell.liquidAmount = max(cell.liquidAmount, 1u);
+            cell.flowX = 0;
+            cell.flowY = 0;
+            cell.gasLifetime = 0.0;
+            cell.gasDrift = 0;
+        }
+    } else if (cell.material == WOOD) {
+        if (touchesFire && randomAt(position, 29u) % 100u < 22u) {
+            cell.heat = 1.0;
+        }
+        if (touchesWater) {
+            cell.heat *= 0.28;
+        }
+        if (cell.heat > 0.34) {
+            cell.heat = max(cell.heat, 0.78);
+            cell.burnProgress = min(
+                1.0, cell.burnProgress + 0.006 + cell.heat * 0.006);
+            if (cell.burnProgress >= 1.0) {
+                cell = makeSmoke(position, cell.heat);
+            }
+        }
+    } else if (cell.material == OIL) {
+        if (touchesFire && randomAt(position, 31u) % 100u < 48u) {
+            cell.heat = 1.0;
+        }
+        if (touchesWater) {
+            cell.heat *= 0.22;
+        }
+        if (exposedToAir && cell.heat > 0.40) {
+            cell.heat = max(cell.heat, 0.86);
+            uint consumed = 2u + uint(cell.heat * 3.0);
+            if (cell.liquidAmount <= consumed) {
+                cell = makeAir();
+            } else {
+                cell.liquidAmount -= consumed;
+            }
+        }
+    } else if (cell.material == WATER && cell.heat > 0.58) {
+        cell.material = STEAM;
+        cell.flowX = 0;
+        cell.flowY = -127;
+        cell.gasDrift = (randomAt(position, 53u) & 1u) == 0u ? -1 : 1;
+    } else if (cell.material == AIR || cell.material == SMOKE) {
+        bool nearBurningFuel =
+            (left.material == WOOD && left.heat > 0.60) ||
+            (right.material == WOOD && right.heat > 0.60) ||
+            (above.material == WOOD && above.heat > 0.60) ||
+            (below.material == WOOD && below.heat > 0.60) ||
+            (left.material == OIL && left.heat > 0.62) ||
+            (right.material == OIL && right.heat > 0.62) ||
+            (above.material == OIL && above.heat > 0.62) ||
+            (below.material == OIL && below.heat > 0.62);
+        if (nearBurningFuel && randomAt(position, 67u) % 100u < 32u) {
+            cell = Cell(FIRE, 0u, 0, -96, 1.0, 0.0, 0.0, 0,
+                        0.68, 0.0, -0.18, 4.0);
+        }
+    }
+
+    if (cell.material != WOOD) {
+        cell.burnProgress = 0.0;
+    }
+    if (cell.material != originalMaterial) {
+        resetFluidState(cell);
+    }
+    writeCell(position, cell);
+}
+
+int stableBottomMass(int totalMass) {
+    if (totalMass <= 255) {
+        return 255;
+    }
+    if (totalMass < 542) {
+        return (255 * 255 + totalMass * 32) / 287;
+    }
+    return (totalMass + 32) / 2;
+}
+
+int densityDirection(ivec2 position) {
+    ivec2 world = position + pushData.region.zw;
+    return ((world.x + world.y + int(pushData.options.z)) & 1) == 0
+               ? -1
+               : 1;
+}
+
+ivec2 densityPartner(ivec2 position) {
+    Cell cell = readCell(position);
+    int direction = densityDirection(position);
+    if (cell.material == WATER) {
+        const ivec2 offsets[3] = ivec2[](
+            ivec2(0, 1), ivec2(direction, 1),
+            ivec2(-direction, 1));
+        for (int index = 0; index < 3; ++index) {
+            ivec2 target = position + offsets[index];
+            if (readCell(target).material == OIL) {
+                return target;
+            }
+        }
+    } else if (cell.material == OIL) {
+        const ivec2 offsets[3] = ivec2[](
+            ivec2(0, -1), ivec2(-direction, -1),
+            ivec2(direction, -1));
+        for (int index = 0; index < 3; ++index) {
+            ivec2 target = position + offsets[index];
+            if (readCell(target).material == WATER) {
+                return target;
+            }
+        }
+    }
+    return position;
+}
+
+void settleLiquidDensity(ivec2 position) {
+    ivec2 partner = densityPartner(position);
+    Cell result = readCell(position);
+    // Only accept mutual pairs. This prevents two cells from selecting the
+    // same destination while still allowing oil to rise diagonally around
+    // uneven water boundaries.
+    if (any(notEqual(partner, position)) &&
+        all(equal(densityPartner(partner), position))) {
+        result = readCell(partner);
+    }
+    writeCell(position, result);
+}
+
+ivec4 flowsFrom(ivec2 position, uint material) {
+    Cell source = readCell(position);
+    if (source.material != material || source.liquidAmount == 0u) {
+        return ivec4(0);
+    }
+
+    bool water = material == WATER;
+    int remaining = int(source.liquidAmount);
+    ivec4 flow = ivec4(0); // down, left, right, up
+    Cell down = readCell(position + ivec2(0, 1));
+    if (targetAcceptsLiquid(position + ivec2(0, 1), material)) {
+        int targetMass =
+            down.material == material ? int(down.liquidAmount) : 0;
+        int wanted = stableBottomMass(remaining + targetMass) - targetMass;
+        flow.x = clamp(wanted, 0, min(remaining, 255));
+        remaining -= flow.x;
+    }
+
+    int firstDirection =
+        source.flowX != 0 ? (source.flowX > 0 ? 1 : -1)
+                          : ((randomAt(position, 101u) & 1u) == 0u ? -1 : 1);
+    for (int pass = 0; pass < 2; ++pass) {
+        int direction = pass == 0 ? firstDirection : -firstDirection;
+        Cell target = readCell(position + ivec2(direction, 0));
+        if (!targetAcceptsLiquid(
+                position + ivec2(direction, 0), material)) {
+            continue;
+        }
+        int targetMass =
+            target.material == material ? int(target.liquidAmount) : 0;
+        bool createsCell = target.material != material;
+        int amount =
+            (remaining - targetMass) / (createsCell
+                                           ? (water ? 2 : 3)
+                                           : (water ? 2 : 4));
+        if (createsCell) {
+            amount = min(amount, remaining - (water ? 0 : 32));
+            if (amount < (water ? 8 : 24)) {
+                amount = 0;
+            }
+        } else if (amount > 0 && amount < (water ? 6 : 4)) {
+            amount = water ? 6 : 4;
+        }
+        amount = clamp(amount, 0,
+                       min(remaining, water ? 220 : 160));
+        if (direction < 0) {
+            flow.y = amount;
+        } else {
+            flow.z = amount;
+        }
+        remaining -= amount;
+    }
+
+    if (remaining > 255) {
+        int excess = remaining - 255;
+        if (excess >= 8) {
+            Cell up = readCell(position + ivec2(0, -1));
+            if (targetAcceptsLiquid(
+                    position + ivec2(0, -1), material)) {
+                flow.w = min(excess, water ? 128 : 64);
+            }
+        }
+    }
+    return flow;
+}
+
+ivec4 storedFlux(ivec2 position, uint material) {
+    if (!inside(position)) {
+        return ivec4(0);
+    }
+    LiquidFlux flux = liquidFlux[cellIndex(position)];
+    return material == WATER ? flux.water : flux.oil;
+}
+
+void calculateLiquidFlux(ivec2 position) {
+    liquidFlux[cellIndex(position)] = LiquidFlux(
+        flowsFrom(position, WATER),
+        flowsFrom(position, OIL));
+}
+
+int updatedLiquidMass(ivec2 position, uint material) {
+    Cell cell = readCell(position);
+    int mass = cell.material == material ? int(cell.liquidAmount) : 0;
+    ivec4 own = storedFlux(position, material);
+    mass -= own.x + own.y + own.z + own.w;
+    mass += storedFlux(position + ivec2(0, -1), material).x;
+    mass += storedFlux(position + ivec2(1, 0), material).y;
+    mass += storedFlux(position + ivec2(-1, 0), material).z;
+    mass += storedFlux(position + ivec2(0, 1), material).w;
+    return clamp(mass, 0, 287);
+}
+
+void updateLiquids(ivec2 position) {
+    Cell cell = readCell(position);
+    uint previousMaterial = cell.material;
+    if (!isLiquid(cell.material) && !isGas(cell.material)) {
+        writeCell(position, cell);
+        return;
+    }
+
+    int waterMass = updatedLiquidMass(position, WATER);
+    int oilMass = updatedLiquidMass(position, OIL);
+    if (waterMass <= 0 && oilMass <= 0) {
+        if (isLiquid(cell.material)) {
+            cell = makeAir();
+        }
+        writeCell(position, cell);
+        return;
+    }
+
+    uint selected =
+        waterMass > 0 &&
+                (cell.material == WATER || oilMass <= 0 ||
+                 waterMass >= oilMass)
+            ? WATER
+            : OIL;
+    int mass = selected == WATER ? waterMass : oilMass;
+    ivec4 own = storedFlux(position, selected);
+    int horizontal =
+        own.z - own.y +
+        storedFlux(position + ivec2(-1, 0), selected).z -
+        storedFlux(position + ivec2(1, 0), selected).y;
+    int vertical =
+        own.x - own.w +
+        storedFlux(position + ivec2(0, -1), selected).x -
+        storedFlux(position + ivec2(0, 1), selected).w;
+    cell.material = selected;
+    cell.liquidAmount = uint(mass);
+    cell.flowX = clamp(horizontal / 2, -127, 127);
+    cell.flowY = clamp(vertical / 2, -127, 127);
+    cell.burnProgress = 0.0;
+    cell.gasLifetime = 0.0;
+    cell.gasDrift = 0;
+    if (previousMaterial != selected) {
+        resetFluidState(cell);
+    }
+    if (selected == WATER) {
+        cell.heat *= 0.72;
+    }
+    cell.momentumX =
+        cell.density * float(cell.flowX) / 48.0;
+    cell.momentumY =
+        cell.density * float(cell.flowY) / 48.0;
+    writeCell(position, cell);
+}
+
+bool openWaterPressurePath(ivec2 first, ivec2 second) {
+    int direction = first.x < second.x ? 1 : -1;
+    for (int distance = 1; distance < 32; ++distance) {
+        ivec2 samplePosition =
+            first + ivec2(direction * distance, 0);
+        if (samplePosition.x == second.x) {
+            return true;
+        }
+        uint material = readCell(samplePosition).material;
+        if (material != WATER && !isGas(material)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void levelWaterPressure(ivec2 position, int offset) {
+    // Shift alternating frames by one half-block so pressure can cross the
+    // boundaries of the previous frame's pairs.
+    int shift =
+        (int(pushData.options.z) & 1) == 0 ? 0 : offset;
+    int shiftedX = position.x + shift;
+    int blockWidth = offset * 2;
+    int localX = shiftedX % blockWidth;
+    ivec2 partner =
+        position +
+        ivec2(localX < offset ? offset : -offset, 0);
+    Cell original = readCell(position);
+    if (!inside(partner) ||
+        !openWaterPressurePath(position, partner)) {
+        writeCell(position, original);
+        return;
+    }
+
+    Cell other = readCell(partner);
+    bool validOriginal =
+        original.material == WATER || isGas(original.material);
+    bool validOther =
+        other.material == WATER || isGas(other.material);
+    int originalMass =
+        original.material == WATER ? int(original.liquidAmount) : 0;
+    int otherMass =
+        other.material == WATER ? int(other.liquidAmount) : 0;
+    if (!validOriginal || !validOther ||
+        originalMass + otherMass == 0) {
+        writeCell(position, original);
+        return;
+    }
+
+    bool originalSupported =
+        originalMass > 0 &&
+        !isGas(readCell(position + ivec2(0, 1)).material);
+    bool otherSupported =
+        otherMass > 0 &&
+        !isGas(readCell(partner + ivec2(0, 1)).material);
+    if (!originalSupported && !otherSupported) {
+        // Do not spread unsupported falling droplets sideways in mid-air.
+        writeCell(position, original);
+        return;
+    }
+
+    int totalMass = originalMass + otherMass;
+    int leftX = min(position.x, partner.x);
+    bool oddMassGoesLeft =
+        ((leftX + position.y + int(pushData.options.z)) & 1) == 0;
+    int leftMass =
+        totalMass / 2 +
+        ((totalMass & 1) != 0 && oddMassGoesLeft ? 1 : 0);
+    int rightMass = totalMass - leftMass;
+    int resultMass = position.x < partner.x ? leftMass : rightMass;
+    if (resultMass <= 0) {
+        writeCell(position,
+                  original.material == WATER ? makeAir() : original);
+        return;
+    }
+
+    Cell result = original;
+    result.material = WATER;
+    result.liquidAmount = uint(resultMass);
+    result.flowX = 0;
+    result.flowY = 0;
+    result.heat *= 0.72;
+    result.burnProgress = 0.0;
+    result.gasLifetime = 0.0;
+    result.gasDrift = 0;
+    if (original.material != WATER) {
+        resetFluidState(result);
+    }
+    writeCell(position, result);
+}
+
+bool canSandEnter(uint material) {
+    return isGas(material) || isLiquid(material);
+}
+
+ivec2 proposedTarget(ivec2 position) {
+    Cell cell = readCell(position);
+    if (cell.material == SAND) {
+        if (canSandEnter(readCell(position + ivec2(0, 1)).material)) {
+            return position + ivec2(0, 1);
+        }
+        int direction = (randomAt(position, 151u) & 1u) == 0u ? -1 : 1;
+        if (canSandEnter(
+                readCell(position + ivec2(direction, 1)).material)) {
+            return position + ivec2(direction, 1);
+        }
+        if (canSandEnter(
+                readCell(position + ivec2(-direction, 1)).material)) {
+            return position + ivec2(-direction, 1);
+        }
+        return position;
+    }
+
+    if (cell.material != FIRE && cell.material != SMOKE &&
+        cell.material != STEAM) {
+        return position;
+    }
+    int drift = cell.gasDrift == 0
+                    ? ((randomAt(position, 163u) & 1u) == 0u ? -1 : 1)
+                    : cell.gasDrift;
+    uint roll = randomAt(position, 173u) % 100u;
+    int riseChance = cell.material == STEAM
+                         ? 88
+                         : (cell.material == SMOKE ? 64 : 92);
+    if (int(roll) < riseChance) {
+        ivec2 diagonal = position + ivec2(drift, -1);
+        if (readCell(diagonal).material == AIR &&
+            randomAt(position, 179u) % 100u < 48u) {
+            return diagonal;
+        }
+        if (readCell(position + ivec2(0, -1)).material == AIR) {
+            return position + ivec2(0, -1);
+        }
+        if (readCell(diagonal).material == AIR) {
+            return diagonal;
+        }
+        if (readCell(position + ivec2(-drift, -1)).material == AIR) {
+            return position + ivec2(-drift, -1);
+        }
+    }
+
+    bool ceiling = !isGas(readCell(position + ivec2(0, -1)).material);
+    int lateralChance = ceiling
+                            ? (cell.material == STEAM ? 58 : 76)
+                            : (cell.material == STEAM ? 12 : 24);
+    if (int(randomAt(position, 191u) % 100u) < lateralChance) {
+        if (readCell(position + ivec2(drift, 0)).material == AIR) {
+            return position + ivec2(drift, 0);
+        }
+        if (readCell(position + ivec2(-drift, 0)).material == AIR) {
+            return position + ivec2(-drift, 0);
+        }
+    }
+    return position;
+}
+
+void moveGranularAndGas(ivec2 position) {
+    Cell result = readCell(position);
+    ivec2 winner = position;
+    uint winnerHash = 0xffffffffu;
+    for (int y = -1; y <= 1; ++y) {
+        for (int x = -1; x <= 1; ++x) {
+            ivec2 source = position + ivec2(x, y);
+            if (all(equal(source, position)) || !inside(source)) {
+                continue;
+            }
+            if (any(notEqual(proposedTarget(source), position))) {
+                continue;
+            }
+            uint candidateHash = randomAt(source, 211u);
+            if (candidateHash < winnerHash) {
+                winnerHash = candidateHash;
+                winner = source;
+            }
+        }
+    }
+
+    if (any(notEqual(winner, position))) {
+        result = readCell(winner);
+    } else {
+        ivec2 target = proposedTarget(position);
+        if (any(notEqual(target, position))) {
+            Cell moving = readCell(position);
+            Cell displaced = readCell(target);
+            result = moving.material == SAND && isLiquid(displaced.material)
+                         ? displaced
+                         : makeAir();
+        }
+    }
+    writeCell(position, result);
+}
+
+struct Conserved {
+    float density;
+    float momentumX;
+    float momentumY;
+    float energy;
+};
+
+Conserved stateOf(Cell cell) {
+    return Conserved(
+        max(cell.density, 0.02),
+        cell.momentumX,
+        cell.momentumY,
+        max(cell.totalEnergy, 0.02));
+}
+
+float statePressure(Conserved state, uint material) {
+    float inverseDensity = 1.0 / max(state.density, 0.02);
+    float kinetic = 0.5 *
+        (state.momentumX * state.momentumX +
+         state.momentumY * state.momentumY) * inverseDensity;
+    float gamma = heatCapacityRatio(material);
+    float offset = pressureOffset(material);
+    return clamp(
+        (gamma - 1.0) * max(state.energy - kinetic, 0.01) -
+            gamma * offset,
+        0.02, 96.0);
+}
+
+float waveSpeed(Conserved state, uint material, bool horizontal) {
+    float pressure = statePressure(state, material);
+    float gamma = heatCapacityRatio(material);
+    float offset = pressureOffset(material);
+    float velocity =
+        (horizontal ? state.momentumX : state.momentumY) /
+        max(state.density, 0.02);
+    float soundSpeed = sqrt(max(
+        gamma * (pressure + offset) / max(state.density, 0.02),
+        0.02));
+    return abs(velocity) + soundSpeed;
+}
+
+Conserved fluxFor(Conserved state, uint material, bool horizontal) {
+    float inverseDensity = 1.0 / max(state.density, 0.02);
+    float normalMomentum =
+        horizontal ? state.momentumX : state.momentumY;
+    float velocity = normalMomentum * inverseDensity;
+    float pressure = statePressure(state, material);
+    return Conserved(
+        normalMomentum,
+        horizontal
+            ? state.momentumX * velocity + pressure
+            : state.momentumX * velocity,
+        horizontal
+            ? state.momentumY * velocity
+            : state.momentumY * velocity + pressure,
+        (state.energy + pressure) * velocity);
+}
+
+Conserved addState(Conserved first, Conserved second) {
+    return Conserved(
+        first.density + second.density,
+        first.momentumX + second.momentumX,
+        first.momentumY + second.momentumY,
+        first.energy + second.energy);
+}
+
+Conserved subtractState(Conserved first, Conserved second) {
+    return Conserved(
+        first.density - second.density,
+        first.momentumX - second.momentumX,
+        first.momentumY - second.momentumY,
+        first.energy - second.energy);
+}
+
+Conserved scaleState(Conserved state, float scale) {
+    return Conserved(
+        state.density * scale,
+        state.momentumX * scale,
+        state.momentumY * scale,
+        state.energy * scale);
+}
+
+Conserved reflectedState(Conserved state, bool horizontal) {
+    if (horizontal) {
+        state.momentumX = -state.momentumX;
+    } else {
+        state.momentumY = -state.momentumY;
+    }
+    return state;
+}
+
+Conserved rusanovFlux(Cell left, Cell right, bool horizontal) {
+    Conserved leftState = stateOf(left);
+    Conserved rightState = stateOf(right);
+    Conserved leftFlux =
+        fluxFor(leftState, left.material, horizontal);
+    Conserved rightFlux =
+        fluxFor(rightState, right.material, horizontal);
+    float maximumWaveSpeed = max(
+        waveSpeed(leftState, left.material, horizontal),
+        waveSpeed(rightState, right.material, horizontal));
+    return subtractState(
+        scaleState(addState(leftFlux, rightFlux), 0.5),
+        scaleState(subtractState(rightState, leftState),
+                   0.5 * maximumWaveSpeed));
+}
+
+Cell fluidNeighbor(Cell center, ivec2 position, bool horizontal) {
+    Cell neighbor = readCell(position);
+    if (!isFluid(neighbor.material)) {
+        neighbor = center;
+        Conserved reflected =
+            reflectedState(stateOf(center), horizontal);
+        neighbor.density = reflected.density;
+        neighbor.momentumX = reflected.momentumX;
+        neighbor.momentumY = reflected.momentumY;
+        neighbor.totalEnergy = reflected.energy;
+    }
+    return neighbor;
+}
+
+void updateCompressibleFluid(ivec2 position) {
+    Cell cell = readCell(position);
+    if (!isFluid(cell.material)) {
+        writeCell(position, cell);
+        return;
+    }
+
+    Cell left = fluidNeighbor(cell, position + ivec2(-1, 0), true);
+    Cell right = fluidNeighbor(cell, position + ivec2(1, 0), true);
+    Cell above = fluidNeighbor(cell, position + ivec2(0, -1), false);
+    Cell below = fluidNeighbor(cell, position + ivec2(0, 1), false);
+
+    Conserved state = stateOf(cell);
+    Conserved leftFlux = rusanovFlux(left, cell, true);
+    Conserved rightFlux = rusanovFlux(cell, right, true);
+    Conserved topFlux = rusanovFlux(above, cell, false);
+    Conserved bottomFlux = rusanovFlux(cell, below, false);
+
+    // A deliberately reduced acoustic speed keeps the explicit CFL step
+    // practical while preserving visible shocks and liquid stiffness.
+    const float timeStep = 0.045;
+    Conserved divergence = addState(
+        subtractState(rightFlux, leftFlux),
+        subtractState(bottomFlux, topFlux));
+    state = subtractState(state, scaleState(divergence, timeStep));
+    state.density = clamp(state.density, 0.04, 24.0);
+
+    // Gravity, buoyancy and material viscosity are source terms shared by
+    // liquids and gases. Hot light gases receive additional upward momentum.
+    state.momentumY += state.density * 0.035;
+    if (cell.material == FIRE || cell.material == STEAM ||
+        cell.material == SMOKE) {
+        state.momentumY -=
+            (cell.heat + (cell.material == STEAM ? 0.35 : 0.0)) *
+            state.density * 0.075;
+    }
+
+    float viscosity =
+        cell.material == OIL ? 0.12 :
+        (cell.material == WATER ? 0.025 : 0.008);
+    vec2 averageMomentum =
+        (vec2(left.momentumX, left.momentumY) +
+         vec2(right.momentumX, right.momentumY) +
+         vec2(above.momentumX, above.momentumY) +
+         vec2(below.momentumX, below.momentumY)) * 0.25;
+    vec2 momentum = vec2(state.momentumX, state.momentumY);
+    momentum = mix(momentum, averageMomentum,
+                   clamp(viscosity * timeStep, 0.0, 0.25));
+    state.momentumX = momentum.x;
+    state.momentumY = momentum.y;
+
+    float kinetic = 0.5 *
+        (state.momentumX * state.momentumX +
+         state.momentumY * state.momentumY) /
+        max(state.density, 0.04);
+    float gamma = heatCapacityRatio(cell.material);
+    float offset = pressureOffset(cell.material);
+    float minimumEnergy =
+        kinetic + (0.02 + gamma * offset) / (gamma - 1.0);
+    state.energy = clamp(max(state.energy, minimumEnergy),
+                         minimumEnergy, 2048.0);
+
+    cell.density = state.density;
+    cell.momentumX = clamp(state.momentumX, -512.0, 512.0);
+    cell.momentumY = clamp(state.momentumY, -512.0, 512.0);
+    cell.totalEnergy = state.energy;
+    vec2 velocity =
+        vec2(state.momentumX, state.momentumY) /
+        max(state.density, 0.04);
+    cell.flowX = int(clamp(round(velocity.x * 48.0), -127.0, 127.0));
+    cell.flowY = int(clamp(round(velocity.y * 48.0), -127.0, 127.0));
+    writeCell(position, cell);
+}
+
+void main() {
+    ivec2 position = ivec2(gl_GlobalInvocationID.xy);
+    if (!inside(position)) {
+        return;
+    }
+    uint stage = pushData.options.x;
+    if (stage == 0u) {
+        updateHeatAndCombustion(position);
+    } else if (stage >= 13u && stage <= 17u) {
+        int offset = 1 << int(stage - 12u);
+        levelWaterPressure(position, offset);
+    } else if (stage == 18u) {
+        moveGranularAndGas(position);
+    } else if (stage >= 19u && stage <= 22u) {
+        updateCompressibleFluid(position);
+    } else {
+        uint liquidStage = (stage - 1u) % 3u;
+        if (liquidStage == 0u) {
+            settleLiquidDensity(position);
+        } else if (liquidStage == 1u) {
+            calculateLiquidFlux(position);
+        } else {
+            updateLiquids(position);
+        }
+    }
+}

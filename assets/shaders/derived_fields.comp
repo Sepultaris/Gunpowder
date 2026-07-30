@@ -1,0 +1,269 @@
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(binding = 0) uniform usampler2D materialTexture;
+layout(rgba8ui, binding = 3) uniform uimage2D derivedImage;
+layout(rgba8ui, binding = 10) uniform uimage2D hazeScratch;
+
+layout(push_constant) uniform DerivedPush {
+    uint stage;
+} pushData;
+
+const int groupWidth = 8;
+const int groupHeight = 8;
+const int filterRadius = 8;
+const int filterTileWidth = groupWidth + filterRadius * 2;
+const int filterTileHeight = groupHeight + filterRadius * 2;
+const int solidRadius = 2;
+const int solidTileWidth = groupWidth + solidRadius * 2;
+const int solidTileHeight = groupHeight + solidRadius * 2;
+
+// Each workgroup loads overlapping neighborhoods once and shares them between
+// its 64 cells. This preserves the same filters while avoiding dozens of
+// duplicate texture reads per output pixel.
+shared float filterTile[filterTileWidth * filterTileHeight];
+shared float solidTile[solidTileWidth * solidTileHeight];
+
+bool isSolid(uint material) {
+    return material == 1 || material == 2 || material == 3 ||
+           material == 9 || material == 10 || material == 11;
+}
+
+float gasAt(ivec2 cell, ivec2 extent) {
+    if (any(lessThan(cell, ivec2(0))) ||
+        any(greaterThanEqual(cell, extent))) {
+        return 0.0;
+    }
+    uint material = texelFetch(materialTexture, cell, 0).r;
+    return material == 7 ? 1.0 : (material == 8 ? 0.35 : 0.0);
+}
+
+float solidAt(ivec2 cell, ivec2 extent) {
+    cell = clamp(cell, ivec2(0), extent - ivec2(1));
+    return isSolid(texelFetch(materialTexture, cell, 0).r) ? 1.0 : 0.0;
+}
+
+void filterHorizontal(ivec2 cell, ivec2 extent) {
+    float density = 0.0;
+    float totalWeight = 0.0;
+    // A triangular kernel approximates a Gaussian while remaining cheap.
+    // The second, vertical pass turns this into a smooth isotropic volume.
+    for (int x = -8; x <= 8; ++x) {
+        float weight = float(9 - abs(x));
+        density += gasAt(cell + ivec2(x, 0), extent) * weight;
+        totalWeight += weight;
+    }
+    density /= totalWeight;
+    imageStore(hazeScratch, cell,
+               uvec4(round(density * 255.0), 0u, 0u, 255u));
+}
+
+void finishDerivedFields(ivec2 cell, ivec2 extent) {
+    float density = 0.0;
+    float totalWeight = 0.0;
+    for (int y = -8; y <= 8; ++y) {
+        float weight = float(9 - abs(y));
+        ivec2 sampleCell = cell + ivec2(0, y);
+        if (all(greaterThanEqual(sampleCell, ivec2(0))) &&
+            all(lessThan(sampleCell, extent))) {
+            density +=
+                float(imageLoad(hazeScratch, sampleCell).r) /
+                255.0 * weight;
+        }
+        totalWeight += weight;
+    }
+    // Sparse smoke remains visible, but no single carrier cell can turn into
+    // a bright square or horizontal dotted row.
+    float haze = clamp(density / totalWeight * 2.15, 0.0, 1.0);
+
+    float centerSolid = solidAt(cell, extent);
+    float openNeighborhood = 0.0;
+    for (int y = -2; y <= 2; ++y) {
+        for (int x = -2; x <= 2; ++x) {
+            if (x == 0 && y == 0) {
+                continue;
+            }
+            openNeighborhood +=
+                1.0 - solidAt(cell + ivec2(x, y), extent);
+        }
+    }
+    float openness = openNeighborhood / 24.0;
+    float ambientOcclusion =
+        centerSolid > 0.5 ? mix(0.58, 1.0, openness) : 1.0;
+
+    vec2 normal = vec2(
+        solidAt(cell + ivec2(-1, 0), extent) -
+            solidAt(cell + ivec2(1, 0), extent),
+        solidAt(cell + ivec2(0, -1), extent) -
+            solidAt(cell + ivec2(0, 1), extent));
+    float normalLength = length(normal);
+    if (normalLength > 0.001) {
+        normal /= normalLength;
+    }
+    vec2 encodedNormal = normal * 0.5 + 0.5;
+
+    uvec4 materialData = texelFetch(materialTexture, cell, 0);
+    bool liquid = materialData.r == 4u || materialData.r == 5u;
+    uint skyExposure =
+        (materialData.a & 0x80u) != 0u ? 255u : 0u;
+    uint worldSunVisibility =
+        liquid
+            ? (materialData.a & 0x0fu) * 17u
+            : ((materialData.a & 0x7fu) * 255u + 63u) / 127u;
+    imageStore(
+        derivedImage, cell,
+        uvec4(round(haze * 255.0),
+              255u,
+              skyExposure,
+              worldSunVisibility));
+}
+
+void filterHorizontalShared(ivec2 cell, ivec2 extent) {
+    ivec2 groupBase =
+        ivec2(gl_WorkGroupID.xy) * ivec2(groupWidth, groupHeight);
+    uint localIndex =
+        gl_LocalInvocationID.y * uint(groupWidth) +
+        gl_LocalInvocationID.x;
+    const uint workerCount = uint(groupWidth * groupHeight);
+    const uint tileCellCount = uint(filterTileWidth * groupHeight);
+    for (uint index = localIndex; index < tileCellCount;
+         index += workerCount) {
+        int tileX = int(index % uint(filterTileWidth));
+        int tileY = int(index / uint(filterTileWidth));
+        ivec2 sampleCell =
+            groupBase + ivec2(tileX - filterRadius, tileY);
+        filterTile[index] = gasAt(sampleCell, extent);
+    }
+    barrier();
+
+    if (any(greaterThanEqual(cell, extent))) {
+        return;
+    }
+    int localX = int(gl_LocalInvocationID.x) + filterRadius;
+    int localY = int(gl_LocalInvocationID.y);
+    float density = 0.0;
+    float totalWeight = 0.0;
+    for (int x = -filterRadius; x <= filterRadius; ++x) {
+        float weight = float(filterRadius + 1 - abs(x));
+        density +=
+            filterTile[localY * filterTileWidth + localX + x] *
+            weight;
+        totalWeight += weight;
+    }
+    density /= totalWeight;
+    imageStore(hazeScratch, cell,
+               uvec4(round(density * 255.0), 0u, 0u, 255u));
+}
+
+void finishDerivedFieldsShared(ivec2 cell, ivec2 extent) {
+    ivec2 groupBase =
+        ivec2(gl_WorkGroupID.xy) * ivec2(groupWidth, groupHeight);
+    uint localIndex =
+        gl_LocalInvocationID.y * uint(groupWidth) +
+        gl_LocalInvocationID.x;
+    const uint workerCount = uint(groupWidth * groupHeight);
+
+    const uint hazeCellCount = uint(groupWidth * filterTileHeight);
+    for (uint index = localIndex; index < hazeCellCount;
+         index += workerCount) {
+        int tileX = int(index % uint(groupWidth));
+        int tileY = int(index / uint(groupWidth));
+        ivec2 sampleCell =
+            groupBase + ivec2(tileX, tileY - filterRadius);
+        float sampleDensity = 0.0;
+        if (all(greaterThanEqual(sampleCell, ivec2(0))) &&
+            all(lessThan(sampleCell, extent))) {
+            sampleDensity =
+                float(imageLoad(hazeScratch, sampleCell).r) / 255.0;
+        }
+        filterTile[index] = sampleDensity;
+    }
+
+    const uint solidCellCount =
+        uint(solidTileWidth * solidTileHeight);
+    for (uint index = localIndex; index < solidCellCount;
+         index += workerCount) {
+        int tileX = int(index % uint(solidTileWidth));
+        int tileY = int(index / uint(solidTileWidth));
+        ivec2 sampleCell =
+            groupBase +
+            ivec2(tileX - solidRadius, tileY - solidRadius);
+        solidTile[index] = solidAt(sampleCell, extent);
+    }
+    barrier();
+
+    if (any(greaterThanEqual(cell, extent))) {
+        return;
+    }
+
+    int localX = int(gl_LocalInvocationID.x);
+    int localY = int(gl_LocalInvocationID.y);
+    float density = 0.0;
+    float totalWeight = 0.0;
+    for (int y = -filterRadius; y <= filterRadius; ++y) {
+        float weight = float(filterRadius + 1 - abs(y));
+        density +=
+            filterTile[(localY + filterRadius + y) * groupWidth +
+                       localX] *
+            weight;
+        totalWeight += weight;
+    }
+    float haze = clamp(density / totalWeight * 2.15, 0.0, 1.0);
+
+    int solidCenterX = localX + solidRadius;
+    int solidCenterY = localY + solidRadius;
+    float centerSolid =
+        solidTile[solidCenterY * solidTileWidth + solidCenterX];
+    float openNeighborhood = 0.0;
+    for (int y = -solidRadius; y <= solidRadius; ++y) {
+        for (int x = -solidRadius; x <= solidRadius; ++x) {
+            if (x == 0 && y == 0) {
+                continue;
+            }
+            openNeighborhood +=
+                1.0 -
+                solidTile[(solidCenterY + y) * solidTileWidth +
+                          solidCenterX + x];
+        }
+    }
+    float openness = openNeighborhood / 24.0;
+    float ambientOcclusion =
+        centerSolid > 0.5 ? mix(0.58, 1.0, openness) : 1.0;
+
+    vec2 normal = vec2(
+        solidTile[solidCenterY * solidTileWidth + solidCenterX - 1] -
+            solidTile[solidCenterY * solidTileWidth + solidCenterX + 1],
+        solidTile[(solidCenterY - 1) * solidTileWidth + solidCenterX] -
+            solidTile[(solidCenterY + 1) * solidTileWidth + solidCenterX]);
+    float normalLength = length(normal);
+    if (normalLength > 0.001) {
+        normal /= normalLength;
+    }
+    vec2 encodedNormal = normal * 0.5 + 0.5;
+
+    uvec4 materialData = texelFetch(materialTexture, cell, 0);
+    bool liquid = materialData.r == 4u || materialData.r == 5u;
+    uint skyExposure =
+        (materialData.a & 0x80u) != 0u ? 255u : 0u;
+    uint worldSunVisibility =
+        liquid
+            ? (materialData.a & 0x0fu) * 17u
+            : ((materialData.a & 0x7fu) * 255u + 63u) / 127u;
+    imageStore(
+        derivedImage, cell,
+        uvec4(round(haze * 255.0),
+              255u,
+              skyExposure,
+              worldSunVisibility));
+}
+
+void main() {
+    ivec2 cell = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 extent = imageSize(derivedImage);
+    if (pushData.stage == 0u) {
+        filterHorizontalShared(cell, extent);
+    } else {
+        finishDerivedFieldsShared(cell, extent);
+    }
+}

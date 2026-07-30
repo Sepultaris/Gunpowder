@@ -1,0 +1,57 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+struct Particle {
+    vec2 position;
+    vec2 velocity;
+    vec4 colorAndLife;
+    vec2 maximumLifeAndSize;
+    uint slot;
+    uint padding;
+};
+
+layout(std430, binding = 5) buffer ParticleBuffer {
+    Particle particles[];
+};
+
+layout(std430, binding = 6) readonly buffer SpawnBuffer {
+    Particle spawns[];
+};
+
+layout(push_constant) uniform ParticlePush {
+    float deltaTime;
+    uint stage;
+    uint spawnCount;
+    uint capacity;
+} pushData;
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    if (pushData.stage == 0u) {
+        if (index >= pushData.capacity) {
+            return;
+        }
+        Particle particle = particles[index];
+        if (particle.colorAndLife.w <= 0.0) {
+            return;
+        }
+        particle.colorAndLife.w -= pushData.deltaTime;
+        if (particle.colorAndLife.w <= 0.0) {
+            particle.colorAndLife.w = 0.0;
+            particles[index] = particle;
+            return;
+        }
+        particle.velocity.y += 380.0 * 0.16 * pushData.deltaTime;
+        particle.velocity *= max(0.0, 1.0 - pushData.deltaTime * 1.8);
+        particle.position += particle.velocity * pushData.deltaTime;
+        particles[index] = particle;
+        return;
+    }
+
+    if (index >= pushData.spawnCount) {
+        return;
+    }
+    Particle spawned = spawns[index];
+    particles[spawned.slot % pushData.capacity] = spawned;
+}

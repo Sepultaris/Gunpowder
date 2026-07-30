@@ -1,0 +1,11 @@
+/build/
+/build-*/
+/out/
+/tmp/
+/.vs/
+/.vscode/
+/.agents/
+/.codex/
+gunpowder_imgui.ini
+*.user
+*.suo

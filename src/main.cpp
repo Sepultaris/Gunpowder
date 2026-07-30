@@ -573,6 +573,10 @@ bool drawDeveloperUi(bool* open,
             materialTimings.activeGasMicrotiles,
             materialTimings.activeThermalMicrotiles);
         ImGui::TextDisabled(
+            "Parallel scheduler: %u threads | %u thermal chunks",
+            materialTimings.materialWorkerThreads,
+            materialTimings.parallelThermalChunks);
+        ImGui::TextDisabled(
             "Liquid prep %u cells | Edge cache %u columns | "
             "Equalization seeds %u cells",
             materialTimings.liquidPreparationCellVisits,

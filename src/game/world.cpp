@@ -1,4 +1,5 @@
 #include "game/world.hpp"
+#include "game/parallel_executor.hpp"
 
 #include <algorithm>
 #include <array>
@@ -55,6 +56,11 @@ bool isSkyOccluder(Material material) {
 
 std::size_t indexOf(int x, int y) {
     return static_cast<std::size_t>(y * World::width + x);
+}
+
+ParallelExecutor& materialExecutor() {
+    static ParallelExecutor executor;
+    return executor;
 }
 
 } // namespace
@@ -145,6 +151,7 @@ void World::regenerate() {
     particles_.clear();
     particleSpawns_.clear();
     pendingGpuMaterialSteps_ = 0;
+    materialScanRight_ = true;
     grapple_ = Grapple{};
     playerSplashAccumulator_ = 0.0F;
     playerLiquidDisplacementAccumulator_ = 0.0F;
@@ -2785,8 +2792,7 @@ void World::updateMaterials() {
             }
         }
     }
-    static bool scanRight = true;
-    scanRight = !scanRight;
+    materialScanRight_ = !materialScanRight_;
     std::uniform_int_distribution<int> coin(0, 1);
     std::uniform_int_distribution<int> percent(0, 99);
 
@@ -2807,7 +2813,9 @@ void World::updateMaterials() {
       const int chunkCount = finalChunkX - firstChunkX;
       for (int chunkStep = 0; chunkStep < chunkCount; ++chunkStep) {
         const int chunkX =
-            scanRight ? firstChunkX + chunkStep : finalChunkX - 1 - chunkStep;
+            materialScanRight_
+                ? firstChunkX + chunkStep
+                : finalChunkX - 1 - chunkStep;
         if (!materialChunkActive(chunkX * chunkSize, chunkY * chunkSize,
                                  granularActivity)) {
           continue;
@@ -2816,7 +2824,9 @@ void World::updateMaterials() {
         for (int tileStep = 0; tileStep < materialMicrotilesPerAxis;
              ++tileStep) {
           const int microtileX =
-              scanRight ? tileStep : materialMicrotilesPerAxis - 1 - tileStep;
+              materialScanRight_
+                  ? tileStep
+                  : materialMicrotilesPerAxis - 1 - tileStep;
           const int tileOriginX =
               chunkOriginX + microtileX * materialMicrotileSize;
           const int beginX = std::max(bounds.minX, tileOriginX);
@@ -2828,7 +2838,9 @@ void World::updateMaterials() {
           }
           for (int localStep = 0; localStep < endX - beginX; ++localStep) {
             const int x =
-                scanRight ? beginX + localStep : endX - 1 - localStep;
+                materialScanRight_
+                    ? beginX + localStep
+                    : endX - 1 - localStep;
           const std::size_t index = indexOf(x, y);
           if (moved_[index] != 0) {
             continue;
@@ -2990,8 +3002,9 @@ void World::updateMaterials() {
             const int rowPosition =
                 (localStep + rowOffset) % rowWidth;
             const int x =
-                scanRight ? beginX + rowPosition
-                          : endX - 1 - rowPosition;
+                materialScanRight_
+                    ? beginX + rowPosition
+                    : endX - 1 - rowPosition;
           const std::size_t index = indexOf(x, y);
           if (moved_[index] != 0) {
             continue;
@@ -4137,82 +4150,172 @@ void World::applyLiquidEqualizationPhase(
 
 void World::updateHeat() {
     const ActiveBounds bounds = activeBounds();
+    constexpr int chunkColumns =
+        (width + chunkSize - 1) / chunkSize;
     const int firstChunkX = bounds.minX / chunkSize;
     const int finalChunkX =
         (bounds.maxX + chunkSize - 1) / chunkSize;
-    const auto forEachActiveCell = [&](auto&& operation) {
-        for (int y = bounds.minY; y < bounds.maxY; ++y) {
-            const int chunkY = y / chunkSize;
-            for (int chunkX = firstChunkX;
-                 chunkX < finalChunkX; ++chunkX) {
-                if (!materialChunkActive(
-                        chunkX * chunkSize,
-                        chunkY * chunkSize,
-                        thermalActivity)) {
-                    continue;
-                }
-                const int chunkOriginX =
-                    chunkX * chunkSize;
-                for (int microtileX = 0;
-                     microtileX < materialMicrotilesPerAxis;
-                     ++microtileX) {
-                    const int tileOriginX =
-                        chunkOriginX +
-                        microtileX *
-                            materialMicrotileSize;
-                    const int beginX =
-                        std::max(bounds.minX, tileOriginX);
-                    const int endX = std::min(
-                        bounds.maxX,
-                        tileOriginX +
-                            materialMicrotileSize);
-                    if (beginX >= endX ||
-                        !materialMicrotileActive(
-                            beginX, y, thermalActivity)) {
-                        continue;
-                    }
-                    for (int x = beginX; x < endX; ++x) {
-                        operation(x, y, indexOf(x, y));
-                    }
-                }
-            }
-        }
+    const int firstChunkY = bounds.minY / chunkSize;
+    const int finalChunkY =
+        (bounds.maxY + chunkSize - 1) / chunkSize;
+
+    struct ThermalChunkJob {
+        int chunkX = 0;
+        int chunkY = 0;
+        std::vector<std::size_t> cells;
     };
+    std::array<std::vector<ThermalChunkJob>, 4> phaseJobs;
+    constexpr std::size_t thermalSystem =
+        std::countr_zero(
+            static_cast<unsigned int>(thermalActivity));
+    std::uint32_t thermalChunkCount = 0;
+    for (int chunkY = firstChunkY;
+         chunkY < finalChunkY; ++chunkY) {
+        for (int chunkX = firstChunkX;
+             chunkX < finalChunkX; ++chunkX) {
+            if (!materialChunkActive(
+                    chunkX * chunkSize,
+                    chunkY * chunkSize,
+                    thermalActivity)) {
+                continue;
+            }
+            const std::size_t chunkIndex =
+                static_cast<std::size_t>(
+                    chunkY * chunkColumns + chunkX);
+            const std::size_t activeCells =
+                static_cast<std::size_t>(
+                    std::popcount(
+                        materialChunkActivity_[chunkIndex]
+                            .microtiles[thermalSystem])) *
+                static_cast<std::size_t>(
+                    materialMicrotileSize *
+                    materialMicrotileSize);
+            const int phase =
+                (chunkX & 1) | ((chunkY & 1) << 1);
+            auto& job = phaseJobs[
+                static_cast<std::size_t>(phase)].emplace_back();
+            job.chunkX = chunkX;
+            job.chunkY = chunkY;
+            job.cells.reserve(activeCells);
+            ++thermalChunkCount;
+        }
+    }
+
+    ParallelExecutor& executor = materialExecutor();
+    materialSimulationTimings_.materialWorkerThreads =
+        executor.workerCount();
+    materialSimulationTimings_.parallelThermalChunks =
+        thermalChunkCount;
+    const auto& currentHeat =
+        std::as_const(heat_);
+    const auto& currentCells =
+        std::as_const(cells_);
+    constexpr std::array<Vec2, 4> heatOffsets{{
+        {-1.0F, 0.0F}, {1.0F, 0.0F},
+        {0.0F, -1.0F}, {0.0F, 1.0F},
+    }};
 
     thermalWorklist_.clear();
-    forEachActiveCell(
-        [&](int x, int y, std::size_t index) {
-            thermalWorklist_.push_back(index);
-            float neighborHeat = 0.0F;
-            int neighborCount = 0;
-            constexpr std::array<Vec2, 4> offsets{{
-                {-1.0F, 0.0F}, {1.0F, 0.0F},
-                {0.0F, -1.0F}, {0.0F, 1.0F},
-            }};
-            for (Vec2 offset : offsets) {
-                const int neighborX = x + static_cast<int>(offset.x);
-                const int neighborY = y + static_cast<int>(offset.y);
-                if (neighborX >= 0 && neighborX < width &&
-                    neighborY >= 0 && neighborY < height) {
-                    neighborHeat += heat_[indexOf(neighborX, neighborY)];
-                    ++neighborCount;
+    for (auto& jobs : phaseJobs) {
+        executor.run(
+            jobs.size(),
+            [&](std::size_t jobIndex) {
+                ThermalChunkJob& job = jobs[jobIndex];
+                const int chunkOriginX =
+                    job.chunkX * chunkSize;
+                const int chunkOriginY =
+                    job.chunkY * chunkSize;
+                const int beginY =
+                    std::max(bounds.minY, chunkOriginY);
+                const int endY = std::min(
+                    bounds.maxY,
+                    chunkOriginY + chunkSize);
+                for (int y = beginY; y < endY; ++y) {
+                    for (int microtileX = 0;
+                         microtileX <
+                             materialMicrotilesPerAxis;
+                         ++microtileX) {
+                        const int tileOriginX =
+                            chunkOriginX +
+                            microtileX *
+                                materialMicrotileSize;
+                        const int beginX = std::max(
+                            bounds.minX, tileOriginX);
+                        const int endX = std::min(
+                            bounds.maxX,
+                            tileOriginX +
+                                materialMicrotileSize);
+                        if (beginX >= endX ||
+                            !materialMicrotileActive(
+                                beginX, y,
+                                thermalActivity)) {
+                            continue;
+                        }
+                        for (int x = beginX;
+                             x < endX; ++x) {
+                            const std::size_t index =
+                                indexOf(x, y);
+                            job.cells.push_back(index);
+                            float neighborHeat = 0.0F;
+                            int neighborCount = 0;
+                            for (Vec2 offset : heatOffsets) {
+                                const int neighborX =
+                                    x + static_cast<int>(
+                                            offset.x);
+                                const int neighborY =
+                                    y + static_cast<int>(
+                                            offset.y);
+                                if (neighborX >= 0 &&
+                                    neighborX < width &&
+                                    neighborY >= 0 &&
+                                    neighborY < height) {
+                                    neighborHeat +=
+                                        currentHeat[indexOf(
+                                            neighborX,
+                                            neighborY)];
+                                    ++neighborCount;
+                                }
+                            }
+                            const float average =
+                                neighborCount > 0
+                                    ? neighborHeat /
+                                          static_cast<float>(
+                                              neighborCount)
+                                    : 0.0F;
+                            float value =
+                                (currentHeat[index] * 0.87F +
+                                 average * 0.13F) *
+                                0.992F;
+                            if (currentCells[index] ==
+                                Material::water) {
+                                value *= 0.72F;
+                            }
+                            nextHeat_[index] =
+                                std::clamp(
+                                    value, 0.0F, 1.0F);
+                        }
+                    }
                 }
-            }
-            const float average = neighborCount > 0
-                                      ? neighborHeat /
-                                            static_cast<float>(neighborCount)
-                                      : 0.0F;
-            float value = (heat_[index] * 0.87F + average * 0.13F) * 0.992F;
-            if (cells_[index] == Material::water) {
-                value *= 0.72F;
-            }
-            nextHeat_[index] = std::clamp(value, 0.0F, 1.0F);
-            if (nextHeat_[index] > 0.015F) {
-                markMaterialActive(
-                    x, y, thermalActivity);
-            }
-        });
+            });
+    }
+    for (const auto& jobs : phaseJobs) {
+        for (const ThermalChunkJob& job : jobs) {
+            thermalWorklist_.insert(
+                thermalWorklist_.end(),
+                job.cells.begin(), job.cells.end());
+        }
+    }
+    std::sort(thermalWorklist_.begin(),
+              thermalWorklist_.end());
     for (std::size_t index : thermalWorklist_) {
+        if (nextHeat_[index] > 0.015F) {
+            const int x = static_cast<int>(
+                index % static_cast<std::size_t>(width));
+            const int y = static_cast<int>(
+                index / static_cast<std::size_t>(width));
+            markMaterialActive(
+                x, y, thermalActivity);
+        }
         heat_[index] = nextHeat_[index];
     }
 

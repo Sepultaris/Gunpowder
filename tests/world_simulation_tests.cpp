@@ -1,7 +1,9 @@
+#include "game/parallel_executor.hpp"
 #include "game/world.hpp"
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <deque>
@@ -97,6 +99,21 @@ float averageLiquidSurface(const gunpowder::World& world,
 } // namespace
 
 int main() {
+    {
+        gunpowder::ParallelExecutor executor(4);
+        std::array<std::atomic<std::uint32_t>, 257> visits{};
+        executor.run(visits.size(), [&](std::size_t index) {
+            visits[index].fetch_add(1, std::memory_order_relaxed);
+        });
+        for (const auto& visitCount : visits) {
+            if (visitCount.load(std::memory_order_relaxed) != 1) {
+                std::cerr
+                    << "Parallel executor skipped or repeated a job\n";
+                return 1;
+            }
+        }
+    }
+
     gunpowder::ChunkGrid<std::uint8_t> spatialChunks(
         130, 130, 0);
     spatialChunks.set(63, 63, 11);
@@ -784,6 +801,53 @@ int main() {
         std::cerr
             << "Equalized water retained residual surface motion ("
             << movingSettledWater << " cells)\n";
+        return 1;
+    }
+
+    gunpowder::World firstThermalWorld;
+    gunpowder::World secondThermalWorld;
+    constexpr std::array<std::pair<int, int>, 4> heatSources{{
+        {96, 80},
+        {160, 80},
+        {96, 144},
+        {160, 144},
+    }};
+    for (const auto& [x, y] : heatSources) {
+        firstThermalWorld.setCellForTest(
+            x, y, gunpowder::Material::fire);
+        secondThermalWorld.setCellForTest(
+            x, y, gunpowder::Material::fire);
+    }
+    gunpowder::InputState thermalInput;
+    for (int tick = 0; tick < 12; ++tick) {
+        firstThermalWorld.update(1.0F / 30.0F, thermalInput);
+        secondThermalWorld.update(1.0F / 30.0F, thermalInput);
+    }
+    for (std::size_t index = 0;
+         index < firstThermalWorld.materials().size(); ++index) {
+        if (firstThermalWorld.materials()[index] !=
+            secondThermalWorld.materials()[index]) {
+            std::cerr
+                << "Parallel thermal scheduling changed material at "
+                << index << '\n';
+            return 1;
+        }
+        if (firstThermalWorld.heat()[index] !=
+            secondThermalWorld.heat()[index]) {
+            std::cerr
+                << "Parallel thermal scheduling changed heat at "
+                << index << " ("
+                << firstThermalWorld.heat()[index] << " versus "
+                << secondThermalWorld.heat()[index] << ")\n";
+            return 1;
+        }
+    }
+    const auto& thermalTimings =
+        firstThermalWorld.materialSimulationTimings();
+    if (thermalTimings.parallelThermalChunks < 2 ||
+        thermalTimings.materialWorkerThreads < 1) {
+        std::cerr
+            << "Thermal work did not reach the parallel chunk scheduler\n";
         return 1;
     }
 

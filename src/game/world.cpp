@@ -2668,6 +2668,8 @@ void World::updateMaterials() {
     currentLiquidMoveProposals_ = 0;
     currentLiquidMovesAccepted_ = 0;
     currentLiquidMoveConflicts_ = 0;
+    currentLiquidGravityConflicts_ = 0;
+    currentLiquidLateralConflicts_ = 0;
     rebuildLiquidWorklist_ = true;
     constexpr int chunkColumns =
         (width + chunkSize - 1) / chunkSize;
@@ -3838,6 +3840,10 @@ void World::updateMaterials() {
         currentLiquidMovesAccepted_;
     materialSimulationTimings_.liquidMoveConflicts =
         currentLiquidMoveConflicts_;
+    materialSimulationTimings_.liquidGravityConflicts =
+        currentLiquidGravityConflicts_;
+    materialSimulationTimings_.liquidLateralConflicts =
+        currentLiquidLateralConflicts_;
 }
 
 void World::cacheLiquidColumnHeads(const ActiveBounds& bounds) {
@@ -4517,6 +4523,7 @@ void World::updateLiquids(const ActiveBounds& bounds, bool waterOnly) {
             cells_[proposal.source] !=
                 proposal.material) {
             ++currentLiquidMoveConflicts_;
+            ++currentLiquidGravityConflicts_;
             continue;
         }
         const int sourceX = static_cast<int>(
@@ -4569,6 +4576,7 @@ void World::updateLiquids(const ActiveBounds& bounds, bool waterOnly) {
         }
         if (!accepted) {
             ++currentLiquidMoveConflicts_;
+            ++currentLiquidGravityConflicts_;
         }
     }
 
@@ -4822,7 +4830,6 @@ void World::updateLiquids(const ActiveBounds& bounds, bool waterOnly) {
                             indexOf(targetX, y);
                         if (lateralReservations[
                                 target] != 0 ||
-                            lateralMoved[target] != 0 ||
                             !isOpen(
                                 lateralCells[
                                     target])) {
@@ -4947,10 +4954,6 @@ void World::updateLiquids(const ActiveBounds& bounds, bool waterOnly) {
         lateralProposals.end(),
         [](const LiquidLateralProposal& first,
            const LiquidLateralProposal& second) {
-            if (first.moving != second.moving) {
-                return first.moving >
-                       second.moving;
-            }
             if (first.priority != second.priority) {
                 return first.priority <
                        second.priority;
@@ -4959,60 +4962,207 @@ void World::updateLiquids(const ActiveBounds& bounds, bool waterOnly) {
         });
     for (const LiquidLateralProposal& proposal :
          lateralProposals) {
-        if (!proposal.moving) {
-            continue;
-        }
-        ++currentLiquidMoveProposals_;
-        const int destinationX =
-            static_cast<int>(
-                proposal.destination %
-                static_cast<std::size_t>(width));
-        const int destinationY =
-            static_cast<int>(
-                proposal.destination /
-                static_cast<std::size_t>(width));
         if (moved_[proposal.source] != 0 ||
-            cells_[proposal.source] !=
-                proposal.material ||
-            !canMoveSidewaysInto(
-                destinationX, destinationY)) {
-            ++currentLiquidMoveConflicts_;
-            if (cells_[proposal.source] ==
-                    proposal.material &&
-                moved_[proposal.source] == 0) {
-                liquidFlowX_[proposal.source] =
-                    proposal.restingFlowX;
-                liquidFlowY_[proposal.source] =
-                    proposal.restingFlowY;
-            }
-            continue;
-        }
-        const int sourceX = static_cast<int>(
-            proposal.source %
-            static_cast<std::size_t>(width));
-        const int sourceY = static_cast<int>(
-            proposal.source /
-            static_cast<std::size_t>(width));
-        moveLiquid(
-            sourceX, sourceY,
-            destinationX, destinationY,
-            proposal.flowX, proposal.flowY);
-        ++currentLiquidMovesAccepted_;
-    }
-    for (const LiquidLateralProposal& proposal :
-         lateralProposals) {
-        if (proposal.moving ||
-            moved_[proposal.source] != 0 ||
             cells_[proposal.source] !=
                 proposal.material) {
             continue;
         }
+        const int x = static_cast<int>(
+            proposal.source %
+            static_cast<std::size_t>(width));
+        const int y = static_cast<int>(
+            proposal.source /
+            static_cast<std::size_t>(width));
+        const Material material =
+            cells_[proposal.source];
         liquidAmount_[proposal.source] =
             maximumLiquidMass;
+        const int currentFlowX =
+            static_cast<int>(
+                liquidFlowX_[proposal.source]);
+        const int firstDirection =
+            currentFlowX == 0
+                ? ((proposal.priority & 1U) == 0
+                       ? -1
+                       : 1)
+                : (currentFlowX < 0 ? -1 : 1);
+        const bool touchesFreeSurface =
+            cell(x, y - 1) != material ||
+            cell(x - 1, y - 1) != material ||
+            cell(x + 1, y - 1) != material;
+        const int headDepth =
+            static_cast<int>(
+                liquidHeadDepth_[proposal.source]);
+        const bool hasLateralOutlet =
+            isOpen(cell(x - 1, y)) ||
+            isOpen(cell(x + 1, y));
+        const int pressureThreshold =
+            material == Material::water
+                ? scaledCell(2)
+                : scaledCell(5);
+        const bool pressureDriven =
+            hasLateralOutlet &&
+            headDepth >= pressureThreshold;
+        if (!touchesFreeSurface &&
+            !pressureDriven) {
+            liquidFlowX_[proposal.source] =
+                static_cast<std::int8_t>(
+                    currentFlowX * 3 / 4);
+            liquidFlowY_[proposal.source] =
+                static_cast<std::int8_t>(
+                    static_cast<int>(
+                        liquidFlowY_[
+                            proposal.source]) *
+                    2 / 3);
+            continue;
+        }
+
+        const int baseSearchDistance =
+            material == Material::water
+                ? scaledCell(12)
+                : scaledCell(3);
+        const int pressureReach =
+            material == Material::water
+                ? std::min(
+                      headDepth, scaledCell(10))
+                : std::min(
+                      headDepth / 3,
+                      scaledCell(2));
+        const int momentumReach =
+            std::abs(currentFlowX) /
+            (material == Material::water
+                 ? 8
+                 : 18);
+        const int searchDistance =
+            baseSearchDistance +
+            pressureReach +
+            momentumReach;
+        struct CurrentLateralPath {
+            int direction = 0;
+            int openRun = 0;
+            int dropDistance = 0;
+            int fallDepth = 0;
+        };
+        std::array<CurrentLateralPath, 2> paths{{
+            {firstDirection, 0, 0, 0},
+            {-firstDirection, 0, 0, 0},
+        }};
+        for (CurrentLateralPath& path : paths) {
+            for (int distance = 1;
+                 distance <= searchDistance;
+                 ++distance) {
+                const int targetX =
+                    x + path.direction * distance;
+                if (targetX < bounds.minX ||
+                    targetX >= bounds.maxX) {
+                    break;
+                }
+                const std::size_t target =
+                    indexOf(targetX, y);
+                if (liquidEqualizationReservation_[
+                        target] != 0 ||
+                    !isOpen(cell(targetX, y))) {
+                    break;
+                }
+                path.openRun = distance;
+                if (isOpen(cell(
+                        targetX, y + 1))) {
+                    path.dropDistance = distance;
+                    const int maximumFallProbe =
+                        material == Material::water
+                            ? scaledCell(12)
+                            : scaledCell(4);
+                    for (int fall = 1;
+                         fall <=
+                                 maximumFallProbe &&
+                         targetInBounds(
+                             targetX, y + fall) &&
+                         isOpen(cell(
+                             targetX, y + fall));
+                         ++fall) {
+                        path.fallDepth = fall;
+                    }
+                    break;
+                }
+            }
+        }
+
+        const CurrentLateralPath* chosen =
+            nullptr;
+        const bool firstHasDrop =
+            paths[0].dropDistance > 0;
+        const bool secondHasDrop =
+            paths[1].dropDistance > 0;
+        if (firstHasDrop || secondHasDrop) {
+            if (!firstHasDrop) {
+                chosen = &paths[1];
+            } else if (!secondHasDrop) {
+                chosen = &paths[0];
+            } else {
+                chosen =
+                    paths[0].fallDepth !=
+                            paths[1].fallDepth
+                        ? (paths[0].fallDepth >
+                                   paths[1].fallDepth
+                               ? &paths[0]
+                               : &paths[1])
+                        : (paths[0].dropDistance <=
+                                   paths[1].dropDistance
+                               ? &paths[0]
+                               : &paths[1]);
+            }
+        } else if (
+            paths[0].openRun > 0 ||
+            paths[1].openRun > 0) {
+            chosen =
+                paths[0].openRun >=
+                        paths[1].openRun
+                    ? &paths[0]
+                    : &paths[1];
+        }
+        const int chosenDistance =
+            chosen == nullptr
+                ? 0
+                : (chosen->dropDistance > 0
+                       ? chosen->dropDistance
+                       : chosen->openRun);
+        if (chosenDistance > 0 &&
+            canMoveSidewaysInto(
+                x +
+                    chosen->direction *
+                        chosenDistance,
+                y)) {
+            const int direction =
+                chosen->direction;
+            const int pressureImpulse =
+                std::min(
+                    127,
+                    (material ==
+                             Material::water
+                         ? 82
+                         : 45) +
+                        headDepth *
+                            (material ==
+                                     Material::water
+                                 ? 3
+                                 : 1));
+            ++currentLiquidMoveProposals_;
+            moveLiquid(
+                x, y,
+                x +
+                    direction *
+                        chosenDistance,
+                y,
+                direction * pressureImpulse,
+                0);
+            ++currentLiquidMovesAccepted_;
+            continue;
+        }
         liquidFlowX_[proposal.source] =
-            proposal.restingFlowX;
+            static_cast<std::int8_t>(
+                currentFlowX * 2 / 3);
         liquidFlowY_[proposal.source] =
-            proposal.restingFlowY;
+            0;
     }
     const auto lateralEnd =
         std::chrono::steady_clock::now();

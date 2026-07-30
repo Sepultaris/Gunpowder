@@ -845,6 +845,8 @@ int main() {
                gunpowder::Material::oil);
     bool usedParallelLiquidScheduler = false;
     bool acceptedLiquidTransfer = false;
+    std::uint64_t acceptedLiquidTransferTotal = 0;
+    std::uint64_t conflictedLiquidTransferTotal = 0;
     gunpowder::InputState parallelLiquidInput;
     for (int tick = 0; tick < 120; ++tick) {
         firstParallelLiquidWorld.update(
@@ -860,6 +862,10 @@ int main() {
         acceptedLiquidTransfer =
             acceptedLiquidTransfer ||
             timings.liquidMovesAccepted > 0;
+        acceptedLiquidTransferTotal +=
+            timings.liquidMovesAccepted;
+        conflictedLiquidTransferTotal +=
+            timings.liquidMoveConflicts;
     }
     if (massOf(firstParallelLiquidWorld,
                gunpowder::Material::water) !=
@@ -906,6 +912,16 @@ int main() {
                "separation across chunk seams (oil "
             << averageOilY << ", water "
             << averageWaterY << ")\n";
+        return 1;
+    }
+    if (conflictedLiquidTransferTotal >=
+        acceptedLiquidTransferTotal) {
+        std::cerr
+            << "Parallel liquid flow became conflict-dominated ("
+            << acceptedLiquidTransferTotal
+            << " accepted, "
+            << conflictedLiquidTransferTotal
+            << " conflicted)\n";
         return 1;
     }
     if (!std::equal(

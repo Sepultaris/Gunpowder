@@ -591,10 +591,13 @@ bool drawDeveloperUi(bool* open,
             materialTimings.gasMovesAccepted,
             materialTimings.gasMoveConflicts);
         ImGui::TextDisabled(
-            "Liquid transfers: %u proposed | %u accepted | %u conflicts",
+            "Liquid transfers: %u proposed | %u accepted | %u conflicts "
+            "(gravity %u / lateral %u)",
             materialTimings.liquidMoveProposals,
             materialTimings.liquidMovesAccepted,
-            materialTimings.liquidMoveConflicts);
+            materialTimings.liquidMoveConflicts,
+            materialTimings.liquidGravityConflicts,
+            materialTimings.liquidLateralConflicts);
         ImGui::TextDisabled(
             "Liquid prep %u cells | Edge cache %u columns | "
             "Equalization seeds %u cells",

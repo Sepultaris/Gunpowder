@@ -1360,8 +1360,6 @@ void main() {
         unpackNormalizedPair(camera.fluidMotion.w);
     float liquidCausticStrength =
         packedLiquidEffects.x * 3.0;
-    float liquidDispersionStrength =
-        packedLiquidEffects.y * 2.0;
     float liquidDepth = 0.0;
     vec3 liquidTransmission = vec3(1.0);
     if (isLiquidMaterial(material)) {
@@ -1732,23 +1730,6 @@ void main() {
             liquidScatterDepth *
             (material == 4u ? 0.055 : 0.12);
 
-        float spectralPhase =
-            absoluteWorldPosition.x * 0.34 +
-            absoluteWorldPosition.y * 0.11 +
-            camera.time * 0.12;
-        vec3 spectralColor =
-            0.5 + 0.5 *
-                cos(vec3(0.0, 2.0944, 4.1888) +
-                    spectralPhase);
-        float dispersionScale =
-            material == 5u ? 0.18 : 0.065;
-        specularLighting +=
-            environmentRadiance *
-            spectralColor *
-            liquidDispersionStrength *
-            dispersionScale *
-            shadingSurfaceWeight *
-            (0.24 + fresnel * 0.76);
     }
 
     // The GPU-derived field supplies smoothly averaged local/room density.

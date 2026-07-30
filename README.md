@@ -13,8 +13,7 @@ The current milestone includes:
 - compact diffuse/specular/metallic material shading with GGX highlights and
   thickness-aware marble subsurface scattering
 - flow-aware metaball skins for water and oil, with gradient-derived normals,
-  Fresnel reflections, depth absorption, subsurface color, caustics, and
-  spectral dispersion
+  Fresnel reflections, depth absorption, subsurface color, and caustics
 - named, human-readable rendering profiles for lighting and material looks
 - visible-region texture uploads instead of full-world transfers
 - fixed-timestep gameplay
@@ -145,12 +144,12 @@ normal rendering, water and oil receive a separate 3x3 implicit metaball skin.
 Resting fields spread horizontally, moving fields stretch with flow, and the
 analytic field gradient supplies a smooth reflection normal. The developer
 window exposes density, radius, edge softness, flow stretching, pool
-flattening, normal strength, reflection, subsurface scattering, caustics, and
-spectral dispersion; the cellular simulation and conserved volume remain
-unchanged. The same controls expose polished-marble scattering strength and
-distance. Marble estimates local thickness from nearby samples, while liquids
-estimate depth for wavelength-dependent absorption. These optical effects
-reuse the existing direct, sky, and GI results and add no ray-tracing passes.
+flattening, normal strength, reflection, subsurface scattering, and caustics;
+the cellular simulation and conserved volume remain unchanged. The same
+controls expose polished-marble scattering strength and distance. Marble
+estimates local thickness from nearby samples, while liquids estimate depth
+for wavelength-dependent absorption. These optical effects reuse the existing
+direct, sky, and GI results and add no ray-tracing passes.
 Smoke, steam, fire, and sand use corresponding local movement and reaction
 rules.
 

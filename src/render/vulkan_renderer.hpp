@@ -88,7 +88,6 @@ struct RayTracingSettings {
     float liquidReflectionStrength = 1.0F;
     float liquidSubsurfaceStrength = 0.68F;
     float liquidCausticStrength = 0.55F;
-    float liquidDispersionStrength = 0.24F;
 };
 
 struct GpuRayTimings {

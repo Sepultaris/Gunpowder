@@ -123,8 +123,7 @@ struct DisplaySettings {
     X(liquidMetaballNormalStrength)                                         \
     X(liquidReflectionStrength)                                             \
     X(liquidSubsurfaceStrength)                                             \
-    X(liquidCausticStrength)                                                \
-    X(liquidDispersionStrength)
+    X(liquidCausticStrength)
 
 struct RenderProfileUi {
     std::filesystem::path directory;
@@ -896,11 +895,6 @@ bool drawDeveloperUi(bool* open,
                 &settings.liquidCausticStrength,
                 0.0F, 3.0F, "%.2f",
                 defaults.liquidCausticStrength);
-            sliderFloatWithReset(
-                "Spectral dispersion",
-                &settings.liquidDispersionStrength,
-                0.0F, 2.0F, "%.2f",
-                defaults.liquidDispersionStrength);
             ImGui::TextDisabled(
                 "Density joins forms; radius changes reach; softness "
                 "controls the transition.");

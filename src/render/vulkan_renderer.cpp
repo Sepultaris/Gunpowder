@@ -4273,7 +4273,7 @@ void VulkanRenderer::recordCommands(VkCommandBuffer commandBuffer,
             rayTracingSettings_.liquidMetaballNormalStrength,
             packNormalizedPair(
                 rayTracingSettings_.liquidCausticStrength, 3.0F,
-                rayTracingSettings_.liquidDispersionStrength, 2.0F),
+                0.0F, 1.0F),
         },
     };
     vkCmdPushConstants(commandBuffer, cellPipelineLayout_,

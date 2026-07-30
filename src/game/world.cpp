@@ -4011,6 +4011,12 @@ void World::cacheLiquidColumnHeads(const ActiveBounds& bounds) {
 void World::updateLiquids(const ActiveBounds& bounds, bool waterOnly) {
     const auto selectionBegin =
         std::chrono::steady_clock::now();
+    // Liquid transport is order-dependent: a bottom-up move must immediately
+    // expose its old cell to the liquid above it. Snapshot command buffers
+    // cannot preserve that cascade and turn falling columns into diagonal
+    // wedges. Keep the read-only frontier work parallel, but resolve gravity
+    // and lateral transport directly against the live grid.
+    constexpr bool useParallelLiquidTransport = false;
     std::uniform_int_distribution<int> coin(0, 1);
     std::uniform_int_distribution<int> percent(0, 99);
     const auto isOpen = [](Material material) {
@@ -4244,6 +4250,28 @@ void World::updateLiquids(const ActiveBounds& bounds, bool waterOnly) {
             liquidWorklist_.begin(),
             liquidWorklist_.end());
     }
+    // Preserve bottom-to-top row traversal while avoiding a persistent
+    // left/right bias within a row.
+    for (std::size_t rowBegin = 0;
+         rowBegin < liquidWorklist_.size();) {
+        const int row = static_cast<int>(
+            liquidWorklist_[rowBegin] /
+            static_cast<std::size_t>(width));
+        std::size_t rowEnd = rowBegin + 1;
+        while (rowEnd < liquidWorklist_.size() &&
+               static_cast<int>(
+                   liquidWorklist_[rowEnd] /
+                   static_cast<std::size_t>(width)) == row) {
+            ++rowEnd;
+        }
+        std::shuffle(
+            liquidWorklist_.begin() +
+                static_cast<std::ptrdiff_t>(rowBegin),
+            liquidWorklist_.begin() +
+                static_cast<std::ptrdiff_t>(rowEnd),
+            random_);
+        rowBegin = rowEnd;
+    }
     currentLiquidCandidateVisits_ +=
         static_cast<std::uint32_t>(std::min<std::size_t>(
             liquidWorklist_.size(),
@@ -4377,12 +4405,15 @@ void World::updateLiquids(const ActiveBounds& bounds, bool waterOnly) {
     const auto& gravityFlowX =
         std::as_const(liquidFlowX_);
     const std::size_t gravityJobCount =
-        liquidWorklist_.empty()
+        !useParallelLiquidTransport ||
+                liquidWorklist_.empty()
             ? 0
             : std::min<std::size_t>(
                   materialExecutor().workerCount(),
                   (liquidWorklist_.size() + 255) /
                       256);
+    const std::size_t gravityJobDivisor =
+        std::max<std::size_t>(1, gravityJobCount);
     std::vector<std::vector<LiquidGravityProposal>>
         gravityJobProposals(gravityJobCount);
     materialExecutor().run(
@@ -4390,10 +4421,11 @@ void World::updateLiquids(const ActiveBounds& bounds, bool waterOnly) {
         [&](std::size_t jobIndex) {
             const std::size_t begin =
                 liquidWorklist_.size() * jobIndex /
-                gravityJobCount;
+                gravityJobDivisor;
             const std::size_t end =
                 liquidWorklist_.size() *
-                (jobIndex + 1) / gravityJobCount;
+                (jobIndex + 1) /
+                gravityJobDivisor;
             auto& proposals =
                 gravityJobProposals[jobIndex];
             proposals.reserve(end - begin);
@@ -4579,6 +4611,68 @@ void World::updateLiquids(const ActiveBounds& bounds, bool waterOnly) {
             ++currentLiquidGravityConflicts_;
         }
     }
+    if (!useParallelLiquidTransport) {
+        // The worklist is row-sorted, so reverse iteration is a true
+        // bottom-up pass. Each accepted move is visible to the next source,
+        // allowing a vertical stream to fall coherently within this substep.
+        for (auto iterator = liquidWorklist_.rbegin();
+             iterator != liquidWorklist_.rend(); ++iterator) {
+            const std::size_t source = *iterator;
+            const int x = static_cast<int>(
+                source % static_cast<std::size_t>(width));
+            const int y = static_cast<int>(
+                source / static_cast<std::size_t>(width));
+            const Material material = cells_[source];
+            if (!isLiquid(material) ||
+                (waterOnly &&
+                 material != Material::water) ||
+                moved_[source] != 0 ||
+                y >= height - 1) {
+                continue;
+            }
+            liquidAmount_[source] = maximumLiquidMass;
+
+            const std::size_t belowIndex =
+                indexOf(x, y + 1);
+            if (material == Material::water &&
+                cells_[belowIndex] == Material::oil &&
+                liquidEqualizationReservation_[
+                    belowIndex] == 0 &&
+                moved_[belowIndex] != 1) {
+                ++currentLiquidMoveProposals_;
+                moveLiquid(x, y, x, y + 1, 0, 96);
+                ++currentLiquidMovesAccepted_;
+                continue;
+            }
+            if (canFallInto(x, y + 1)) {
+                ++currentLiquidMoveProposals_;
+                moveLiquid(x, y, x, y + 1, 0, 127);
+                ++currentLiquidMovesAccepted_;
+                continue;
+            }
+
+            const int firstDirection =
+                liquidFlowX_[source] == 0
+                    ? (coin(random_) == 0 ? -1 : 1)
+                    : (liquidFlowX_[source] < 0
+                           ? -1
+                           : 1);
+            for (int direction :
+                 {firstDirection, -firstDirection}) {
+                if (!canFallInto(
+                        x + direction, y + 1)) {
+                    continue;
+                }
+                ++currentLiquidMoveProposals_;
+                moveLiquid(
+                    x, y,
+                    x + direction, y + 1,
+                    direction * 84, 112);
+                ++currentLiquidMovesAccepted_;
+                break;
+            }
+        }
+    }
 
     // Impact metadata is resolved after transport, once destination locks
     // make it clear which cells actually remained supported.
@@ -4681,12 +4775,15 @@ void World::updateLiquids(const ActiveBounds& bounds, bool waterOnly) {
             return lateralCells[indexOf(x, y)];
         };
     const std::size_t lateralJobCount =
-        liquidWorklist_.empty()
+        !useParallelLiquidTransport ||
+                liquidWorklist_.empty()
             ? 0
             : std::min<std::size_t>(
                   materialExecutor().workerCount(),
                   (liquidWorklist_.size() + 255) /
                       256);
+    const std::size_t lateralJobDivisor =
+        std::max<std::size_t>(1, lateralJobCount);
     std::vector<std::vector<LiquidLateralProposal>>
         lateralJobProposals(lateralJobCount);
     materialExecutor().run(
@@ -4694,10 +4791,11 @@ void World::updateLiquids(const ActiveBounds& bounds, bool waterOnly) {
         [&](std::size_t jobIndex) {
             const std::size_t begin =
                 liquidWorklist_.size() * jobIndex /
-                lateralJobCount;
+                lateralJobDivisor;
             const std::size_t end =
                 liquidWorklist_.size() *
-                (jobIndex + 1) / lateralJobCount;
+                (jobIndex + 1) /
+                lateralJobDivisor;
             auto& proposals =
                 lateralJobProposals[jobIndex];
             proposals.reserve(end - begin);
@@ -4949,17 +5047,40 @@ void World::updateLiquids(const ActiveBounds& bounds, bool waterOnly) {
             jobProposals.begin(),
             jobProposals.end());
     }
-    std::sort(
-        lateralProposals.begin(),
-        lateralProposals.end(),
-        [](const LiquidLateralProposal& first,
-           const LiquidLateralProposal& second) {
-            if (first.priority != second.priority) {
-                return first.priority <
-                       second.priority;
+    if (!useParallelLiquidTransport) {
+        lateralProposals.reserve(
+            liquidWorklist_.size());
+        for (std::size_t source :
+             liquidWorklist_) {
+            const Material material = cells_[source];
+            if (!isLiquid(material) ||
+                (waterOnly &&
+                 material != Material::water)) {
+                continue;
             }
-            return first.source < second.source;
-        });
+            LiquidLateralProposal proposal;
+            proposal.source = source;
+            proposal.destination = source;
+            proposal.material = material;
+            proposal.priority =
+                static_cast<std::uint32_t>(
+                    coin(random_));
+            lateralProposals.push_back(proposal);
+        }
+    } else {
+        std::sort(
+            lateralProposals.begin(),
+            lateralProposals.end(),
+            [](const LiquidLateralProposal& first,
+               const LiquidLateralProposal& second) {
+                if (first.priority !=
+                    second.priority) {
+                    return first.priority <
+                           second.priority;
+                }
+                return first.source < second.source;
+            });
+    }
     for (const LiquidLateralProposal& proposal :
          lateralProposals) {
         if (moved_[proposal.source] != 0 ||

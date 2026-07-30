@@ -152,6 +152,7 @@ void World::regenerate() {
     particleSpawns_.clear();
     pendingGpuMaterialSteps_ = 0;
     materialScanRight_ = true;
+    materialStep_ = 0;
     grapple_ = Grapple{};
     playerSplashAccumulator_ = 0.0F;
     playerLiquidDisplacementAccumulator_ = 0.0F;
@@ -2793,6 +2794,7 @@ void World::updateMaterials() {
         }
     }
     materialScanRight_ = !materialScanRight_;
+    ++materialStep_;
     std::uniform_int_distribution<int> coin(0, 1);
     std::uniform_int_distribution<int> percent(0, 99);
 
@@ -2804,121 +2806,383 @@ void World::updateMaterials() {
         moved_[to] = 1;
     };
 
-    // Granular positions remain cell-exact, but their free-fall integration
-    // uses the same acceleration and terminal speed as the player. Fractional
-    // travel is retained between 30 Hz material ticks, while a fast grain may
-    // cross several open cells in one tick without tunneling through them.
-    for (int y = std::min(bounds.maxY - 1, height - 2); y >= bounds.minY; --y) {
-      const int chunkY = y / chunkSize;
-      const int chunkCount = finalChunkX - firstChunkX;
-      for (int chunkStep = 0; chunkStep < chunkCount; ++chunkStep) {
-        const int chunkX =
-            materialScanRight_
-                ? firstChunkX + chunkStep
-                : finalChunkX - 1 - chunkStep;
-        if (!materialChunkActive(chunkX * chunkSize, chunkY * chunkSize,
-                                 granularActivity)) {
-          continue;
+    struct GranularTransfer {
+        std::size_t source = 0;
+        std::size_t destination = 0;
+        float velocity = 0.0F;
+        float remainder = 0.0F;
+        float rejectedVelocity = 0.0F;
+        float rejectedRemainder = 0.0F;
+        std::uint32_t priority = 0;
+        bool moving = false;
+        bool keepActive = false;
+    };
+    struct GranularChunkJob {
+        int chunkX = 0;
+        int chunkY = 0;
+        std::vector<GranularTransfer> transfers;
+    };
+
+    std::array<std::vector<GranularChunkJob>, 4> granularPhaseJobs;
+    std::uint32_t granularChunkCount = 0;
+    for (int chunkY = firstChunkY; chunkY < finalChunkY; ++chunkY) {
+        for (int chunkX = firstChunkX; chunkX < finalChunkX; ++chunkX) {
+            if (!materialChunkActive(
+                    chunkX * chunkSize,
+                    chunkY * chunkSize,
+                    granularActivity)) {
+                continue;
+            }
+            const std::size_t chunkIndex =
+                static_cast<std::size_t>(
+                    chunkY * chunkColumns + chunkX);
+            const std::size_t activeCells =
+                static_cast<std::size_t>(
+                    std::popcount(
+                        materialChunkActivity_[chunkIndex]
+                            .microtiles[granularSystem])) *
+                static_cast<std::size_t>(
+                    materialMicrotileSize *
+                    materialMicrotileSize);
+            const int phase =
+                (chunkX & 1) | ((chunkY & 1) << 1);
+            auto& job = granularPhaseJobs[
+                static_cast<std::size_t>(phase)].emplace_back();
+            job.chunkX = chunkX;
+            job.chunkY = chunkY;
+            job.transfers.reserve(activeCells);
+            ++granularChunkCount;
         }
-        const int chunkOriginX = chunkX * chunkSize;
-        for (int tileStep = 0; tileStep < materialMicrotilesPerAxis;
-             ++tileStep) {
-          const int microtileX =
-              materialScanRight_
-                  ? tileStep
-                  : materialMicrotilesPerAxis - 1 - tileStep;
-          const int tileOriginX =
-              chunkOriginX + microtileX * materialMicrotileSize;
-          const int beginX = std::max(bounds.minX, tileOriginX);
-          const int endX =
-              std::min(bounds.maxX, tileOriginX + materialMicrotileSize);
-          if (beginX >= endX ||
-              !materialMicrotileActive(beginX, y, granularActivity)) {
-            continue;
-          }
-          for (int localStep = 0; localStep < endX - beginX; ++localStep) {
-            const int x =
-                materialScanRight_
-                    ? beginX + localStep
-                    : endX - 1 - localStep;
-          const std::size_t index = indexOf(x, y);
-          if (moved_[index] != 0) {
-            continue;
-          }
-          const Material material = cells_[index];
-          if (material != Material::sand) {
-            continue;
-          }
-
-          const auto canFallInto = [](Material target) {
-            return target == Material::air || target == Material::fire ||
-                   target == Material::smoke || target == Material::steam ||
-                   isLiquid(target);
-          };
-
-          if (canFallInto(cell(x, y + 1))) {
-            const float previousVelocity =
-                std::max(granularVelocityY_[index], 0.0F);
-            const float nextVelocity =
-                std::min(previousVelocity + gravity * materialTimeStep,
-                         terminalFallSpeed);
-            const float integratedDistance =
-                granularFallRemainder_[index] +
-                (previousVelocity + nextVelocity) * 0.5F * materialTimeStep;
-            const int requestedSteps =
-                static_cast<int>(std::floor(integratedDistance));
-            if (requestedSteps <= 0) {
-              granularVelocityY_[index] = nextVelocity;
-              granularFallRemainder_[index] = integratedDistance;
-              markMaterialActive(x, y, granularActivity);
-              continue;
-            }
-
-            int currentY = y;
-            int completedSteps = 0;
-            while (completedSteps < requestedSteps && currentY < height - 1 &&
-                   canFallInto(cell(x, currentY + 1))) {
-              moveCell(x, currentY, x, currentY + 1);
-              ++currentY;
-              ++completedSteps;
-            }
-
-            const std::size_t destination = indexOf(x, currentY);
-            const bool landed = completedSteps < requestedSteps ||
-                                currentY >= height - 1 ||
-                                !canFallInto(cell(x, currentY + 1));
-            if (landed) {
-              granularVelocityY_[destination] = 0.0F;
-              granularFallRemainder_[destination] = 0.0F;
-            } else {
-              granularVelocityY_[destination] = nextVelocity;
-              granularFallRemainder_[destination] =
-                  integratedDistance - static_cast<float>(completedSteps);
-              markMaterialActive(x, currentY, granularActivity);
-            }
-            continue;
-          }
-
-          granularVelocityY_[index] = 0.0F;
-          granularFallRemainder_[index] = 0.0F;
-          const int direction = coin(random_) == 0 ? -1 : 1;
-          if (canFallInto(cell(x + direction, y + 1))) {
-            moveCell(x, y, x + direction, y + 1);
-            const std::size_t destination = indexOf(x + direction, y + 1);
-            granularVelocityY_[destination] = 0.0F;
-            granularFallRemainder_[destination] = 0.0F;
-            continue;
-          }
-          if (canFallInto(cell(x - direction, y + 1))) {
-            moveCell(x, y, x - direction, y + 1);
-            const std::size_t destination = indexOf(x - direction, y + 1);
-            granularVelocityY_[destination] = 0.0F;
-            granularFallRemainder_[destination] = 0.0F;
-          }
-          }
-        }
-      }
     }
+
+    const auto& currentCells = std::as_const(cells_);
+    const auto& currentGranularVelocity =
+        std::as_const(granularVelocityY_);
+    const auto& currentGranularRemainder =
+        std::as_const(granularFallRemainder_);
+    const auto materialAt =
+        [&](int x, int y) {
+            if (x < 0 || x >= width ||
+                y < 0 || y >= height) {
+                return Material::rock;
+            }
+            return currentCells[indexOf(x, y)];
+        };
+    const auto canFallInto = [](Material target) {
+        return target == Material::air ||
+               target == Material::fire ||
+               target == Material::smoke ||
+               target == Material::steam ||
+               isLiquid(target);
+    };
+    const auto transferPriority =
+        [&](std::size_t source) {
+            std::uint64_t value =
+                source ^
+                (materialStep_ * 0x9E3779B97F4A7C15ULL);
+            value ^= value >> 30U;
+            value *= 0xBF58476D1CE4E5B9ULL;
+            value ^= value >> 27U;
+            value *= 0x94D049BB133111EBULL;
+            value ^= value >> 31U;
+            return static_cast<std::uint32_t>(
+                value ^ (value >> 32U));
+        };
+
+    ParallelExecutor& executor = materialExecutor();
+    materialSimulationTimings_.materialWorkerThreads =
+        executor.workerCount();
+    materialSimulationTimings_.parallelGranularChunks =
+        granularChunkCount;
+    for (auto& jobs : granularPhaseJobs) {
+        executor.run(
+            jobs.size(),
+            [&](std::size_t jobIndex) {
+                GranularChunkJob& job = jobs[jobIndex];
+                const int chunkOriginX =
+                    job.chunkX * chunkSize;
+                const int chunkOriginY =
+                    job.chunkY * chunkSize;
+                const int beginY = std::max(
+                    bounds.minY, chunkOriginY);
+                const int endY = std::min({
+                    bounds.maxY,
+                    chunkOriginY + chunkSize,
+                    height - 1,
+                });
+                for (int y = endY - 1;
+                     y >= beginY; --y) {
+                    for (int tileStep = 0;
+                         tileStep <
+                             materialMicrotilesPerAxis;
+                         ++tileStep) {
+                        const int microtileX =
+                            materialScanRight_
+                                ? tileStep
+                                : materialMicrotilesPerAxis -
+                                      1 - tileStep;
+                        const int tileOriginX =
+                            chunkOriginX +
+                            microtileX *
+                                materialMicrotileSize;
+                        const int beginX = std::max(
+                            bounds.minX, tileOriginX);
+                        const int endX = std::min(
+                            bounds.maxX,
+                            tileOriginX +
+                                materialMicrotileSize);
+                        if (beginX >= endX ||
+                            !materialMicrotileActive(
+                                beginX, y,
+                                granularActivity)) {
+                            continue;
+                        }
+                        for (int localStep = 0;
+                             localStep < endX - beginX;
+                             ++localStep) {
+                            const int x =
+                                materialScanRight_
+                                    ? beginX + localStep
+                                    : endX - 1 -
+                                          localStep;
+                            const std::size_t source =
+                                indexOf(x, y);
+                            if (currentCells[source] !=
+                                Material::sand) {
+                                continue;
+                            }
+
+                            GranularTransfer transfer;
+                            transfer.source = source;
+                            transfer.destination = source;
+                            transfer.priority =
+                                transferPriority(source);
+                            if (canFallInto(
+                                    materialAt(x, y + 1))) {
+                                const float previousVelocity =
+                                    std::max(
+                                        currentGranularVelocity[
+                                            source],
+                                        0.0F);
+                                const float nextVelocity =
+                                    std::min(
+                                        previousVelocity +
+                                            gravity *
+                                                materialTimeStep,
+                                        terminalFallSpeed);
+                                const float integratedDistance =
+                                    currentGranularRemainder[
+                                        source] +
+                                    (previousVelocity +
+                                     nextVelocity) *
+                                        0.5F *
+                                        materialTimeStep;
+                                const int requestedSteps =
+                                    static_cast<int>(
+                                        std::floor(
+                                            integratedDistance));
+                                if (requestedSteps <= 0) {
+                                    transfer.velocity =
+                                        nextVelocity;
+                                    transfer.remainder =
+                                        integratedDistance;
+                                    transfer.keepActive = true;
+                                    job.transfers.push_back(
+                                        transfer);
+                                    continue;
+                                }
+
+                                int destinationY = y;
+                                int completedSteps = 0;
+                                while (
+                                    completedSteps <
+                                        requestedSteps &&
+                                    destinationY <
+                                        height - 1 &&
+                                    canFallInto(materialAt(
+                                        x,
+                                        destinationY + 1))) {
+                                    ++destinationY;
+                                    ++completedSteps;
+                                }
+                                transfer.destination =
+                                    indexOf(x, destinationY);
+                                transfer.moving =
+                                    destinationY != y;
+                                const bool landed =
+                                    completedSteps <
+                                        requestedSteps ||
+                                    destinationY >=
+                                        height - 1 ||
+                                    !canFallInto(materialAt(
+                                        x,
+                                        destinationY + 1));
+                                transfer.velocity =
+                                    landed ? 0.0F
+                                           : nextVelocity;
+                                transfer.remainder =
+                                    landed
+                                        ? 0.0F
+                                        : integratedDistance -
+                                              static_cast<float>(
+                                                  completedSteps);
+                                transfer.rejectedVelocity =
+                                    nextVelocity;
+                                transfer.rejectedRemainder =
+                                    std::min(
+                                        integratedDistance,
+                                        1.0F);
+                                transfer.keepActive =
+                                    !landed;
+                                job.transfers.push_back(
+                                    transfer);
+                                continue;
+                            }
+
+                            const int preferredDirection =
+                                (transfer.priority & 1U) == 0
+                                    ? -1
+                                    : 1;
+                            for (int direction :
+                                 {preferredDirection,
+                                  -preferredDirection}) {
+                                if (!canFallInto(materialAt(
+                                        x + direction,
+                                        y + 1))) {
+                                    continue;
+                                }
+                                transfer.destination =
+                                    indexOf(
+                                        x + direction,
+                                        y + 1);
+                                transfer.moving = true;
+                                break;
+                            }
+                            job.transfers.push_back(
+                                transfer);
+                        }
+                    }
+                }
+            });
+    }
+
+    std::vector<GranularTransfer> granularTransfers;
+    for (const auto& jobs : granularPhaseJobs) {
+        for (const GranularChunkJob& job : jobs) {
+            granularTransfers.insert(
+                granularTransfers.end(),
+                job.transfers.begin(),
+                job.transfers.end());
+        }
+    }
+    std::sort(
+        granularTransfers.begin(),
+        granularTransfers.end(),
+        [](const GranularTransfer& first,
+           const GranularTransfer& second) {
+            if (first.destination != second.destination) {
+                return first.destination <
+                       second.destination;
+            }
+            if (first.priority != second.priority) {
+                return first.priority < second.priority;
+            }
+            return first.source < second.source;
+        });
+
+    std::uint32_t granularMoveProposals = 0;
+    std::uint32_t granularMovesAccepted = 0;
+    std::uint32_t granularMoveConflicts = 0;
+    for (std::size_t begin = 0;
+         begin < granularTransfers.size();) {
+        std::size_t end = begin + 1;
+        while (end < granularTransfers.size() &&
+               granularTransfers[end].destination ==
+                   granularTransfers[begin].destination) {
+            ++end;
+        }
+        const GranularTransfer& accepted =
+            granularTransfers[begin];
+        if (accepted.moving) {
+            ++granularMovesAccepted;
+            const int sourceX = static_cast<int>(
+                accepted.source %
+                static_cast<std::size_t>(width));
+            const int sourceY = static_cast<int>(
+                accepted.source /
+                static_cast<std::size_t>(width));
+            const int destinationX = static_cast<int>(
+                accepted.destination %
+                static_cast<std::size_t>(width));
+            const int destinationY = static_cast<int>(
+                accepted.destination /
+                static_cast<std::size_t>(width));
+            swapCells(
+                sourceX, sourceY,
+                destinationX, destinationY);
+            moved_[accepted.source] = 1;
+            moved_[accepted.destination] = 1;
+            granularVelocityY_[accepted.destination] =
+                accepted.velocity;
+            granularFallRemainder_[accepted.destination] =
+                accepted.remainder;
+            if (accepted.keepActive) {
+                markMaterialActive(
+                    destinationX, destinationY,
+                    granularActivity);
+            }
+        } else {
+            granularVelocityY_[accepted.source] =
+                accepted.velocity;
+            granularFallRemainder_[accepted.source] =
+                accepted.remainder;
+            if (accepted.keepActive) {
+                const int sourceX = static_cast<int>(
+                    accepted.source %
+                    static_cast<std::size_t>(width));
+                const int sourceY = static_cast<int>(
+                    accepted.source /
+                    static_cast<std::size_t>(width));
+                markMaterialActive(
+                    sourceX, sourceY,
+                    granularActivity);
+            }
+        }
+
+        if (accepted.moving) {
+            ++granularMoveProposals;
+        }
+        for (std::size_t rejectedIndex = begin + 1;
+             rejectedIndex < end; ++rejectedIndex) {
+            const GranularTransfer& rejected =
+                granularTransfers[rejectedIndex];
+            if (!rejected.moving) {
+                continue;
+            }
+            ++granularMoveProposals;
+            ++granularMoveConflicts;
+            granularVelocityY_[rejected.source] =
+                rejected.rejectedVelocity;
+            granularFallRemainder_[rejected.source] =
+                rejected.rejectedRemainder;
+            const int sourceX = static_cast<int>(
+                rejected.source %
+                static_cast<std::size_t>(width));
+            const int sourceY = static_cast<int>(
+                rejected.source /
+                static_cast<std::size_t>(width));
+            markMaterialActive(
+                sourceX, sourceY,
+                granularActivity);
+        }
+        begin = end;
+    }
+    materialSimulationTimings_.granularMoveProposals =
+        granularMoveProposals;
+    materialSimulationTimings_.granularMovesAccepted =
+        granularMovesAccepted;
+    materialSimulationTimings_.granularMoveConflicts =
+        granularMoveConflicts;
 
     // Local cellular substeps let falling liquids travel several pixels per
     // material tick without introducing fractional cell volume. Water gets

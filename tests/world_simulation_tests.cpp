@@ -1161,6 +1161,80 @@ int main() {
         return 1;
     }
 
+    gunpowder::World firstParallelSandWorld;
+    gunpowder::World secondParallelSandWorld;
+    for (int y = 30; y <= 150; ++y) {
+        for (int x = 52; x <= 76; ++x) {
+            const gunpowder::Material material =
+                y == 150
+                    ? gunpowder::Material::stone
+                    : gunpowder::Material::air;
+            firstParallelSandWorld.setCellForTest(
+                x, y, material);
+            secondParallelSandWorld.setCellForTest(
+                x, y, material);
+        }
+    }
+    for (int y = 48; y <= 62; ++y) {
+        for (int x = 60; x <= 67; ++x) {
+            firstParallelSandWorld.setCellForTest(
+                x, y, gunpowder::Material::sand);
+            secondParallelSandWorld.setCellForTest(
+                x, y, gunpowder::Material::sand);
+        }
+    }
+    const std::size_t initialParallelSand =
+        countOf(firstParallelSandWorld,
+                gunpowder::Material::sand);
+    bool usedParallelGranularScheduler = false;
+    bool acceptedGranularTransfer = false;
+    for (int tick = 0; tick < 60; ++tick) {
+        firstParallelSandWorld.update(
+            1.0F / 30.0F, gravityInput);
+        secondParallelSandWorld.update(
+            1.0F / 30.0F, gravityInput);
+        const auto& timings =
+            firstParallelSandWorld
+                .materialSimulationTimings();
+        usedParallelGranularScheduler =
+            usedParallelGranularScheduler ||
+            timings.parallelGranularChunks >= 2;
+        acceptedGranularTransfer =
+            acceptedGranularTransfer ||
+            timings.granularMovesAccepted > 0;
+    }
+    if (countOf(firstParallelSandWorld,
+                gunpowder::Material::sand) !=
+        initialParallelSand) {
+        std::cerr
+            << "Parallel granular transfers changed sand mass\n";
+        return 1;
+    }
+    bool crossedVerticalChunkBoundary = false;
+    for (int y = 64; y < 150; ++y) {
+        for (int x = 52; x <= 76; ++x) {
+            crossedVerticalChunkBoundary =
+                crossedVerticalChunkBoundary ||
+                firstParallelSandWorld.cell(x, y) ==
+                    gunpowder::Material::sand;
+        }
+    }
+    if (!crossedVerticalChunkBoundary ||
+        !usedParallelGranularScheduler ||
+        !acceptedGranularTransfer) {
+        std::cerr
+            << "Sand did not use parallel cross-chunk transfers\n";
+        return 1;
+    }
+    if (!std::equal(
+            firstParallelSandWorld.materials().begin(),
+            firstParallelSandWorld.materials().end(),
+            secondParallelSandWorld.materials().begin())) {
+        std::cerr
+            << "Parallel granular transfers are not deterministic\n";
+        return 1;
+    }
+
     gunpowder::World wrapWorld;
     gunpowder::InputState wrapInput;
     wrapInput.grappleToggle = true;

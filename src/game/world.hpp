@@ -38,7 +38,11 @@ struct MaterialSimulationTimings {
     std::uint32_t activeGasMicrotiles = 0;
     std::uint32_t activeThermalMicrotiles = 0;
     std::uint32_t materialWorkerThreads = 1;
+    std::uint32_t parallelGranularChunks = 0;
     std::uint32_t parallelThermalChunks = 0;
+    std::uint32_t granularMoveProposals = 0;
+    std::uint32_t granularMovesAccepted = 0;
+    std::uint32_t granularMoveConflicts = 0;
     std::uint32_t liquidPreparationCellVisits = 0;
     std::uint32_t liquidHeadSummaryHits = 0;
     std::uint32_t liquidEqualizationSeedVisits = 0;
@@ -424,6 +428,7 @@ private:
     float materialAccumulator_ = 0.0F;
     float sparseCleanupAccumulator_ = 0.0F;
     bool materialScanRight_ = true;
+    std::uint64_t materialStep_ = 0;
     std::uint32_t pendingGpuMaterialSteps_ = 0;
     bool gpuMaterialSimulationEnabled_ = false;
     Material selectedMaterial_ = Material::water;

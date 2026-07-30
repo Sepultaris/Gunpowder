@@ -38,6 +38,7 @@ constexpr std::uint32_t rayTimingQueryCount = 10;
 constexpr float renderScale = static_cast<float>(World::simulationScale);
 constexpr float tau = 6.28318530718F;
 constexpr float sunHorizonSamplesPerCell = 4.0F;
+constexpr float skyHorizonSamplesPerCell = 2.0F;
 
 float packNormalizedPair(
     float first, float firstMaximum,
@@ -4520,6 +4521,72 @@ void VulkanRenderer::draw(World& world) {
         lastSunOcclusionTicks_ = particleTicks;
         sunVisibilityCacheValid_ = true;
     }
+    const std::int32_t requestedSkyRayCount =
+        std::clamp(rayTracingSettings_.skyRays, 1, 9);
+    const bool skySolidFieldChanged =
+        cachedSkySolidRevision_ != world.solidRevision();
+    const bool skyReceiverMoved =
+        !skyVisibilityCacheValid_ ||
+        std::abs(camera.x - cachedSkyCamera_.x) >
+            static_cast<float>(World::viewWidth) * 0.25F ||
+        std::abs(camera.y - cachedSkyCamera_.y) >
+            static_cast<float>(World::viewHeight) * 0.25F;
+    const bool skyRayCountChanged =
+        cachedSkyRayCount_ != requestedSkyRayCount;
+    const bool skyCacheThrottleExpired =
+        !skyVisibilityCacheValid_ ||
+        particleTicks - lastSkyOcclusionTicks_ >= 100;
+    if (rayTracingSettings_.skyLightIntensity > 0.0001F &&
+        (!skyVisibilityCacheValid_ ||
+         skySolidFieldChanged || skyReceiverMoved ||
+         skyRayCountChanged) &&
+        skyCacheThrottleExpired) {
+        const Vec2 receiverMargin{
+            static_cast<float>(World::viewWidth) * 0.5F,
+            static_cast<float>(World::viewHeight) * 0.5F,
+        };
+        skyHorizons_.resize(
+            static_cast<std::size_t>(
+                requestedSkyRayCount));
+        constexpr float maximumSkyAngle =
+            80.0F / 360.0F * tau;
+        for (std::int32_t rayIndex = 0;
+             rayIndex < requestedSkyRayCount;
+             ++rayIndex) {
+            const float sample =
+                requestedSkyRayCount == 1
+                    ? 0.5F
+                    : static_cast<float>(rayIndex) /
+                          static_cast<float>(
+                              requestedSkyRayCount - 1);
+            const float angle =
+                -maximumSkyAngle +
+                sample * maximumSkyAngle * 2.0F;
+            DirectionalHorizon& horizon =
+                skyHorizons_[static_cast<std::size_t>(
+                    rayIndex)];
+            horizon.direction = {
+                std::sin(angle),
+                -std::cos(angle),
+            };
+            world.buildDirectionalSunHorizon(
+                horizon.direction,
+                skyHorizonSamplesPerCell,
+                horizon.depths,
+                horizon.blockers,
+                horizon.minimumPerpendicularCoordinate,
+                camera - receiverMargin,
+                camera + Vec2{
+                    static_cast<float>(World::viewWidth),
+                    static_cast<float>(World::viewHeight),
+                } + receiverMargin);
+        }
+        cachedSkyCamera_ = camera;
+        cachedSkySolidRevision_ = world.solidRevision();
+        cachedSkyRayCount_ = requestedSkyRayCount;
+        lastSkyOcclusionTicks_ = particleTicks;
+        skyVisibilityCacheValid_ = true;
+    }
     if (lastParticleTicks_ != 0) {
         particleDeltaTime_ = std::clamp(
             static_cast<float>(particleTicks - lastParticleTicks_) * 0.001F,
@@ -4629,32 +4696,91 @@ void VulkanRenderer::draw(World& world) {
             world.skyOccluderY(
                 originX + static_cast<int>(index) - 1);
     }
-    const auto sunBlockedAt =
-        [&](float sampleX, float sampleY,
+    const auto directionalBlockedAt =
+        [&](Vec2 direction,
+            const std::vector<float>& depths,
+            const std::vector<std::int32_t>& blockers,
+            float minimumPerpendicularCoordinate,
+            float samplesPerCell,
+            float sampleX, float sampleY,
             std::int32_t receiverIndex) {
             const float perpendicular =
-                -cachedSunDirection_.y * sampleX +
-                cachedSunDirection_.x * sampleY;
+                -direction.y * sampleX +
+                direction.x * sampleY;
             const int sample = static_cast<int>(std::floor(
-                (perpendicular - sunHorizonMinimum_) *
-                sunHorizonSamplesPerCell));
+                (perpendicular -
+                 minimumPerpendicularCoordinate) *
+                samplesPerCell));
             if (sample < 0 ||
                 sample >=
-                    static_cast<int>(sunHorizonBlockers_.size())) {
+                    static_cast<int>(blockers.size())) {
                 return false;
             }
             const std::size_t sampleIndex =
                 static_cast<std::size_t>(sample);
             const std::int32_t blocker =
-                sunHorizonBlockers_[sampleIndex];
+                blockers[sampleIndex];
             if (blocker < 0 || blocker == receiverIndex) {
                 return false;
             }
             const float receiverDepth =
-                cachedSunDirection_.x * sampleX +
-                cachedSunDirection_.y * sampleY;
-            return sunHorizonDepths_[sampleIndex] >
+                direction.x * sampleX +
+                direction.y * sampleY;
+            return depths[sampleIndex] >
                    receiverDepth + 0.001F;
+        };
+    const auto sunBlockedAt =
+        [&](float sampleX, float sampleY,
+            std::int32_t receiverIndex) {
+            return directionalBlockedAt(
+                cachedSunDirection_,
+                sunHorizonDepths_,
+                sunHorizonBlockers_,
+                sunHorizonMinimum_,
+                sunHorizonSamplesPerCell,
+                sampleX, sampleY, receiverIndex);
+        };
+    const auto skyVisibilityAt =
+        [&](float centerX, float centerY,
+            bool receiverIsSolid,
+            std::int32_t receiverIndex) {
+            if (!skyVisibilityCacheValid_ ||
+                skyHorizons_.empty()) {
+                return 0.0F;
+            }
+            constexpr float faceOffset =
+                0.5F +
+                0.5F / skyHorizonSamplesPerCell +
+                0.001F;
+            float visibleRays = 0.0F;
+            for (const DirectionalHorizon& horizon :
+                 skyHorizons_) {
+                const float sampleX =
+                    centerX +
+                    (receiverIsSolid
+                         ? horizon.direction.x *
+                               faceOffset
+                         : 0.0F);
+                const float sampleY =
+                    centerY +
+                    (receiverIsSolid
+                         ? horizon.direction.y *
+                               faceOffset
+                         : 0.0F);
+                if (!directionalBlockedAt(
+                        horizon.direction,
+                        horizon.depths,
+                        horizon.blockers,
+                        horizon.minimumPerpendicularCoordinate,
+                        skyHorizonSamplesPerCell,
+                        sampleX, sampleY,
+                        receiverIndex)) {
+                    visibleRays += 1.0F;
+                }
+            }
+            return visibleRays /
+                   static_cast<float>(
+                       skyHorizons_.size());
         };
 
     for (std::uint32_t textureY = 0; textureY < textureHeight; ++textureY) {
@@ -4764,13 +4890,22 @@ void VulkanRenderer::draw(World& world) {
                         static_cast<std::int32_t>(worldIndex));
                 }
             }
-            const std::uint8_t worldSun =
-                sunlit ? 255 : 0;
-            const std::uint8_t packedSun7 =
+            const float skyVisibility =
+                skyVisibilityAt(
+                    centerX, centerY,
+                    receiverIsSolid,
+                    static_cast<std::int32_t>(
+                        worldIndex));
+            const std::uint8_t packedSky7 =
                 static_cast<std::uint8_t>(
-                    (static_cast<unsigned>(worldSun) * 127U + 127U) /
-                    255U);
-            texturePixels[textureIndex + 3] = packedSun7;
+                    std::lround(
+                        std::clamp(
+                            skyVisibility, 0.0F, 1.0F) *
+                        127.0F));
+            texturePixels[textureIndex + 3] =
+                static_cast<std::uint8_t>(
+                    (packedSky7 << 1U) |
+                    (sunlit ? 1U : 0U));
 
             const std::size_t skyColumn =
                 static_cast<std::size_t>(textureX) + 1U;
@@ -4778,28 +4913,6 @@ void VulkanRenderer::draw(World& world) {
                 worldY < visibleSkyOccluders[skyColumn] ||
                 (receiverIsSolid &&
                  worldY == visibleSkyOccluders[skyColumn]);
-            const bool leftOpenToSky =
-                worldX > 0 &&
-                worldY <
-                    visibleSkyOccluders[skyColumn - 1U] &&
-                !isSunOccluder(
-                    world.materials()[worldIndex - 1U]);
-            const bool rightOpenToSky =
-                worldX + 1 < World::width &&
-                worldY <
-                    visibleSkyOccluders[skyColumn + 1U] &&
-                !isSunOccluder(
-                    world.materials()[worldIndex + 1U]);
-            const bool skyLightExposed =
-                verticallyOpenToSky ||
-                leftOpenToSky || rightOpenToSky;
-            const bool liquid =
-                material == Material::water ||
-                material == Material::oil;
-            if (skyLightExposed && !liquid) {
-                texturePixels[textureIndex + 3] |= 0x80U;
-            }
-
             if (material == Material::air) {
                 if (verticallyOpenToSky &&
                     !world.hasInteriorBackdrop(worldX, worldY)) {
@@ -4847,15 +4960,17 @@ void VulkanRenderer::draw(World& world) {
                          world.liquidFoam()[worldIndex]) +
                      18U) /
                     36U);
-            const std::uint8_t packedSun4 =
+            const std::uint8_t packedSky4 =
                 static_cast<std::uint8_t>(
-                    (static_cast<unsigned>(worldSun) + 8U) /
-                    17U);
+                    std::lround(
+                        std::clamp(
+                            skyVisibility, 0.0F, 1.0F) *
+                        15.0F));
             texturePixels[textureIndex + 3] =
                 static_cast<std::uint8_t>(
-                    (skyLightExposed ? 0x80U : 0U) |
-                    ((packedFoam & 0x07U) << 4U) |
-                    packedSun4);
+                    (packedSky4 << 4U) |
+                    ((packedFoam & 0x07U) << 1U) |
+                    (sunlit ? 1U : 0U));
         }
     }
     vkUnmapMemory(device_, frame.textureStagingMemory);

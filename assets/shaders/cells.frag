@@ -1045,7 +1045,7 @@ void main() {
 
     if (material == 4 || material == 5) {
         float fill = float(data.g) / 255.0;
-        float foam = float((data.a >> 4u) & 7u) / 7.0;
+        float foam = float((data.a >> 1u) & 7u) / 7.0;
         vec2 flow =
             metaballLiquidPixel
                 ? metaballFlow

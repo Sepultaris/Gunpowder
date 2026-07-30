@@ -62,6 +62,7 @@ struct RayTracingSettings {
     float sunShadowSoftness = 0.018F;
     float skyIntensity = 0.90F;
     float skyLightIntensity = 0.16F;
+    int skyRays = 5;
 
     float ambientIntensity = 0.002F;
     float daylightAmbientIntensity = 0.018F;
@@ -343,10 +344,16 @@ private:
     std::uint64_t lastParticleTicks_ = 0;
     std::uint64_t lastDayCycleTicks_ = 0;
     std::uint64_t lastSunOcclusionTicks_ = 0;
+    std::uint64_t lastSkyOcclusionTicks_ = 0;
     std::uint64_t lastSunTransmittanceTicks_ = 0;
     std::uint64_t cachedSunSolidRevision_ =
         std::numeric_limits<std::uint64_t>::max();
     Vec2 cachedSunCamera_{};
+    std::uint64_t cachedSkySolidRevision_ =
+        std::numeric_limits<std::uint64_t>::max();
+    Vec2 cachedSkyCamera_{};
+    std::int32_t cachedSkyRayCount_ = 0;
+    bool skyVisibilityCacheValid_ = false;
     Vec2 sunTransmittanceDirection_{};
     std::int32_t sunTransmittanceOriginX_ = 0;
     std::int32_t sunTransmittanceOriginY_ = 0;
@@ -396,6 +403,13 @@ private:
     std::vector<float> sunHorizonDepths_;
     std::vector<std::int32_t> sunHorizonBlockers_;
     float sunHorizonMinimum_ = 0.0F;
+    struct DirectionalHorizon {
+        Vec2 direction{};
+        std::vector<float> depths;
+        std::vector<std::int32_t> blockers;
+        float minimumPerpendicularCoordinate = 0.0F;
+    };
+    std::vector<DirectionalHorizon> skyHorizons_;
     Vec2 cachedSunDirection_{};
     bool sunVisibilityCacheValid_ = false;
     int playerSpriteWidth_ = 0;

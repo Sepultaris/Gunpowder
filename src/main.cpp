@@ -101,6 +101,7 @@ struct DisplaySettings {
     X(sunShadowSoftness)                                                    \
     X(skyIntensity)                                                         \
     X(skyLightIntensity)                                                    \
+    X(skyRays)                                                              \
     X(ambientIntensity)                                                     \
     X(daylightAmbientIntensity)                                             \
     X(baseHaze)                                                             \
@@ -1050,6 +1051,11 @@ bool drawDeveloperUi(bool* open,
         sliderFloatWithReset(
             "Sky light intensity", &settings.skyLightIntensity,
             0.0F, 1.0F, "%.2f", defaults.skyLightIntensity);
+        sliderIntWithReset(
+            "Sky rays", &settings.skyRays, 1, 9,
+            defaults.skyRays);
+        ImGui::TextDisabled(
+            "Sky rays sample the upper hemisphere from horizon to horizon.");
         if (settings.sunRays > 4) {
             ImGui::TextColored(
                 ImVec4(1.0F, 0.72F, 0.25F, 1.0F),

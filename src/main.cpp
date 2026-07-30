@@ -566,6 +566,12 @@ bool drawDeveloperUi(bool* open,
             materialTimings.activeLiquidChunks,
             materialTimings.activeGasChunks,
             materialTimings.activeThermalChunks);
+        ImGui::TextDisabled(
+            "Liquid prep %u cells | Edge cache %u columns | "
+            "Equalization seeds %u cells",
+            materialTimings.liquidPreparationCellVisits,
+            materialTimings.liquidHeadSummaryHits,
+            materialTimings.liquidEqualizationSeedVisits);
     } else {
         ImGui::TextDisabled("CPU material timings: collecting...");
     }

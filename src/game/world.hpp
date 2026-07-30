@@ -7,6 +7,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <random>
 #include <utility>
 #include <vector>
@@ -32,6 +33,9 @@ struct MaterialSimulationTimings {
     std::uint32_t activeLiquidChunks = 0;
     std::uint32_t activeGasChunks = 0;
     std::uint32_t activeThermalChunks = 0;
+    std::uint32_t liquidPreparationCellVisits = 0;
+    std::uint32_t liquidHeadSummaryHits = 0;
+    std::uint32_t liquidEqualizationSeedVisits = 0;
     std::uint32_t liquidCandidateVisits = 0;
     std::uint32_t equalizedComponents = 0;
     std::uint32_t equalizedCells = 0;
@@ -215,6 +219,14 @@ public:
     void clearMaterialActivityForTest();
     [[nodiscard]] std::array<bool, 4>
     materialActivityForTest(int x, int y) const;
+    [[nodiscard]] std::uint8_t
+    liquidHeadDepthForTest(int x, int y) const {
+        return x >= 0 && x < width &&
+                       y >= 0 && y < height
+                   ? liquidHeadDepth_[static_cast<std::size_t>(
+                         y * width + x)]
+                   : 0;
+    }
 #endif
 
 private:
@@ -255,6 +267,12 @@ private:
     struct MaterialChunkActivity {
         std::array<std::uint8_t,
                    materialActivitySystemCount> lifetime{};
+    };
+
+    struct LiquidChunkColumnSummary {
+        std::array<Material, chunkSize> bottomMaterial{};
+        std::array<std::uint8_t, chunkSize> bottomDepth{};
+        std::uint32_t generation = 0;
     };
 
     [[nodiscard]] bool isSolid(int x, int y) const;
@@ -356,11 +374,15 @@ private:
     float currentLiquidFrontierMs_ = 0.0F;
     float currentLiquidEqualizationMs_ = 0.0F;
     std::uint32_t currentLiquidCandidateVisits_ = 0;
+    std::uint32_t currentLiquidPreparationCellVisits_ = 0;
+    std::uint32_t currentLiquidHeadSummaryHits_ = 0;
+    std::uint32_t currentLiquidEqualizationSeedVisits_ = 0;
     std::uint32_t currentEqualizedComponents_ = 0;
     std::uint32_t currentEqualizedCells_ = 0;
-    std::vector<Material> columnHeadMaterial_;
-    std::vector<std::uint8_t> columnHeadDepth_;
     std::vector<MaterialChunkActivity> materialChunkActivity_;
+    std::vector<std::unique_ptr<LiquidChunkColumnSummary>>
+        liquidChunkColumnSummaries_;
+    std::uint32_t liquidPreparationGeneration_ = 0;
     std::vector<int> skyOccluderY_;
     std::vector<std::uint8_t> skyColumnDirty_;
     SparseGrid<std::uint8_t> interiorBackdrop_;

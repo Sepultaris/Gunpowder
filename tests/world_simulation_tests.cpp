@@ -192,6 +192,61 @@ int main() {
         return 1;
     }
 
+    gunpowder::World chunkHeadWorld;
+    constexpr int headColumnX = 100;
+    constexpr int headBottomY = 71;
+    chunkHeadWorld.setPlayerForTest(
+        {static_cast<float>(headColumnX), 48.0F});
+    for (int y = 0; y <= headBottomY; ++y) {
+        chunkHeadWorld.setCellForTest(
+            headColumnX - 1, y, gunpowder::Material::stone);
+        chunkHeadWorld.setCellForTest(
+            headColumnX + 1, y, gunpowder::Material::stone);
+    }
+    chunkHeadWorld.setCellForTest(
+        headColumnX, headBottomY, gunpowder::Material::stone);
+    for (int y = 0; y < headBottomY; ++y) {
+        chunkHeadWorld.setCellForTest(
+            headColumnX, y, gunpowder::Material::water);
+    }
+    chunkHeadWorld.setCellForTest(
+        headColumnX, 0, gunpowder::Material::air);
+    chunkHeadWorld.clearMaterialActivityForTest();
+    chunkHeadWorld.setCellForTest(
+        headColumnX, 0, gunpowder::Material::water);
+    gunpowder::InputState chunkHeadInput;
+    chunkHeadWorld.update(1.0F / 30.0F, chunkHeadInput);
+    if (chunkHeadWorld.liquidHeadDepthForTest(
+            headColumnX, 63) != 64 ||
+        chunkHeadWorld.liquidHeadDepthForTest(
+            headColumnX, 64) != 65 ||
+        chunkHeadWorld.liquidHeadDepthForTest(
+            headColumnX, 70) != 71) {
+        std::cerr << "Liquid head depth broke across a chunk boundary\n";
+        return 1;
+    }
+    const auto& chunkHeadTimings =
+        chunkHeadWorld.materialSimulationTimings();
+    const std::uint32_t visibleCellCount =
+        static_cast<std::uint32_t>(
+            gunpowder::World::viewWidth *
+            gunpowder::World::viewHeight);
+    if (chunkHeadTimings.liquidPreparationCellVisits == 0 ||
+        chunkHeadTimings.liquidPreparationCellVisits >=
+            visibleCellCount ||
+        chunkHeadTimings.liquidHeadSummaryHits == 0 ||
+        chunkHeadTimings.liquidEqualizationSeedVisits == 0 ||
+        chunkHeadTimings.liquidEqualizationSeedVisits >=
+            visibleCellCount) {
+        std::cerr
+            << "Liquid preparation fell back to a camera-wide scan: prep "
+            << chunkHeadTimings.liquidPreparationCellVisits
+            << ", seeds "
+            << chunkHeadTimings.liquidEqualizationSeedVisits
+            << ", visible " << visibleCellCount << '\n';
+        return 1;
+    }
+
     gunpowder::SparseGrid<std::uint8_t> streamedState(
         4096, 2048, 0);
     const std::size_t distantState =

@@ -76,10 +76,11 @@ World::World()
       moved_(width, height, 0),
       liquidFrontierStamp_(width, height, 0),
       liquidComponentStamp_(width, height, 0),
-      columnHeadMaterial_(static_cast<std::size_t>(width),
-                          Material::air),
-      columnHeadDepth_(static_cast<std::size_t>(width), 0),
       materialChunkActivity_(
+          static_cast<std::size_t>(
+              ((width + chunkSize - 1) / chunkSize) *
+              ((height + chunkSize - 1) / chunkSize))),
+      liquidChunkColumnSummaries_(
           static_cast<std::size_t>(
               ((width + chunkSize - 1) / chunkSize) *
               ((height + chunkSize - 1) / chunkSize))),
@@ -117,6 +118,10 @@ void World::regenerate() {
     liquidWorklist_.clear();
     liquidNextWorklist_.clear();
     liquidReservedCells_.clear();
+    for (auto& summary : liquidChunkColumnSummaries_) {
+        summary.reset();
+    }
+    liquidPreparationGeneration_ = 0;
     std::fill(materialChunkActivity_.begin(),
               materialChunkActivity_.end(),
               MaterialChunkActivity{});
@@ -2579,6 +2584,9 @@ void World::updateMaterials() {
     currentLiquidFrontierMs_ = 0.0F;
     currentLiquidEqualizationMs_ = 0.0F;
     currentLiquidCandidateVisits_ = 0;
+    currentLiquidPreparationCellVisits_ = 0;
+    currentLiquidHeadSummaryHits_ = 0;
+    currentLiquidEqualizationSeedVisits_ = 0;
     currentEqualizedComponents_ = 0;
     currentEqualizedCells_ = 0;
     rebuildLiquidWorklist_ = true;
@@ -2965,6 +2973,12 @@ void World::updateMaterials() {
             liquidTransportEnd, gasAndReactionEnd));
     materialSimulationTimings_.liquidCandidateVisits =
         currentLiquidCandidateVisits_;
+    materialSimulationTimings_.liquidPreparationCellVisits =
+        currentLiquidPreparationCellVisits_;
+    materialSimulationTimings_.liquidHeadSummaryHits =
+        currentLiquidHeadSummaryHits_;
+    materialSimulationTimings_.liquidEqualizationSeedVisits =
+        currentLiquidEqualizationSeedVisits_;
     materialSimulationTimings_.equalizedComponents =
         currentEqualizedComponents_;
     materialSimulationTimings_.equalizedCells =
@@ -2972,50 +2986,163 @@ void World::updateMaterials() {
 }
 
 void World::cacheLiquidColumnHeads(const ActiveBounds& bounds) {
-    std::fill(columnHeadMaterial_.begin() + bounds.minX,
-              columnHeadMaterial_.begin() + bounds.maxX,
-              Material::air);
-    std::fill(columnHeadDepth_.begin() + bounds.minX,
-              columnHeadDepth_.begin() + bounds.maxX, 0);
+    ++liquidPreparationGeneration_;
+    if (liquidPreparationGeneration_ == 0) {
+        for (auto& summary : liquidChunkColumnSummaries_) {
+            if (summary) {
+                summary->generation = 0;
+            }
+        }
+        ++liquidPreparationGeneration_;
+    }
 
-    // Row-major traversal keeps the large world arrays cache-friendly while
-    // the narrow per-column state tracks the local hydrostatic head. Separate
-    // liquid runs in the same column naturally restart at depth one.
+    constexpr int chunkColumns =
+        (width + chunkSize - 1) / chunkSize;
+    const int firstChunkX = bounds.minX / chunkSize;
+    const int finalChunkX =
+        (bounds.maxX + chunkSize - 1) / chunkSize;
+    const int firstChunkY = bounds.minY / chunkSize;
+    const int finalChunkY =
+        (bounds.maxY + chunkSize - 1) / chunkSize;
     constexpr std::uint8_t maximumCachedHead = 255;
     constexpr std::uint8_t foamDecayPerTick = 9;
-    for (int y = bounds.minY; y < bounds.maxY; ++y) {
-        for (int x = bounds.minX; x < bounds.maxX; ++x) {
-            const std::size_t index = indexOf(x, y);
-            const Material material = cells_[index];
-            if (isLiquid(material)) {
-                std::uint8_t& cachedDepth =
-                    columnHeadDepth_[static_cast<std::size_t>(x)];
-                Material& cachedMaterial =
-                    columnHeadMaterial_[static_cast<std::size_t>(x)];
-                if (cachedMaterial == material) {
-                    cachedDepth = static_cast<std::uint8_t>(
-                        std::min<int>(maximumCachedHead,
-                                      static_cast<int>(cachedDepth) + 1));
-                } else {
-                    cachedMaterial = material;
-                    cachedDepth = 1;
-                }
-                liquidHeadDepth_[index] = cachedDepth;
-            } else {
-                columnHeadMaterial_[static_cast<std::size_t>(x)] =
-                    Material::air;
-                columnHeadDepth_[static_cast<std::size_t>(x)] = 0;
-                liquidHeadDepth_[index] = 0;
+    const auto incrementVisitCount = [&] {
+        if (currentLiquidPreparationCellVisits_ <
+            std::numeric_limits<std::uint32_t>::max()) {
+            ++currentLiquidPreparationCellVisits_;
+        }
+    };
+
+    // Process only awake liquid chunks. A chunk consumes the bottom-column
+    // summary produced by its awake neighbor above. When that neighbor is
+    // sleeping, a bounded upward walk reconstructs the exact incoming head
+    // without scanning the rest of the camera region.
+    for (int chunkY = firstChunkY;
+         chunkY < finalChunkY; ++chunkY) {
+        for (int chunkX = firstChunkX;
+             chunkX < finalChunkX; ++chunkX) {
+            const int chunkOriginX = chunkX * chunkSize;
+            const int chunkOriginY = chunkY * chunkSize;
+            if (!materialChunkActive(
+                    chunkOriginX, chunkOriginY,
+                    liquidActivity)) {
+                continue;
             }
 
-            if (material != Material::water) {
-                liquidFoam_[index] = 0;
-            } else if (liquidFoam_[index] > foamDecayPerTick) {
-                liquidFoam_[index] = static_cast<std::uint8_t>(
-                    liquidFoam_[index] - foamDecayPerTick);
-            } else {
-                liquidFoam_[index] = 0;
+            const std::size_t chunkIndex =
+                static_cast<std::size_t>(
+                    chunkY * chunkColumns + chunkX);
+            auto& summary =
+                liquidChunkColumnSummaries_[chunkIndex];
+            if (!summary) {
+                summary =
+                    std::make_unique<LiquidChunkColumnSummary>();
             }
+
+            const int beginX =
+                std::max(bounds.minX, chunkOriginX);
+            const int endX = std::min(
+                bounds.maxX, chunkOriginX + chunkSize);
+            const int beginY =
+                std::max(bounds.minY, chunkOriginY);
+            const int endY = std::min(
+                bounds.maxY, chunkOriginY + chunkSize);
+
+            const LiquidChunkColumnSummary* aboveSummary = nullptr;
+            if (chunkY > firstChunkY &&
+                beginY == chunkOriginY) {
+                const std::size_t aboveIndex =
+                    static_cast<std::size_t>(
+                        (chunkY - 1) * chunkColumns + chunkX);
+                const auto& above =
+                    liquidChunkColumnSummaries_[aboveIndex];
+                if (above &&
+                    above->generation ==
+                        liquidPreparationGeneration_) {
+                    aboveSummary = above.get();
+                }
+            }
+
+            for (int x = beginX; x < endX; ++x) {
+                const std::size_t localX =
+                    static_cast<std::size_t>(
+                        x - chunkOriginX);
+                Material cachedMaterial = Material::air;
+                std::uint8_t cachedDepth = 0;
+                if (aboveSummary) {
+                    cachedMaterial =
+                        aboveSummary->bottomMaterial[localX];
+                    cachedDepth =
+                        aboveSummary->bottomDepth[localX];
+                    if (currentLiquidHeadSummaryHits_ <
+                        std::numeric_limits<std::uint32_t>::max()) {
+                        ++currentLiquidHeadSummaryHits_;
+                    }
+                } else if (beginY > bounds.minY) {
+                    int scanY = beginY - 1;
+                    cachedMaterial =
+                        cells_[indexOf(x, scanY)];
+                    incrementVisitCount();
+                    if (isLiquid(cachedMaterial)) {
+                        cachedDepth = 1;
+                        while (cachedDepth <
+                                   maximumCachedHead &&
+                               scanY > bounds.minY &&
+                               cells_[indexOf(x, scanY - 1)] ==
+                                   cachedMaterial) {
+                            --scanY;
+                            ++cachedDepth;
+                            incrementVisitCount();
+                        }
+                    } else {
+                        cachedMaterial = Material::air;
+                    }
+                }
+
+                for (int y = beginY; y < endY; ++y) {
+                    const std::size_t index = indexOf(x, y);
+                    const Material material = cells_[index];
+                    incrementVisitCount();
+                    if (isLiquid(material)) {
+                        if (cachedMaterial == material) {
+                            cachedDepth =
+                                static_cast<std::uint8_t>(
+                                    std::min<int>(
+                                        maximumCachedHead,
+                                        static_cast<int>(
+                                            cachedDepth) +
+                                            1));
+                        } else {
+                            cachedMaterial = material;
+                            cachedDepth = 1;
+                        }
+                        liquidHeadDepth_[index] = cachedDepth;
+                    } else {
+                        cachedMaterial = Material::air;
+                        cachedDepth = 0;
+                        liquidHeadDepth_[index] = 0;
+                    }
+
+                    if (material != Material::water) {
+                        liquidFoam_[index] = 0;
+                    } else if (liquidFoam_[index] >
+                               foamDecayPerTick) {
+                        liquidFoam_[index] =
+                            static_cast<std::uint8_t>(
+                                liquidFoam_[index] -
+                                foamDecayPerTick);
+                    } else {
+                        liquidFoam_[index] = 0;
+                    }
+                }
+
+                summary->bottomMaterial[localX] =
+                    cachedMaterial;
+                summary->bottomDepth[localX] =
+                    cachedDepth;
+            }
+            summary->generation =
+                liquidPreparationGeneration_;
         }
     }
 }
@@ -3494,8 +3621,8 @@ void World::prepareLiquidEqualization(const ActiveBounds& bounds) {
                material == Material::smoke || material == Material::steam;
     };
     const auto insideBounds = [&](int x, int y) {
-        return x >= bounds.minX && x < bounds.maxX &&
-               y >= bounds.minY && y < bounds.maxY;
+        return x >= bounds.minX && x < bounds.maxX && y >= bounds.minY &&
+               y < bounds.maxY;
     };
 
     liquidEqualizationMoves_.clear();
@@ -3508,212 +3635,205 @@ void World::prepareLiquidEqualization(const ActiveBounds& bounds) {
         liquidComponentStamp_.reset(0);
         ++liquidComponentGeneration_;
     }
-    const auto reserveCell =
-        [&](std::size_t index, std::uint8_t reservation) {
-            if (liquidEqualizationReservation_[index] == 0) {
-                liquidReservedCells_.push_back(index);
-            }
-            liquidEqualizationReservation_[index] = reservation;
-        };
+    const auto reserveCell = [&](std::size_t index, std::uint8_t reservation) {
+        if (liquidEqualizationReservation_[index] == 0) {
+            liquidReservedCells_.push_back(index);
+        }
+        liquidEqualizationReservation_[index] = reservation;
+    };
 
     constexpr std::array<std::array<int, 2>, 8> neighbors{{
-        {{-1, 0}}, {{1, 0}}, {{0, -1}}, {{0, 1}},
-        {{-1, -1}}, {{1, -1}}, {{-1, 1}}, {{1, 1}},
+        {{-1, 0}},
+        {{1, 0}},
+        {{0, -1}},
+        {{0, 1}},
+        {{-1, -1}},
+        {{1, -1}},
+        {{-1, 1}},
+        {{1, 1}},
     }};
+    const int firstChunkX = bounds.minX / chunkSize;
+    const int finalChunkX = (bounds.maxX + chunkSize - 1) / chunkSize;
     for (int seedY = bounds.minY; seedY < bounds.maxY; ++seedY) {
-        for (int seedX = bounds.minX; seedX < bounds.maxX; ++seedX) {
+        const int chunkY = seedY / chunkSize;
+        for (int chunkX = firstChunkX; chunkX < finalChunkX; ++chunkX) {
             // A moving region wakes its own and neighboring chunks. Starting
             // discovery only there avoids rebuilding every settled lake each
             // tick. Once seeded, traversal still follows the complete
             // connected liquid component through sleeping chunks.
-            if (!materialChunkActive(
-                    seedX, seedY, liquidActivity)) {
+            if (!materialChunkActive(chunkX * chunkSize, chunkY * chunkSize,
+                                     liquidActivity)) {
                 continue;
             }
-            const std::size_t seed = indexOf(seedX, seedY);
-            const Material material = cells_[seed];
-            if (!isLiquid(material) ||
-                liquidComponentStamp_[seed] ==
-                    liquidComponentGeneration_) {
-                continue;
-            }
-
-            liquidComponentQueue_.clear();
-            liquidHighSurfaces_.clear();
-            liquidLowSurfaces_.clear();
-            liquidComponentQueue_.push_back(seed);
-            liquidComponentStamp_[seed] =
-                liquidComponentGeneration_;
-            int highestSurfaceY = bounds.maxY;
-            int lowestSurfaceY = bounds.minY - 1;
-            bool hasDownwardPath = false;
-            bool hasActiveFoam = false;
-            bool hasDensityInstability = false;
-
-            for (std::size_t cursor = 0;
-                 cursor < liquidComponentQueue_.size(); ++cursor) {
-                const std::size_t current =
-                    liquidComponentQueue_[cursor];
-                const int x = static_cast<int>(
-                    current % static_cast<std::size_t>(width));
-                const int y = static_cast<int>(
-                    current / static_cast<std::size_t>(width));
-
-                const bool exposedAbove =
-                    isOpen(cell(x, y - 1));
-                const Material below = cell(x, y + 1);
-                hasDownwardPath =
-                    hasDownwardPath ||
-                    isOpen(below) ||
-                    isOpen(cell(x - 1, y + 1)) ||
-                    isOpen(cell(x + 1, y + 1));
-                hasActiveFoam =
-                    hasActiveFoam ||
-                    liquidFoam_[current] > 18;
-                hasDensityInstability =
-                    hasDensityInstability ||
-                    (material == Material::water &&
-                     below == Material::oil) ||
-                    (material == Material::oil &&
-                     cell(x, y - 1) == Material::water);
-                const bool supportedSurface =
-                    exposedAbove && !isOpen(below);
-                if (supportedSurface) {
-                    highestSurfaceY = std::min(highestSurfaceY, y);
-                    lowestSurfaceY = std::max(lowestSurfaceY, y);
+            const int beginX = std::max(bounds.minX, chunkX * chunkSize);
+            const int endX = std::min(bounds.maxX, (chunkX + 1) * chunkSize);
+            for (int seedX = beginX; seedX < endX; ++seedX) {
+                if (currentLiquidEqualizationSeedVisits_ <
+                    std::numeric_limits<std::uint32_t>::max()) {
+                    ++currentLiquidEqualizationSeedVisits_;
+                }
+                const std::size_t seed = indexOf(seedX, seedY);
+                const Material material = cells_[seed];
+                if (!isLiquid(material) ||
+                    liquidComponentStamp_[seed] == liquidComponentGeneration_) {
+                    continue;
                 }
 
-                for (const auto& offset : neighbors) {
-                    const int neighborX = x + offset[0];
-                    const int neighborY = y + offset[1];
-                    if (!insideBounds(neighborX, neighborY)) {
+                liquidComponentQueue_.clear();
+                liquidHighSurfaces_.clear();
+                liquidLowSurfaces_.clear();
+                liquidComponentQueue_.push_back(seed);
+                liquidComponentStamp_[seed] = liquidComponentGeneration_;
+                int highestSurfaceY = bounds.maxY;
+                int lowestSurfaceY = bounds.minY - 1;
+                bool hasDownwardPath = false;
+                bool hasActiveFoam = false;
+                bool hasDensityInstability = false;
+
+                for (std::size_t cursor = 0;
+                     cursor < liquidComponentQueue_.size(); ++cursor) {
+                    const std::size_t current = liquidComponentQueue_[cursor];
+                    const int x = static_cast<int>(
+                        current % static_cast<std::size_t>(width));
+                    const int y = static_cast<int>(
+                        current / static_cast<std::size_t>(width));
+
+                    const bool exposedAbove = isOpen(cell(x, y - 1));
+                    const Material below = cell(x, y + 1);
+                    hasDownwardPath = hasDownwardPath || isOpen(below) ||
+                                      isOpen(cell(x - 1, y + 1)) ||
+                                      isOpen(cell(x + 1, y + 1));
+                    hasActiveFoam = hasActiveFoam || liquidFoam_[current] > 18;
+                    hasDensityInstability = hasDensityInstability ||
+                                            (material == Material::water &&
+                                             below == Material::oil) ||
+                                            (material == Material::oil &&
+                                             cell(x, y - 1) == Material::water);
+                    const bool supportedSurface =
+                        exposedAbove && !isOpen(below);
+                    if (supportedSurface) {
+                        highestSurfaceY = std::min(highestSurfaceY, y);
+                        lowestSurfaceY = std::max(lowestSurfaceY, y);
+                    }
+
+                    for (const auto& offset : neighbors) {
+                        const int neighborX = x + offset[0];
+                        const int neighborY = y + offset[1];
+                        if (!insideBounds(neighborX, neighborY)) {
+                            continue;
+                        }
+                        const std::size_t neighbor =
+                            indexOf(neighborX, neighborY);
+                        if (liquidComponentStamp_[neighbor] !=
+                                liquidComponentGeneration_ &&
+                            cells_[neighbor] == material) {
+                            liquidComponentStamp_[neighbor] =
+                                liquidComponentGeneration_;
+                            liquidComponentQueue_.push_back(neighbor);
+                        }
+                    }
+                }
+                ++currentEqualizedComponents_;
+                currentEqualizedCells_ +=
+                    static_cast<std::uint32_t>(std::min<std::size_t>(
+                        liquidComponentQueue_.size(),
+                        std::numeric_limits<std::uint32_t>::max() -
+                            currentEqualizedCells_));
+
+                const bool hasSupportedSurface =
+                    highestSurfaceY <= lowestSurfaceY;
+                const int levelDifference =
+                    hasSupportedSurface ? lowestSurfaceY - highestSurfaceY : 0;
+                const bool settled = levelDifference <= 1 && !hasDownwardPath &&
+                                     !hasActiveFoam && !hasDensityInstability;
+                if (settled) {
+                    // A discrete liquid may retain a partially occupied top
+                    // row, but once its connected surfaces agree and nothing
+                    // can fall, residual direction hints must not keep that row
+                    // shuffling.
+                    for (const std::size_t cellIndex : liquidComponentQueue_) {
+                        liquidFlowX_[cellIndex] = 0;
+                        liquidFlowY_[cellIndex] = 0;
+                        reserveCell(cellIndex, 255);
+                    }
+                    continue;
+                }
+                if (levelDifference <= 1) {
+                    continue;
+                }
+
+                for (const std::size_t surface : liquidComponentQueue_) {
+                    const int x = static_cast<int>(
+                        surface % static_cast<std::size_t>(width));
+                    const int y = static_cast<int>(
+                        surface / static_cast<std::size_t>(width));
+                    if (!isOpen(cell(x, y - 1)) || isOpen(cell(x, y + 1))) {
                         continue;
                     }
-                    const std::size_t neighbor =
-                        indexOf(neighborX, neighborY);
-                    if (liquidComponentStamp_[neighbor] !=
-                            liquidComponentGeneration_ &&
-                        cells_[neighbor] == material) {
-                        liquidComponentStamp_[neighbor] =
-                            liquidComponentGeneration_;
-                        liquidComponentQueue_.push_back(neighbor);
+                    if (y == highestSurfaceY) {
+                        liquidHighSurfaces_.push_back(surface);
+                    } else if (y == lowestSurfaceY) {
+                        liquidLowSurfaces_.push_back(surface);
                     }
                 }
-            }
-            ++currentEqualizedComponents_;
-            currentEqualizedCells_ +=
-                static_cast<std::uint32_t>(std::min<std::size_t>(
-                    liquidComponentQueue_.size(),
-                    std::numeric_limits<std::uint32_t>::max() -
-                        currentEqualizedCells_));
-
-            const bool hasSupportedSurface =
-                highestSurfaceY <= lowestSurfaceY;
-            const int levelDifference =
-                hasSupportedSurface
-                    ? lowestSurfaceY - highestSurfaceY
-                    : 0;
-            const bool settled =
-                levelDifference <= 1 &&
-                !hasDownwardPath &&
-                !hasActiveFoam &&
-                !hasDensityInstability;
-            if (settled) {
-                // A discrete liquid may retain a partially occupied top row,
-                // but once its connected surfaces agree and nothing can fall,
-                // residual direction hints must not keep that row shuffling.
-                for (const std::size_t cellIndex :
-                     liquidComponentQueue_) {
-                    liquidFlowX_[cellIndex] = 0;
-                    liquidFlowY_[cellIndex] = 0;
-                    reserveCell(cellIndex, 255);
-                }
-                continue;
-            }
-            if (levelDifference <= 1) {
-                continue;
-            }
-
-            for (const std::size_t surface :
-                 liquidComponentQueue_) {
-                const int x = static_cast<int>(
-                    surface % static_cast<std::size_t>(width));
-                const int y = static_cast<int>(
-                    surface / static_cast<std::size_t>(width));
-                if (!isOpen(cell(x, y - 1)) ||
-                    isOpen(cell(x, y + 1))) {
+                if (liquidHighSurfaces_.empty() || liquidLowSurfaces_.empty()) {
                     continue;
                 }
-                if (y == highestSurfaceY) {
-                    liquidHighSurfaces_.push_back(surface);
-                } else if (y == lowestSurfaceY) {
-                    liquidLowSurfaces_.push_back(surface);
-                }
-            }
-            if (liquidHighSurfaces_.empty() ||
-                liquidLowSurfaces_.empty()) {
-                continue;
-            }
 
-            std::shuffle(liquidHighSurfaces_.begin(),
-                         liquidHighSurfaces_.end(), random_);
-            std::shuffle(liquidLowSurfaces_.begin(),
-                         liquidLowSurfaces_.end(), random_);
-            const std::size_t mobilityLimit =
-                static_cast<std::size_t>(
-                    material == Material::water
-                        ? scaledCell(16)
-                        : scaledCell(3));
-            const std::size_t transferLimit = std::min({
-                mobilityLimit,
-                liquidHighSurfaces_.size(),
-                liquidLowSurfaces_.size(),
-                static_cast<std::size_t>(
-                    std::max(1, levelDifference *
-                                    (material == Material::water ? 2 : 1))),
-            });
-
-            std::size_t sourceCursor = 0;
-            std::size_t destinationCursor = 0;
-            std::size_t transfers = 0;
-            while (transfers < transferLimit &&
-                   sourceCursor < liquidHighSurfaces_.size() &&
-                   destinationCursor < liquidLowSurfaces_.size()) {
-                const std::size_t source =
-                    liquidHighSurfaces_[sourceCursor++];
-                const std::size_t lowerSurface =
-                    liquidLowSurfaces_[destinationCursor++];
-                const int destinationX = static_cast<int>(
-                    lowerSurface % static_cast<std::size_t>(width));
-                const int destinationY =
-                    static_cast<int>(
-                        lowerSurface /
-                        static_cast<std::size_t>(width)) -
-                    1;
-                if (!insideBounds(destinationX, destinationY)) {
-                    continue;
-                }
-                const std::size_t destination =
-                    indexOf(destinationX, destinationY);
-                const int phaseCount =
-                    material == Material::water ? 6 : 4;
-                const std::uint8_t phase =
-                    static_cast<std::uint8_t>(
-                        transfers %
-                        static_cast<std::size_t>(phaseCount));
-                liquidEqualizationMoves_.push_back({
-                    .source = source,
-                    .destination = destination,
-                    .support = lowerSurface,
-                    .material = material,
-                    .phase = phase,
+                std::shuffle(liquidHighSurfaces_.begin(),
+                             liquidHighSurfaces_.end(), random_);
+                std::shuffle(liquidLowSurfaces_.begin(),
+                             liquidLowSurfaces_.end(), random_);
+                const std::size_t mobilityLimit = static_cast<std::size_t>(
+                    material == Material::water ? scaledCell(16)
+                                                : scaledCell(3));
+                const std::size_t transferLimit = std::min({
+                    mobilityLimit,
+                    liquidHighSurfaces_.size(),
+                    liquidLowSurfaces_.size(),
+                    static_cast<std::size_t>(
+                        std::max(1, levelDifference *
+                                        (material == Material::water ? 2 : 1))),
                 });
-                const std::uint8_t reservation =
-                    static_cast<std::uint8_t>(phase + 1);
-                reserveCell(source, reservation);
-                reserveCell(destination, reservation);
-                reserveCell(lowerSurface, reservation);
-                ++transfers;
+
+                std::size_t sourceCursor = 0;
+                std::size_t destinationCursor = 0;
+                std::size_t transfers = 0;
+                while (transfers < transferLimit &&
+                       sourceCursor < liquidHighSurfaces_.size() &&
+                       destinationCursor < liquidLowSurfaces_.size()) {
+                    const std::size_t source =
+                        liquidHighSurfaces_[sourceCursor++];
+                    const std::size_t lowerSurface =
+                        liquidLowSurfaces_[destinationCursor++];
+                    const int destinationX = static_cast<int>(
+                        lowerSurface % static_cast<std::size_t>(width));
+                    const int destinationY =
+                        static_cast<int>(lowerSurface /
+                                         static_cast<std::size_t>(width)) -
+                        1;
+                    if (!insideBounds(destinationX, destinationY)) {
+                        continue;
+                    }
+                    const std::size_t destination =
+                        indexOf(destinationX, destinationY);
+                    const int phaseCount = material == Material::water ? 6 : 4;
+                    const std::uint8_t phase = static_cast<std::uint8_t>(
+                        transfers % static_cast<std::size_t>(phaseCount));
+                    liquidEqualizationMoves_.push_back({
+                        .source = source,
+                        .destination = destination,
+                        .support = lowerSurface,
+                        .material = material,
+                        .phase = phase,
+                    });
+                    const std::uint8_t reservation =
+                        static_cast<std::uint8_t>(phase + 1);
+                    reserveCell(source, reservation);
+                    reserveCell(destination, reservation);
+                    reserveCell(lowerSurface, reservation);
+                    ++transfers;
+                }
             }
         }
     }

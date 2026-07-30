@@ -933,6 +933,81 @@ int main() {
         return 1;
     }
 
+    gunpowder::World firstParallelGasWorld;
+    gunpowder::World secondParallelGasWorld;
+    for (int y = 30; y <= 100; ++y) {
+        for (int x = 44; x <= 84; ++x) {
+            firstParallelGasWorld.setCellForTest(
+                x, y, gunpowder::Material::air);
+            secondParallelGasWorld.setCellForTest(
+                x, y, gunpowder::Material::air);
+        }
+    }
+    for (int y = 66; y <= 73; ++y) {
+        for (int x = 60; x <= 67; ++x) {
+            firstParallelGasWorld.setCellForTest(
+                x, y, gunpowder::Material::smoke);
+            secondParallelGasWorld.setCellForTest(
+                x, y, gunpowder::Material::smoke);
+        }
+    }
+    const std::size_t initialParallelSmoke =
+        countOf(firstParallelGasWorld,
+                gunpowder::Material::smoke);
+    bool usedParallelGasScheduler = false;
+    bool acceptedGasTransfer = false;
+    for (int tick = 0; tick < 30; ++tick) {
+        firstParallelGasWorld.update(
+            1.0F / 30.0F, smokeInput);
+        secondParallelGasWorld.update(
+            1.0F / 30.0F, smokeInput);
+        const auto& timings =
+            firstParallelGasWorld
+                .materialSimulationTimings();
+        usedParallelGasScheduler =
+            usedParallelGasScheduler ||
+            timings.parallelGasChunks >= 2;
+        acceptedGasTransfer =
+            acceptedGasTransfer ||
+            timings.gasMovesAccepted > 0;
+    }
+    if (countOf(firstParallelGasWorld,
+                gunpowder::Material::smoke) !=
+        initialParallelSmoke) {
+        std::cerr
+            << "Parallel gas transfers changed smoke mass "
+               "before its lifetime expired\n";
+        return 1;
+    }
+    bool crossedGasChunkBoundary = false;
+    for (int y = 30; y < 64; ++y) {
+        for (int x = 44; x <= 84; ++x) {
+            crossedGasChunkBoundary =
+                crossedGasChunkBoundary ||
+                firstParallelGasWorld.cell(x, y) ==
+                    gunpowder::Material::smoke;
+        }
+    }
+    if (!crossedGasChunkBoundary ||
+        !usedParallelGasScheduler ||
+        !acceptedGasTransfer) {
+        std::cerr
+            << "Smoke did not use parallel cross-chunk transfers\n";
+        return 1;
+    }
+    if (!std::equal(
+            firstParallelGasWorld.materials().begin(),
+            firstParallelGasWorld.materials().end(),
+            secondParallelGasWorld.materials().begin()) ||
+        !std::equal(
+            firstParallelGasWorld.heat().begin(),
+            firstParallelGasWorld.heat().end(),
+            secondParallelGasWorld.heat().begin())) {
+        std::cerr
+            << "Parallel gas transfers are not deterministic\n";
+        return 1;
+    }
+
     gunpowder::World grappleWorld;
     gunpowder::InputState grappleInput;
     grappleInput.grappleToggle = true;

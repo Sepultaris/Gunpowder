@@ -573,15 +573,22 @@ bool drawDeveloperUi(bool* open,
             materialTimings.activeGasMicrotiles,
             materialTimings.activeThermalMicrotiles);
         ImGui::TextDisabled(
-            "Parallel scheduler: %u threads | granular %u | thermal %u chunks",
+            "Parallel scheduler: %u threads | granular %u | gas %u | "
+            "thermal %u chunks",
             materialTimings.materialWorkerThreads,
             materialTimings.parallelGranularChunks,
+            materialTimings.parallelGasChunks,
             materialTimings.parallelThermalChunks);
         ImGui::TextDisabled(
             "Sand transfers: %u proposed | %u accepted | %u conflicts",
             materialTimings.granularMoveProposals,
             materialTimings.granularMovesAccepted,
             materialTimings.granularMoveConflicts);
+        ImGui::TextDisabled(
+            "Gas transfers: %u proposed | %u accepted | %u conflicts",
+            materialTimings.gasMoveProposals,
+            materialTimings.gasMovesAccepted,
+            materialTimings.gasMoveConflicts);
         ImGui::TextDisabled(
             "Liquid prep %u cells | Edge cache %u columns | "
             "Equalization seeds %u cells",

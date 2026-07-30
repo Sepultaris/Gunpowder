@@ -39,10 +39,14 @@ struct MaterialSimulationTimings {
     std::uint32_t activeThermalMicrotiles = 0;
     std::uint32_t materialWorkerThreads = 1;
     std::uint32_t parallelGranularChunks = 0;
+    std::uint32_t parallelGasChunks = 0;
     std::uint32_t parallelThermalChunks = 0;
     std::uint32_t granularMoveProposals = 0;
     std::uint32_t granularMovesAccepted = 0;
     std::uint32_t granularMoveConflicts = 0;
+    std::uint32_t gasMoveProposals = 0;
+    std::uint32_t gasMovesAccepted = 0;
+    std::uint32_t gasMoveConflicts = 0;
     std::uint32_t liquidPreparationCellVisits = 0;
     std::uint32_t liquidHeadSummaryHits = 0;
     std::uint32_t liquidEqualizationSeedVisits = 0;

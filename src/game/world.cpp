@@ -2795,16 +2795,7 @@ void World::updateMaterials() {
     }
     materialScanRight_ = !materialScanRight_;
     ++materialStep_;
-    std::uniform_int_distribution<int> coin(0, 1);
     std::uniform_int_distribution<int> percent(0, 99);
-
-    const auto moveCell = [&](int fromX, int fromY, int toX, int toY) {
-        const std::size_t from = indexOf(fromX, fromY);
-        const std::size_t to = indexOf(toX, toY);
-        swapCells(fromX, fromY, toX, toY);
-        moved_[from] = 1;
-        moved_[to] = 1;
-    };
 
     struct GranularTransfer {
         std::size_t source = 0;
@@ -3218,178 +3209,581 @@ void World::updateMaterials() {
     const auto liquidTransportEnd =
         std::chrono::steady_clock::now();
 
-    // Hot gases rise after liquids settle, and oil touching fire becomes fuel.
-    const int gasChunkCount = finalChunkX - firstChunkX;
-    for (int y = std::max(bounds.minY, 1); y < bounds.maxY; ++y) {
-      const int chunkY = y / chunkSize;
-      const int rowChunkOffset = gasChunkCount > 1
-                                     ? std::uniform_int_distribution<int>(
-                                           0, gasChunkCount - 1)(random_)
-                                     : 0;
-      for (int chunkStep = 0; chunkStep < gasChunkCount; ++chunkStep) {
-        const int chunkX =
-            firstChunkX + (chunkStep + rowChunkOffset) % gasChunkCount;
-        if (!materialChunkActive(chunkX * chunkSize, chunkY * chunkSize,
-                                 gasActivity)) {
-          continue;
+    // Chemistry and lifetime changes are resolved serially before movement.
+    // This keeps ignition, condensation, and dissipation deterministic while
+    // the read-only movement search can run safely on worker threads.
+    std::vector<std::size_t> gasReactionCells;
+    gasReactionCells.reserve(
+        static_cast<std::size_t>(
+            activeGasMicrotileCount) *
+        static_cast<std::size_t>(
+            materialMicrotileSize *
+            materialMicrotileSize));
+    for (int y = std::max(bounds.minY, 1);
+         y < bounds.maxY; ++y) {
+        const int chunkY = y / chunkSize;
+        for (int chunkX = firstChunkX;
+             chunkX < finalChunkX; ++chunkX) {
+            if (!materialChunkActive(
+                    chunkX * chunkSize,
+                    chunkY * chunkSize,
+                    gasActivity)) {
+                continue;
+            }
+            const int chunkOriginX =
+                chunkX * chunkSize;
+            for (int microtileX = 0;
+                 microtileX <
+                     materialMicrotilesPerAxis;
+                 ++microtileX) {
+                const int tileOriginX =
+                    chunkOriginX +
+                    microtileX *
+                        materialMicrotileSize;
+                const int beginX = std::max(
+                    bounds.minX, tileOriginX);
+                const int endX = std::min(
+                    bounds.maxX,
+                    tileOriginX +
+                        materialMicrotileSize);
+                if (beginX >= endX ||
+                    !materialMicrotileActive(
+                        beginX, y, gasActivity)) {
+                    continue;
+                }
+                for (int x = beginX;
+                     x < endX; ++x) {
+                    const std::size_t index =
+                        indexOf(x, y);
+                    if (moved_[index] == 0 &&
+                        (cells_[index] ==
+                             Material::fire ||
+                         cells_[index] ==
+                             Material::smoke ||
+                         cells_[index] ==
+                             Material::steam)) {
+                        gasReactionCells.push_back(
+                            index);
+                    }
+                }
+            }
         }
-        const int chunkOriginX = chunkX * chunkSize;
-        const int microtileOffset =
-            std::uniform_int_distribution<int>(
-                0, materialMicrotilesPerAxis - 1)(random_);
-        for (int tileStep = 0;
-             tileStep < materialMicrotilesPerAxis; ++tileStep) {
-          const int microtileX =
-              (tileStep + microtileOffset) %
-              materialMicrotilesPerAxis;
-          const int tileOriginX =
-              chunkOriginX +
-              microtileX * materialMicrotileSize;
-          const int beginX =
-              std::max(bounds.minX, tileOriginX);
-          const int endX = std::min(
-              bounds.maxX,
-              tileOriginX + materialMicrotileSize);
-          if (beginX >= endX ||
-              !materialMicrotileActive(
-                  beginX, y, gasActivity)) {
+    }
+
+    constexpr std::array<Vec2, 4> gasNeighbors{{
+        {-1.0F, 0.0F},
+        {1.0F, 0.0F},
+        {0.0F, -1.0F},
+        {0.0F, 1.0F},
+    }};
+    for (std::size_t index : gasReactionCells) {
+        if (moved_[index] != 0) {
             continue;
-          }
-          const int rowWidth = endX - beginX;
-          const int rowOffset =
-              rowWidth > 1
-                  ? std::uniform_int_distribution<int>(
-                        0, rowWidth - 1)(random_)
-                  : 0;
-          for (int localStep = 0;
-               localStep < rowWidth; ++localStep) {
-            const int rowPosition =
-                (localStep + rowOffset) % rowWidth;
-            const int x =
-                materialScanRight_
-                    ? beginX + rowPosition
-                    : endX - 1 - rowPosition;
-          const std::size_t index = indexOf(x, y);
-          if (moved_[index] != 0) {
-            continue;
-          }
-          const Material material = cells_[index];
-          if (material == Material::fire) {
-            markMaterialActive(x, y, gasActivity | thermalActivity);
-            heat_[index] = std::max(0.0F, heat_[index] - 0.045F);
-            constexpr std::array<Vec2, 4> neighbors{{
-                {-1.0F, 0.0F},
-                {1.0F, 0.0F},
-                {0.0F, -1.0F},
-                {0.0F, 1.0F},
-            }};
+        }
+        const int x = static_cast<int>(
+            index % static_cast<std::size_t>(width));
+        const int y = static_cast<int>(
+            index / static_cast<std::size_t>(width));
+        const Material material = cells_[index];
+        if (material == Material::fire) {
+            markMaterialActive(
+                x, y,
+                gasActivity | thermalActivity);
+            heat_[index] =
+                std::max(
+                    0.0F, heat_[index] - 0.045F);
             bool touchesWater = false;
-            for (Vec2 offset : neighbors) {
-              const int neighborX = x + static_cast<int>(offset.x);
-              const int neighborY = y + static_cast<int>(offset.y);
-              const Material neighbor = cell(neighborX, neighborY);
-              if (neighbor == Material::oil && percent(random_) < 48) {
-                heat_[indexOf(neighborX, neighborY)] = 1.0F;
-              } else if (neighbor == Material::wood && percent(random_) < 22) {
-                heat_[indexOf(neighborX, neighborY)] = 1.0F;
-              } else if (neighbor == Material::water) {
-                touchesWater = true;
-                heat_[indexOf(neighborX, neighborY)] *= 0.45F;
-              }
+            for (Vec2 offset : gasNeighbors) {
+                const int neighborX =
+                    x + static_cast<int>(offset.x);
+                const int neighborY =
+                    y + static_cast<int>(offset.y);
+                const Material neighbor =
+                    cell(neighborX, neighborY);
+                if (neighbor == Material::oil &&
+                    percent(random_) < 48) {
+                    heat_[indexOf(
+                        neighborX, neighborY)] = 1.0F;
+                } else if (
+                    neighbor == Material::wood &&
+                    percent(random_) < 22) {
+                    heat_[indexOf(
+                        neighborX, neighborY)] = 1.0F;
+                } else if (
+                    neighbor == Material::water) {
+                    touchesWater = true;
+                    heat_[indexOf(
+                        neighborX, neighborY)] *= 0.45F;
+                }
             }
             if (touchesWater) {
-              heat_[index] *= 0.55F;
+                heat_[index] *= 0.55F;
             }
             if (heat_[index] < 0.10F) {
-              setCell(x, y, Material::smoke);
-              continue;
+                setCell(x, y, Material::smoke);
+                moved_[index] = 1;
             }
-            const int riseDirection = coin(random_) == 0 ? -1 : 1;
-            if (cell(x, y - 1) == Material::air ||
-                cell(x, y - 1) == Material::smoke) {
-              moveCell(x, y, x, y - 1);
-            } else if (cell(x + riseDirection, y - 1) == Material::air) {
-              moveCell(x, y, x + riseDirection, y - 1);
-            }
-          } else if (material == Material::smoke ||
-                     material == Material::steam) {
-            markMaterialActive(x, y, gasActivity | thermalActivity);
-            const bool steam = material == Material::steam;
-            heat_[index] *= steam ? 0.92F : 0.975F;
-            if (steam && heat_[index] < 0.055F) {
-              setCell(x, y, Material::water);
-              liquidAmount_[index] = maximumLiquidMass;
-              continue;
-            }
-            if (!steam) {
-              gasLifetime_[index] -= 1.0F / 30.0F;
-              if (gasLifetime_[index] <= 0.0F) {
+            continue;
+        }
+        if (material != Material::smoke &&
+            material != Material::steam) {
+            continue;
+        }
+
+        markMaterialActive(
+            x, y, gasActivity | thermalActivity);
+        const bool steam =
+            material == Material::steam;
+        heat_[index] *= steam ? 0.92F : 0.975F;
+        if (steam && heat_[index] < 0.055F) {
+            setCell(x, y, Material::water);
+            liquidAmount_[index] =
+                maximumLiquidMass;
+            continue;
+        }
+        if (!steam) {
+            gasLifetime_[index] -=
+                materialTimeStep;
+            if (gasLifetime_[index] <= 0.0F) {
                 setCell(x, y, Material::air);
                 continue;
-              }
             }
-
-            int drift = static_cast<int>(gasDrift_[index]);
-            if (drift == 0) {
-              drift = coin(random_) == 0 ? -1 : 1;
-              gasDrift_[index] = static_cast<std::int8_t>(drift);
-            } else if (percent(random_) < (steam ? 4 : 7)) {
-              // Small independent eddies keep neighboring gas cells
-              // from locking into the same horizontal travel lane.
-              drift = -drift;
-              gasDrift_[index] = static_cast<std::int8_t>(drift);
-            }
-
-            const Material materialAbove = cell(x, y - 1);
-            const bool blockedByCeiling = materialAbove != Material::air &&
-                                          materialAbove != Material::fire &&
-                                          materialAbove != Material::smoke &&
-                                          materialAbove != Material::steam;
-            const int riseChance = steam ? 88 : 64;
-            if (percent(random_) < riseChance) {
-              // Persistent diagonal preference breaks up narrow vertical
-              // columns while still letting buoyancy dominate.
-              if (percent(random_) < 48 &&
-                  cell(x + drift, y - 1) == Material::air) {
-                moveCell(x, y, x + drift, y - 1);
-                continue;
-              }
-              if (cell(x, y - 1) == Material::air) {
-                moveCell(x, y, x, y - 1);
-                continue;
-              }
-              if (cell(x + drift, y - 1) == Material::air) {
-                moveCell(x, y, x + drift, y - 1);
-                continue;
-              }
-              if (cell(x - drift, y - 1) == Material::air) {
-                gasDrift_[index] = static_cast<std::int8_t>(-drift);
-                moveCell(x, y, x - drift, y - 1);
-                continue;
-              }
-            }
-
-            // Smoke fans out beneath ceilings and continues to meander
-            // laterally while rising through open rooms.
-            const int lateralChance =
-                blockedByCeiling ? (steam ? 58 : 76) : (steam ? 12 : 24);
-            if (percent(random_) < lateralChance) {
-              if (cell(x + drift, y) == Material::air) {
-                moveCell(x, y, x + drift, y);
-                continue;
-              }
-              if (cell(x - drift, y) == Material::air) {
-                gasDrift_[index] = static_cast<std::int8_t>(-drift);
-                moveCell(x, y, x - drift, y);
-                continue;
-              }
-              gasDrift_[index] = static_cast<std::int8_t>(-drift);
-            }
-          }
-          }
         }
-      }
+
+        int drift =
+            static_cast<int>(gasDrift_[index]);
+        const std::uint32_t stateRandom =
+            transferPriority(
+                index ^
+                0xD1B54A32D192ED03ULL);
+        if (drift == 0) {
+            drift = (stateRandom & 1U) == 0
+                        ? -1
+                        : 1;
+        } else if (
+            stateRandom % 100U <
+            static_cast<std::uint32_t>(
+                steam ? 4 : 7)) {
+            drift = -drift;
+        }
+        gasDrift_[index] =
+            static_cast<std::int8_t>(drift);
     }
+
+    struct GasTransfer {
+        std::size_t source = 0;
+        std::size_t destination = 0;
+        Material material = Material::air;
+        std::int8_t nextDrift = 0;
+        std::uint32_t priority = 0;
+        bool moving = false;
+    };
+    struct GasChunkJob {
+        int chunkX = 0;
+        int chunkY = 0;
+        std::vector<GasTransfer> transfers;
+    };
+
+    std::array<std::vector<GasChunkJob>, 4>
+        gasPhaseJobs;
+    std::uint32_t gasChunkCount = 0;
+    for (int chunkY = firstChunkY;
+         chunkY < finalChunkY; ++chunkY) {
+        for (int chunkX = firstChunkX;
+             chunkX < finalChunkX; ++chunkX) {
+            if (!materialChunkActive(
+                    chunkX * chunkSize,
+                    chunkY * chunkSize,
+                    gasActivity)) {
+                continue;
+            }
+            const std::size_t chunkIndex =
+                static_cast<std::size_t>(
+                    chunkY * chunkColumns + chunkX);
+            const std::size_t activeCells =
+                static_cast<std::size_t>(
+                    std::popcount(
+                        materialChunkActivity_[chunkIndex]
+                            .microtiles[gasSystem])) *
+                static_cast<std::size_t>(
+                    materialMicrotileSize *
+                    materialMicrotileSize);
+            const int phase =
+                (chunkX & 1) |
+                ((chunkY & 1) << 1);
+            auto& job = gasPhaseJobs[
+                static_cast<std::size_t>(
+                    phase)].emplace_back();
+            job.chunkX = chunkX;
+            job.chunkY = chunkY;
+            job.transfers.reserve(activeCells);
+            ++gasChunkCount;
+        }
+    }
+    materialSimulationTimings_.parallelGasChunks =
+        gasChunkCount;
+
+    const auto& gasCells = std::as_const(cells_);
+    const auto& gasMoved = std::as_const(moved_);
+    const auto& currentGasDrift =
+        std::as_const(gasDrift_);
+    const auto gasMaterialAt =
+        [&](int x, int y) {
+            if (x < 0 || x >= width ||
+                y < 0 || y >= height) {
+                return Material::rock;
+            }
+            return gasCells[indexOf(x, y)];
+        };
+    const auto gasDestinationOpen =
+        [&](int x, int y, bool allowSmoke) {
+            if (x < 0 || x >= width ||
+                y < 0 || y >= height) {
+                return false;
+            }
+            const std::size_t destination =
+                indexOf(x, y);
+            const Material target =
+                gasCells[destination];
+            return gasMoved[destination] == 0 &&
+                   (target == Material::air ||
+                    (allowSmoke &&
+                     target == Material::smoke));
+        };
+    const auto randomPercent =
+        [&](std::size_t source,
+            std::uint64_t salt) {
+            return transferPriority(
+                       source ^
+                       static_cast<std::size_t>(
+                           salt)) %
+                   100U;
+        };
+
+    for (auto& jobs : gasPhaseJobs) {
+        executor.run(
+            jobs.size(),
+            [&](std::size_t jobIndex) {
+                GasChunkJob& job =
+                    jobs[jobIndex];
+                const int chunkOriginX =
+                    job.chunkX * chunkSize;
+                const int chunkOriginY =
+                    job.chunkY * chunkSize;
+                const int beginY = std::max({
+                    bounds.minY,
+                    chunkOriginY,
+                    1,
+                });
+                const int endY = std::min(
+                    bounds.maxY,
+                    chunkOriginY + chunkSize);
+                for (int y = beginY;
+                     y < endY; ++y) {
+                    for (int microtileX = 0;
+                         microtileX <
+                             materialMicrotilesPerAxis;
+                         ++microtileX) {
+                        const int tileOriginX =
+                            chunkOriginX +
+                            microtileX *
+                                materialMicrotileSize;
+                        const int beginX = std::max(
+                            bounds.minX, tileOriginX);
+                        const int endX = std::min(
+                            bounds.maxX,
+                            tileOriginX +
+                                materialMicrotileSize);
+                        if (beginX >= endX ||
+                            !materialMicrotileActive(
+                                beginX, y,
+                                gasActivity)) {
+                            continue;
+                        }
+                        for (int x = beginX;
+                             x < endX; ++x) {
+                            const std::size_t source =
+                                indexOf(x, y);
+                            if (gasMoved[source] != 0) {
+                                continue;
+                            }
+                            const Material material =
+                                gasCells[source];
+                            if (material !=
+                                    Material::fire &&
+                                material !=
+                                    Material::smoke &&
+                                material !=
+                                    Material::steam) {
+                                continue;
+                            }
+
+                            GasTransfer transfer;
+                            transfer.source = source;
+                            transfer.destination = source;
+                            transfer.material = material;
+                            transfer.nextDrift =
+                                currentGasDrift[source];
+                            transfer.priority =
+                                transferPriority(source);
+                            if (material ==
+                                Material::fire) {
+                                const int direction =
+                                    (transfer.priority &
+                                     1U) == 0
+                                        ? -1
+                                        : 1;
+                                if (gasDestinationOpen(
+                                        x, y - 1,
+                                        true)) {
+                                    transfer.destination =
+                                        indexOf(
+                                            x, y - 1);
+                                    transfer.moving = true;
+                                } else if (
+                                    gasDestinationOpen(
+                                        x + direction,
+                                        y - 1,
+                                        false)) {
+                                    transfer.destination =
+                                        indexOf(
+                                            x + direction,
+                                            y - 1);
+                                    transfer.moving = true;
+                                }
+                                job.transfers.push_back(
+                                    transfer);
+                                continue;
+                            }
+
+                            const bool steam =
+                                material ==
+                                Material::steam;
+                            int drift =
+                                static_cast<int>(
+                                    transfer.nextDrift);
+                            if (drift == 0) {
+                                drift =
+                                    (transfer.priority &
+                                     1U) == 0
+                                        ? -1
+                                        : 1;
+                            }
+                            const Material above =
+                                gasMaterialAt(
+                                    x, y - 1);
+                            const bool blockedByCeiling =
+                                above != Material::air &&
+                                above !=
+                                    Material::fire &&
+                                above !=
+                                    Material::smoke &&
+                                above !=
+                                    Material::steam;
+                            const std::uint32_t
+                                riseChance =
+                                    steam ? 88U : 64U;
+                            if (randomPercent(
+                                    source,
+                                    0xA24BAED4963EE407ULL) <
+                                riseChance) {
+                                if (randomPercent(
+                                        source,
+                                        0x9FB21C651E98DF25ULL) <
+                                        48U &&
+                                    gasDestinationOpen(
+                                        x + drift,
+                                        y - 1,
+                                        false)) {
+                                    transfer.destination =
+                                        indexOf(
+                                            x + drift,
+                                            y - 1);
+                                    transfer.moving = true;
+                                } else if (
+                                    gasDestinationOpen(
+                                        x, y - 1,
+                                        false)) {
+                                    transfer.destination =
+                                        indexOf(
+                                            x, y - 1);
+                                    transfer.moving = true;
+                                } else if (
+                                    gasDestinationOpen(
+                                        x + drift,
+                                        y - 1,
+                                        false)) {
+                                    transfer.destination =
+                                        indexOf(
+                                            x + drift,
+                                            y - 1);
+                                    transfer.moving = true;
+                                } else if (
+                                    gasDestinationOpen(
+                                        x - drift,
+                                        y - 1,
+                                        false)) {
+                                    transfer.destination =
+                                        indexOf(
+                                            x - drift,
+                                            y - 1);
+                                    transfer.nextDrift =
+                                        static_cast<
+                                            std::int8_t>(
+                                            -drift);
+                                    transfer.moving = true;
+                                }
+                            }
+
+                            const std::uint32_t
+                                lateralChance =
+                                    blockedByCeiling
+                                        ? (steam
+                                               ? 58U
+                                               : 76U)
+                                        : (steam
+                                               ? 12U
+                                               : 24U);
+                            if (!transfer.moving &&
+                                randomPercent(
+                                    source,
+                                    0xC13FA9A902A6328FULL) <
+                                    lateralChance) {
+                                if (gasDestinationOpen(
+                                        x + drift, y,
+                                        false)) {
+                                    transfer.destination =
+                                        indexOf(
+                                            x + drift, y);
+                                    transfer.moving = true;
+                                } else if (
+                                    gasDestinationOpen(
+                                        x - drift, y,
+                                        false)) {
+                                    transfer.destination =
+                                        indexOf(
+                                            x - drift, y);
+                                    transfer.nextDrift =
+                                        static_cast<
+                                            std::int8_t>(
+                                            -drift);
+                                    transfer.moving = true;
+                                } else {
+                                    transfer.nextDrift =
+                                        static_cast<
+                                            std::int8_t>(
+                                            -drift);
+                                }
+                            }
+                            job.transfers.push_back(
+                                transfer);
+                        }
+                    }
+                }
+            });
+    }
+
+    std::vector<GasTransfer> gasTransfers;
+    for (const auto& jobs : gasPhaseJobs) {
+        for (const GasChunkJob& job : jobs) {
+            gasTransfers.insert(
+                gasTransfers.end(),
+                job.transfers.begin(),
+                job.transfers.end());
+        }
+    }
+    std::sort(
+        gasTransfers.begin(), gasTransfers.end(),
+        [](const GasTransfer& first,
+           const GasTransfer& second) {
+            if (first.moving != second.moving) {
+                return first.moving >
+                       second.moving;
+            }
+            if (first.priority != second.priority) {
+                return first.priority <
+                       second.priority;
+            }
+            return first.source < second.source;
+        });
+
+    std::uint32_t gasMoveProposals = 0;
+    std::uint32_t gasMovesAccepted = 0;
+    std::uint32_t gasMoveConflicts = 0;
+    for (const GasTransfer& transfer :
+         gasTransfers) {
+        if (!transfer.moving) {
+            continue;
+        }
+        ++gasMoveProposals;
+        if (moved_[transfer.source] != 0 ||
+            moved_[transfer.destination] != 0 ||
+            cells_[transfer.source] !=
+                transfer.material) {
+            ++gasMoveConflicts;
+            if (cells_[transfer.source] ==
+                transfer.material) {
+                gasDrift_[transfer.source] =
+                    transfer.nextDrift;
+                const int sourceX =
+                    static_cast<int>(
+                        transfer.source %
+                        static_cast<std::size_t>(
+                            width));
+                const int sourceY =
+                    static_cast<int>(
+                        transfer.source /
+                        static_cast<std::size_t>(
+                            width));
+                markMaterialActive(
+                    sourceX, sourceY,
+                    gasActivity |
+                        thermalActivity);
+            }
+            continue;
+        }
+
+        const int sourceX = static_cast<int>(
+            transfer.source %
+            static_cast<std::size_t>(width));
+        const int sourceY = static_cast<int>(
+            transfer.source /
+            static_cast<std::size_t>(width));
+        const int destinationX = static_cast<int>(
+            transfer.destination %
+            static_cast<std::size_t>(width));
+        const int destinationY = static_cast<int>(
+            transfer.destination /
+            static_cast<std::size_t>(width));
+        swapCells(
+            sourceX, sourceY,
+            destinationX, destinationY);
+        moved_[transfer.source] = 1;
+        moved_[transfer.destination] = 1;
+        gasDrift_[transfer.destination] =
+            transfer.nextDrift;
+        markMaterialActive(
+            destinationX, destinationY,
+            gasActivity | thermalActivity);
+        ++gasMovesAccepted;
+    }
+    for (const GasTransfer& transfer :
+         gasTransfers) {
+        if (transfer.moving ||
+            moved_[transfer.source] != 0 ||
+            cells_[transfer.source] !=
+                transfer.material) {
+            continue;
+        }
+        gasDrift_[transfer.source] =
+            transfer.nextDrift;
+    }
+    materialSimulationTimings_.gasMoveProposals =
+        gasMoveProposals;
+    materialSimulationTimings_.gasMovesAccepted =
+        gasMovesAccepted;
+    materialSimulationTimings_.gasMoveConflicts =
+        gasMoveConflicts;
     const auto gasAndReactionEnd =
         std::chrono::steady_clock::now();
     smoothTiming(

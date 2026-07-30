@@ -28,6 +28,10 @@ struct MaterialSimulationTimings {
     float gasAndReactionMs = 0.0F;
     float heatMs = 0.0F;
     std::uint32_t activeChunks = 0;
+    std::uint32_t activeGranularChunks = 0;
+    std::uint32_t activeLiquidChunks = 0;
+    std::uint32_t activeGasChunks = 0;
+    std::uint32_t activeThermalChunks = 0;
     std::uint32_t liquidCandidateVisits = 0;
     std::uint32_t equalizedComponents = 0;
     std::uint32_t equalizedCells = 0;
@@ -208,6 +212,9 @@ public:
         player_.onGround = false;
         releaseGrapple();
     }
+    void clearMaterialActivityForTest();
+    [[nodiscard]] std::array<bool, 4>
+    materialActivityForTest(int x, int y) const;
 #endif
 
 private:
@@ -236,6 +243,20 @@ private:
         std::uint8_t phase = 0;
     };
 
+    static constexpr std::uint8_t granularActivity = 1U << 0U;
+    static constexpr std::uint8_t liquidActivity = 1U << 1U;
+    static constexpr std::uint8_t gasActivity = 1U << 2U;
+    static constexpr std::uint8_t thermalActivity = 1U << 3U;
+    static constexpr std::uint8_t allMaterialActivity =
+        granularActivity | liquidActivity |
+        gasActivity | thermalActivity;
+    static constexpr std::size_t materialActivitySystemCount = 4;
+
+    struct MaterialChunkActivity {
+        std::array<std::uint8_t,
+                   materialActivitySystemCount> lifetime{};
+    };
+
     [[nodiscard]] bool isSolid(int x, int y) const;
     [[nodiscard]] bool overlapsTerrain(Vec2 center, Vec2 halfSize) const;
     void ensureTerrainGenerated(const ActiveBounds& bounds);
@@ -244,8 +265,14 @@ private:
     [[nodiscard]] Material proceduralMaterial(int x, int y) const;
     void setCell(int x, int y, Material material);
     void swapCells(int firstX, int firstY, int secondX, int secondY);
-    void markMaterialActive(int x, int y);
-    [[nodiscard]] bool materialChunkActive(int x, int y) const;
+    [[nodiscard]] static std::uint8_t
+    materialActivityMask(Material material);
+    void markMaterialActive(
+        int x, int y,
+        std::uint8_t activityMask = allMaterialActivity);
+    [[nodiscard]] bool materialChunkActive(
+        int x, int y,
+        std::uint8_t activityMask = allMaterialActivity) const;
     void ageMaterialChunks();
     void rebuildDirtySkyColumns();
     void captureInteriorBackdrop();
@@ -333,7 +360,7 @@ private:
     std::uint32_t currentEqualizedCells_ = 0;
     std::vector<Material> columnHeadMaterial_;
     std::vector<std::uint8_t> columnHeadDepth_;
-    std::vector<std::uint8_t> materialChunkActivity_;
+    std::vector<MaterialChunkActivity> materialChunkActivity_;
     std::vector<int> skyOccluderY_;
     std::vector<std::uint8_t> skyColumnDirty_;
     SparseGrid<std::uint8_t> interiorBackdrop_;

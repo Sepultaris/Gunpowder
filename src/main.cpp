@@ -560,6 +560,12 @@ bool drawDeveloperUi(bool* open,
             materialTimings.liquidCandidateVisits,
             materialTimings.equalizedComponents,
             materialTimings.equalizedCells);
+        ImGui::TextDisabled(
+            "Awake: granular %u | liquid %u | gas %u | thermal %u",
+            materialTimings.activeGranularChunks,
+            materialTimings.activeLiquidChunks,
+            materialTimings.activeGasChunks,
+            materialTimings.activeThermalChunks);
     } else {
         ImGui::TextDisabled("CPU material timings: collecting...");
     }

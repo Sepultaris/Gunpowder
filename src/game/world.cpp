@@ -82,8 +82,7 @@ World::World()
       materialChunkActivity_(
           static_cast<std::size_t>(
               ((width + chunkSize - 1) / chunkSize) *
-              ((height + chunkSize - 1) / chunkSize)),
-          0),
+              ((height + chunkSize - 1) / chunkSize))),
       skyOccluderY_(static_cast<std::size_t>(width), height),
       skyColumnDirty_(static_cast<std::size_t>(width), 1),
       interiorBackdrop_(width, height, 0),
@@ -119,7 +118,8 @@ void World::regenerate() {
     liquidNextWorklist_.clear();
     liquidReservedCells_.clear();
     std::fill(materialChunkActivity_.begin(),
-              materialChunkActivity_.end(), 0);
+              materialChunkActivity_.end(),
+              MaterialChunkActivity{});
     interiorBackdrop_.reset(0);
     std::fill(generatedTerrainChunks_.begin(),
               generatedTerrainChunks_.end(), 0);
@@ -824,7 +824,16 @@ void World::setCell(int x, int y, Material material) {
         ++solidRevision_;
     }
     if (material != previous) {
-        markMaterialActive(x, y);
+        std::uint8_t activityMask =
+            materialActivityMask(previous) |
+            materialActivityMask(material);
+        if (isSkyOccluder(previous) !=
+            isSkyOccluder(material)) {
+            // Explicit construction or destruction can change support,
+            // containment, gas paths, and heat conduction simultaneously.
+            activityMask |= allMaterialActivity;
+        }
+        markMaterialActive(x, y, activityMask);
     }
     if (material != previous || material != Material::wood) {
         burnProgress_.set(index, 0.0F);
@@ -886,10 +895,12 @@ void World::setCell(int x, int y, Material material) {
 void World::swapCells(int firstX, int firstY, int secondX, int secondY) {
     const std::size_t first = indexOf(firstX, firstY);
     const std::size_t second = indexOf(secondX, secondY);
+    const Material firstMaterial = cells_[first];
+    const Material secondMaterial = cells_[second];
     const bool firstWasOccluder =
-        isSkyOccluder(cells_[first]);
+        isSkyOccluder(firstMaterial);
     const bool secondWasOccluder =
-        isSkyOccluder(cells_[second]);
+        isSkyOccluder(secondMaterial);
     if (firstWasOccluder != secondWasOccluder) {
         const auto updateColumn =
             [&](int x, int y, bool wasOccluder,
@@ -923,11 +934,46 @@ void World::swapCells(int firstX, int firstY, int secondX, int secondY) {
     std::swap(granularVelocityY_[first], granularVelocityY_[second]);
     std::swap(granularFallRemainder_[first],
               granularFallRemainder_[second]);
-    markMaterialActive(firstX, firstY);
-    markMaterialActive(secondX, secondY);
+    std::uint8_t activityMask =
+        materialActivityMask(firstMaterial) |
+        materialActivityMask(secondMaterial);
+    if (firstWasOccluder != secondWasOccluder) {
+        activityMask |= granularActivity |
+                        liquidActivity |
+                        gasActivity;
+    }
+    if (heat_[first] > 0.015F || heat_[second] > 0.015F) {
+        activityMask |= thermalActivity;
+    }
+    markMaterialActive(firstX, firstY, activityMask);
+    markMaterialActive(secondX, secondY, activityMask);
 }
 
-void World::markMaterialActive(int x, int y) {
+std::uint8_t World::materialActivityMask(Material material) {
+    switch (material) {
+    case Material::sand:
+        return granularActivity;
+    case Material::water:
+        return liquidActivity | thermalActivity;
+    case Material::oil:
+        return liquidActivity | thermalActivity;
+    case Material::fire:
+        return gasActivity | thermalActivity;
+    case Material::smoke:
+    case Material::steam:
+        return gasActivity | thermalActivity;
+    case Material::wood:
+        return thermalActivity;
+    default:
+        return 0;
+    }
+}
+
+void World::markMaterialActive(
+    int x, int y, std::uint8_t activityMask) {
+    if (activityMask == 0) {
+        return;
+    }
     constexpr int chunkColumns =
         (width + chunkSize - 1) / chunkSize;
     constexpr int chunkRows =
@@ -947,14 +993,24 @@ void World::markMaterialActive(int x, int y) {
             const std::size_t chunkIndex =
                 static_cast<std::size_t>(
                     chunkY * chunkColumns + chunkX);
-            materialChunkActivity_[chunkIndex] =
-                std::max<std::uint8_t>(
-                    materialChunkActivity_[chunkIndex], 8);
+            auto& activity =
+                materialChunkActivity_[chunkIndex];
+            for (std::size_t system = 0;
+                 system < materialActivitySystemCount; ++system) {
+                const std::uint8_t systemMask =
+                    static_cast<std::uint8_t>(1U << system);
+                if ((activityMask & systemMask) != 0) {
+                    activity.lifetime[system] =
+                        std::max<std::uint8_t>(
+                            activity.lifetime[system], 8);
+                }
+            }
         }
     }
 }
 
-bool World::materialChunkActive(int x, int y) const {
+bool World::materialChunkActive(
+    int x, int y, std::uint8_t activityMask) const {
     constexpr int chunkColumns =
         (width + chunkSize - 1) / chunkSize;
     if (x < 0 || x >= width || y < 0 || y >= height) {
@@ -962,16 +1018,47 @@ bool World::materialChunkActive(int x, int y) const {
     }
     const std::size_t chunkIndex = static_cast<std::size_t>(
         (y / chunkSize) * chunkColumns + x / chunkSize);
-    return materialChunkActivity_[chunkIndex] != 0;
+    const auto& activity = materialChunkActivity_[chunkIndex];
+    for (std::size_t system = 0;
+         system < materialActivitySystemCount; ++system) {
+        const std::uint8_t systemMask =
+            static_cast<std::uint8_t>(1U << system);
+        if ((activityMask & systemMask) != 0 &&
+            activity.lifetime[system] != 0) {
+            return true;
+        }
+    }
+    return false;
 }
 
 void World::ageMaterialChunks() {
-    for (std::uint8_t& activity : materialChunkActivity_) {
-        if (activity > 0) {
-            --activity;
+    for (MaterialChunkActivity& activity :
+         materialChunkActivity_) {
+        for (std::uint8_t& lifetime : activity.lifetime) {
+            if (lifetime > 0) {
+                --lifetime;
+            }
         }
     }
 }
+
+#ifdef GUNPOWDER_TEST_SCALE
+void World::clearMaterialActivityForTest() {
+    std::fill(materialChunkActivity_.begin(),
+              materialChunkActivity_.end(),
+              MaterialChunkActivity{});
+}
+
+std::array<bool, 4> World::materialActivityForTest(
+    int x, int y) const {
+    return {
+        materialChunkActive(x, y, granularActivity),
+        materialChunkActive(x, y, liquidActivity),
+        materialChunkActive(x, y, gasActivity),
+        materialChunkActive(x, y, thermalActivity),
+    };
+}
+#endif
 
 void World::rebuildDirtySkyColumns() {
     for (int x = 0; x < width; ++x) {
@@ -2495,8 +2582,6 @@ void World::updateMaterials() {
     currentEqualizedComponents_ = 0;
     currentEqualizedCells_ = 0;
     rebuildLiquidWorklist_ = true;
-    constexpr int chunkColumns =
-        (width + chunkSize - 1) / chunkSize;
     const int firstChunkX = bounds.minX / chunkSize;
     const int finalChunkX =
         (bounds.maxX + chunkSize - 1) / chunkSize;
@@ -2504,18 +2589,58 @@ void World::updateMaterials() {
     const int finalChunkY =
         (bounds.maxY + chunkSize - 1) / chunkSize;
     std::uint32_t activeChunkCount = 0;
+    std::uint32_t activeGranularChunkCount = 0;
+    std::uint32_t activeLiquidChunkCount = 0;
+    std::uint32_t activeGasChunkCount = 0;
+    std::uint32_t activeThermalChunkCount = 0;
     for (int chunkY = firstChunkY; chunkY < finalChunkY; ++chunkY) {
         for (int chunkX = firstChunkX; chunkX < finalChunkX; ++chunkX) {
-            const std::size_t chunkIndex = static_cast<std::size_t>(
-                chunkY * chunkColumns + chunkX);
+            const int sampleX = chunkX * chunkSize;
+            const int sampleY = chunkY * chunkSize;
+            const bool granular = materialChunkActive(
+                sampleX, sampleY, granularActivity);
+            const bool liquid = materialChunkActive(
+                sampleX, sampleY, liquidActivity);
+            const bool gas = materialChunkActive(
+                sampleX, sampleY, gasActivity);
+            const bool thermal = materialChunkActive(
+                sampleX, sampleY, thermalActivity);
             activeChunkCount +=
-                materialChunkActivity_[chunkIndex] != 0 ? 1U : 0U;
+                granular || liquid || gas || thermal ? 1U : 0U;
+            activeGranularChunkCount += granular ? 1U : 0U;
+            activeLiquidChunkCount += liquid ? 1U : 0U;
+            activeGasChunkCount += gas ? 1U : 0U;
+            activeThermalChunkCount += thermal ? 1U : 0U;
         }
     }
     materialSimulationTimings_.activeChunks = activeChunkCount;
-    for (int y = bounds.minY; y < bounds.maxY; ++y) {
-        for (int x = bounds.minX; x < bounds.maxX; ++x) {
-            moved_.set(indexOf(x, y), 0);
+    materialSimulationTimings_.activeGranularChunks =
+        activeGranularChunkCount;
+    materialSimulationTimings_.activeLiquidChunks =
+        activeLiquidChunkCount;
+    materialSimulationTimings_.activeGasChunks =
+        activeGasChunkCount;
+    materialSimulationTimings_.activeThermalChunks =
+        activeThermalChunkCount;
+    for (int chunkY = firstChunkY; chunkY < finalChunkY; ++chunkY) {
+        for (int chunkX = firstChunkX; chunkX < finalChunkX; ++chunkX) {
+            if (!materialChunkActive(
+                    chunkX * chunkSize, chunkY * chunkSize)) {
+                continue;
+            }
+            const int beginX =
+                std::max(bounds.minX, chunkX * chunkSize);
+            const int endX = std::min(
+                bounds.maxX, (chunkX + 1) * chunkSize);
+            const int beginY =
+                std::max(bounds.minY, chunkY * chunkSize);
+            const int endY = std::min(
+                bounds.maxY, (chunkY + 1) * chunkSize);
+            for (int y = beginY; y < endY; ++y) {
+                for (int x = beginX; x < endX; ++x) {
+                    moved_.set(indexOf(x, y), 0);
+                }
+            }
         }
     }
     static bool scanRight = true;
@@ -2535,98 +2660,96 @@ void World::updateMaterials() {
     // uses the same acceleration and terminal speed as the player. Fractional
     // travel is retained between 30 Hz material ticks, while a fast grain may
     // cross several open cells in one tick without tunneling through them.
-    for (int y = std::min(bounds.maxY - 1, height - 2);
-         y >= bounds.minY; --y) {
-        for (int step = bounds.minX; step < bounds.maxX; ++step) {
-            const int x = scanRight ? step
-                                    : bounds.maxX - 1 - (step - bounds.minX);
-            const std::size_t index = indexOf(x, y);
-            if (!materialChunkActive(x, y)) {
-                continue;
-            }
-            if (moved_[index] != 0) {
-                continue;
-            }
-            const Material material = cells_[index];
-            if (material != Material::sand) {
-                continue;
-            }
-
-            const auto canFallInto = [](Material target) {
-                return target == Material::air || target == Material::fire ||
-                       target == Material::smoke ||
-                       target == Material::steam || isLiquid(target);
-            };
-
-            if (canFallInto(cell(x, y + 1))) {
-                const float previousVelocity =
-                    std::max(granularVelocityY_[index], 0.0F);
-                const float nextVelocity =
-                    std::min(previousVelocity +
-                                 gravity * materialTimeStep,
-                             terminalFallSpeed);
-                const float integratedDistance =
-                    granularFallRemainder_[index] +
-                    (previousVelocity + nextVelocity) *
-                        0.5F * materialTimeStep;
-                const int requestedSteps =
-                    static_cast<int>(std::floor(integratedDistance));
-                if (requestedSteps <= 0) {
-                    granularVelocityY_[index] = nextVelocity;
-                    granularFallRemainder_[index] =
-                        integratedDistance;
-                    markMaterialActive(x, y);
-                    continue;
-                }
-
-                int currentY = y;
-                int completedSteps = 0;
-                while (completedSteps < requestedSteps &&
-                       currentY < height - 1 &&
-                       canFallInto(cell(x, currentY + 1))) {
-                    moveCell(x, currentY, x, currentY + 1);
-                    ++currentY;
-                    ++completedSteps;
-                }
-
-                const std::size_t destination =
-                    indexOf(x, currentY);
-                const bool landed =
-                    completedSteps < requestedSteps ||
-                    currentY >= height - 1 ||
-                    !canFallInto(cell(x, currentY + 1));
-                if (landed) {
-                    granularVelocityY_[destination] = 0.0F;
-                    granularFallRemainder_[destination] = 0.0F;
-                } else {
-                    granularVelocityY_[destination] = nextVelocity;
-                    granularFallRemainder_[destination] =
-                        integratedDistance -
-                        static_cast<float>(completedSteps);
-                    markMaterialActive(x, currentY);
-                }
-                continue;
-            }
-
-            granularVelocityY_[index] = 0.0F;
-            granularFallRemainder_[index] = 0.0F;
-            const int direction = coin(random_) == 0 ? -1 : 1;
-            if (canFallInto(cell(x + direction, y + 1))) {
-                moveCell(x, y, x + direction, y + 1);
-                const std::size_t destination =
-                    indexOf(x + direction, y + 1);
-                granularVelocityY_[destination] = 0.0F;
-                granularFallRemainder_[destination] = 0.0F;
-                continue;
-            }
-            if (canFallInto(cell(x - direction, y + 1))) {
-                moveCell(x, y, x - direction, y + 1);
-                const std::size_t destination =
-                    indexOf(x - direction, y + 1);
-                granularVelocityY_[destination] = 0.0F;
-                granularFallRemainder_[destination] = 0.0F;
-            }
+    for (int y = std::min(bounds.maxY - 1, height - 2); y >= bounds.minY; --y) {
+      const int chunkY = y / chunkSize;
+      const int chunkCount = finalChunkX - firstChunkX;
+      for (int chunkStep = 0; chunkStep < chunkCount; ++chunkStep) {
+        const int chunkX =
+            scanRight ? firstChunkX + chunkStep : finalChunkX - 1 - chunkStep;
+        if (!materialChunkActive(chunkX * chunkSize, chunkY * chunkSize,
+                                 granularActivity)) {
+          continue;
         }
+        const int beginX = std::max(bounds.minX, chunkX * chunkSize);
+        const int endX = std::min(bounds.maxX, (chunkX + 1) * chunkSize);
+        for (int localStep = 0; localStep < endX - beginX; ++localStep) {
+          const int x = scanRight ? beginX + localStep : endX - 1 - localStep;
+          const std::size_t index = indexOf(x, y);
+          if (moved_[index] != 0) {
+            continue;
+          }
+          const Material material = cells_[index];
+          if (material != Material::sand) {
+            continue;
+          }
+
+          const auto canFallInto = [](Material target) {
+            return target == Material::air || target == Material::fire ||
+                   target == Material::smoke || target == Material::steam ||
+                   isLiquid(target);
+          };
+
+          if (canFallInto(cell(x, y + 1))) {
+            const float previousVelocity =
+                std::max(granularVelocityY_[index], 0.0F);
+            const float nextVelocity =
+                std::min(previousVelocity + gravity * materialTimeStep,
+                         terminalFallSpeed);
+            const float integratedDistance =
+                granularFallRemainder_[index] +
+                (previousVelocity + nextVelocity) * 0.5F * materialTimeStep;
+            const int requestedSteps =
+                static_cast<int>(std::floor(integratedDistance));
+            if (requestedSteps <= 0) {
+              granularVelocityY_[index] = nextVelocity;
+              granularFallRemainder_[index] = integratedDistance;
+              markMaterialActive(x, y, granularActivity);
+              continue;
+            }
+
+            int currentY = y;
+            int completedSteps = 0;
+            while (completedSteps < requestedSteps && currentY < height - 1 &&
+                   canFallInto(cell(x, currentY + 1))) {
+              moveCell(x, currentY, x, currentY + 1);
+              ++currentY;
+              ++completedSteps;
+            }
+
+            const std::size_t destination = indexOf(x, currentY);
+            const bool landed = completedSteps < requestedSteps ||
+                                currentY >= height - 1 ||
+                                !canFallInto(cell(x, currentY + 1));
+            if (landed) {
+              granularVelocityY_[destination] = 0.0F;
+              granularFallRemainder_[destination] = 0.0F;
+            } else {
+              granularVelocityY_[destination] = nextVelocity;
+              granularFallRemainder_[destination] =
+                  integratedDistance - static_cast<float>(completedSteps);
+              markMaterialActive(x, currentY, granularActivity);
+            }
+            continue;
+          }
+
+          granularVelocityY_[index] = 0.0F;
+          granularFallRemainder_[index] = 0.0F;
+          const int direction = coin(random_) == 0 ? -1 : 1;
+          if (canFallInto(cell(x + direction, y + 1))) {
+            moveCell(x, y, x + direction, y + 1);
+            const std::size_t destination = indexOf(x + direction, y + 1);
+            granularVelocityY_[destination] = 0.0F;
+            granularFallRemainder_[destination] = 0.0F;
+            continue;
+          }
+          if (canFallInto(cell(x - direction, y + 1))) {
+            moveCell(x, y, x - direction, y + 1);
+            const std::size_t destination = indexOf(x - direction, y + 1);
+            granularVelocityY_[destination] = 0.0F;
+            granularFallRemainder_[destination] = 0.0F;
+          }
+        }
+      }
     }
 
     // Local cellular substeps let falling liquids travel several pixels per
@@ -2635,160 +2758,179 @@ void World::updateMaterials() {
     // higher viscosity.
     const auto granularEnd =
         std::chrono::steady_clock::now();
-    cacheLiquidColumnHeads(bounds);
-    prepareLiquidEqualization(bounds);
+    const bool hasActiveLiquidChunks =
+        activeLiquidChunkCount != 0;
+    if (hasActiveLiquidChunks) {
+        cacheLiquidColumnHeads(bounds);
+        prepareLiquidEqualization(bounds);
+    } else {
+        liquidWorklist_.clear();
+        liquidNextWorklist_.clear();
+        liquidEqualizationMoves_.clear();
+    }
     const auto liquidPreparationEnd =
         std::chrono::steady_clock::now();
     constexpr int liquidSubsteps = 4;
     constexpr int additionalWaterSubsteps = 2;
-    for (int step = 0; step < liquidSubsteps; ++step) {
-        updateLiquids(bounds);
-        applyLiquidEqualizationPhase(bounds, step);
-    }
-    for (int step = 0; step < additionalWaterSubsteps; ++step) {
-        updateLiquids(bounds, true);
-        applyLiquidEqualizationPhase(
-            bounds, liquidSubsteps + step);
+    if (hasActiveLiquidChunks) {
+        for (int step = 0; step < liquidSubsteps; ++step) {
+            updateLiquids(bounds);
+            applyLiquidEqualizationPhase(bounds, step);
+        }
+        for (int step = 0; step < additionalWaterSubsteps; ++step) {
+            updateLiquids(bounds, true);
+            applyLiquidEqualizationPhase(
+                bounds, liquidSubsteps + step);
+        }
     }
     const auto liquidTransportEnd =
         std::chrono::steady_clock::now();
 
     // Hot gases rise after liquids settle, and oil touching fire becomes fuel.
-    const int gasRowWidth = bounds.maxX - bounds.minX;
+    const int gasChunkCount = finalChunkX - firstChunkX;
     for (int y = std::max(bounds.minY, 1); y < bounds.maxY; ++y) {
-        const int rowOffset =
-            gasRowWidth > 1
-                ? std::uniform_int_distribution<int>(
-                      0, gasRowWidth - 1)(random_)
-                : 0;
-        for (int step = bounds.minX; step < bounds.maxX; ++step) {
-            const int rowPosition =
-                (step - bounds.minX + rowOffset) % gasRowWidth;
-            const int x =
-                scanRight ? bounds.minX + rowPosition
-                          : bounds.maxX - 1 - rowPosition;
-            const std::size_t index = indexOf(x, y);
-            if (!materialChunkActive(x, y)) {
-                continue;
-            }
-            if (moved_[index] != 0) {
-                continue;
-            }
-            const Material material = cells_[index];
-            if (material == Material::fire) {
-                markMaterialActive(x, y);
-                heat_[index] = std::max(0.0F, heat_[index] - 0.045F);
-                constexpr std::array<Vec2, 4> neighbors{{
-                    {-1.0F, 0.0F}, {1.0F, 0.0F},
-                    {0.0F, -1.0F}, {0.0F, 1.0F},
-                }};
-                bool touchesWater = false;
-                for (Vec2 offset : neighbors) {
-                    const int neighborX = x + static_cast<int>(offset.x);
-                    const int neighborY = y + static_cast<int>(offset.y);
-                    const Material neighbor = cell(neighborX, neighborY);
-                    if (neighbor == Material::oil && percent(random_) < 48) {
-                        heat_[indexOf(neighborX, neighborY)] = 1.0F;
-                    } else if (neighbor == Material::wood &&
-                               percent(random_) < 22) {
-                        heat_[indexOf(neighborX, neighborY)] = 1.0F;
-                    } else if (neighbor == Material::water) {
-                        touchesWater = true;
-                        heat_[indexOf(neighborX, neighborY)] *= 0.45F;
-                    }
-                }
-                if (touchesWater) {
-                    heat_[index] *= 0.55F;
-                }
-                if (heat_[index] < 0.10F) {
-                    setCell(x, y, Material::smoke);
-                    continue;
-                }
-                const int riseDirection = coin(random_) == 0 ? -1 : 1;
-                if (cell(x, y - 1) == Material::air ||
-                    cell(x, y - 1) == Material::smoke) {
-                    moveCell(x, y, x, y - 1);
-                } else if (cell(x + riseDirection, y - 1) == Material::air) {
-                    moveCell(x, y, x + riseDirection, y - 1);
-                }
-            } else if (material == Material::smoke ||
-                       material == Material::steam) {
-                markMaterialActive(x, y);
-                const bool steam = material == Material::steam;
-                heat_[index] *= steam ? 0.92F : 0.975F;
-                if (steam && heat_[index] < 0.055F) {
-                    setCell(x, y, Material::water);
-                    liquidAmount_[index] = maximumLiquidMass;
-                    continue;
-                }
-                if (!steam) {
-                    gasLifetime_[index] -= 1.0F / 30.0F;
-                    if (gasLifetime_[index] <= 0.0F) {
-                        setCell(x, y, Material::air);
-                        continue;
-                    }
-                }
-
-                int drift = static_cast<int>(gasDrift_[index]);
-                if (drift == 0) {
-                    drift = coin(random_) == 0 ? -1 : 1;
-                    gasDrift_[index] = static_cast<std::int8_t>(drift);
-                } else if (percent(random_) < (steam ? 4 : 7)) {
-                    // Small independent eddies keep neighboring gas cells
-                    // from locking into the same horizontal travel lane.
-                    drift = -drift;
-                    gasDrift_[index] = static_cast<std::int8_t>(drift);
-                }
-
-                const Material materialAbove = cell(x, y - 1);
-                const bool blockedByCeiling =
-                    materialAbove != Material::air &&
-                    materialAbove != Material::fire &&
-                    materialAbove != Material::smoke &&
-                    materialAbove != Material::steam;
-                const int riseChance = steam ? 88 : 64;
-                if (percent(random_) < riseChance) {
-                    // Persistent diagonal preference breaks up narrow vertical
-                    // columns while still letting buoyancy dominate.
-                    if (percent(random_) < 48 &&
-                        cell(x + drift, y - 1) == Material::air) {
-                        moveCell(x, y, x + drift, y - 1);
-                        continue;
-                    }
-                    if (cell(x, y - 1) == Material::air) {
-                        moveCell(x, y, x, y - 1);
-                        continue;
-                    }
-                    if (cell(x + drift, y - 1) == Material::air) {
-                        moveCell(x, y, x + drift, y - 1);
-                        continue;
-                    }
-                    if (cell(x - drift, y - 1) == Material::air) {
-                        gasDrift_[index] = static_cast<std::int8_t>(-drift);
-                        moveCell(x, y, x - drift, y - 1);
-                        continue;
-                    }
-                }
-
-                // Smoke fans out beneath ceilings and continues to meander
-                // laterally while rising through open rooms.
-                const int lateralChance =
-                    blockedByCeiling ? (steam ? 58 : 76)
-                                     : (steam ? 12 : 24);
-                if (percent(random_) < lateralChance) {
-                    if (cell(x + drift, y) == Material::air) {
-                        moveCell(x, y, x + drift, y);
-                        continue;
-                    }
-                    if (cell(x - drift, y) == Material::air) {
-                        gasDrift_[index] = static_cast<std::int8_t>(-drift);
-                        moveCell(x, y, x - drift, y);
-                        continue;
-                    }
-                    gasDrift_[index] = static_cast<std::int8_t>(-drift);
-                }
-            }
+      const int chunkY = y / chunkSize;
+      const int rowChunkOffset = gasChunkCount > 1
+                                     ? std::uniform_int_distribution<int>(
+                                           0, gasChunkCount - 1)(random_)
+                                     : 0;
+      for (int chunkStep = 0; chunkStep < gasChunkCount; ++chunkStep) {
+        const int chunkX =
+            firstChunkX + (chunkStep + rowChunkOffset) % gasChunkCount;
+        if (!materialChunkActive(chunkX * chunkSize, chunkY * chunkSize,
+                                 gasActivity)) {
+          continue;
         }
+        const int beginX = std::max(bounds.minX, chunkX * chunkSize);
+        const int endX = std::min(bounds.maxX, (chunkX + 1) * chunkSize);
+        const int rowWidth = endX - beginX;
+        const int rowOffset =
+            rowWidth > 1
+                ? std::uniform_int_distribution<int>(0, rowWidth - 1)(random_)
+                : 0;
+        for (int localStep = 0; localStep < rowWidth; ++localStep) {
+          const int rowPosition = (localStep + rowOffset) % rowWidth;
+          const int x =
+              scanRight ? beginX + rowPosition : endX - 1 - rowPosition;
+          const std::size_t index = indexOf(x, y);
+          if (moved_[index] != 0) {
+            continue;
+          }
+          const Material material = cells_[index];
+          if (material == Material::fire) {
+            markMaterialActive(x, y, gasActivity | thermalActivity);
+            heat_[index] = std::max(0.0F, heat_[index] - 0.045F);
+            constexpr std::array<Vec2, 4> neighbors{{
+                {-1.0F, 0.0F},
+                {1.0F, 0.0F},
+                {0.0F, -1.0F},
+                {0.0F, 1.0F},
+            }};
+            bool touchesWater = false;
+            for (Vec2 offset : neighbors) {
+              const int neighborX = x + static_cast<int>(offset.x);
+              const int neighborY = y + static_cast<int>(offset.y);
+              const Material neighbor = cell(neighborX, neighborY);
+              if (neighbor == Material::oil && percent(random_) < 48) {
+                heat_[indexOf(neighborX, neighborY)] = 1.0F;
+              } else if (neighbor == Material::wood && percent(random_) < 22) {
+                heat_[indexOf(neighborX, neighborY)] = 1.0F;
+              } else if (neighbor == Material::water) {
+                touchesWater = true;
+                heat_[indexOf(neighborX, neighborY)] *= 0.45F;
+              }
+            }
+            if (touchesWater) {
+              heat_[index] *= 0.55F;
+            }
+            if (heat_[index] < 0.10F) {
+              setCell(x, y, Material::smoke);
+              continue;
+            }
+            const int riseDirection = coin(random_) == 0 ? -1 : 1;
+            if (cell(x, y - 1) == Material::air ||
+                cell(x, y - 1) == Material::smoke) {
+              moveCell(x, y, x, y - 1);
+            } else if (cell(x + riseDirection, y - 1) == Material::air) {
+              moveCell(x, y, x + riseDirection, y - 1);
+            }
+          } else if (material == Material::smoke ||
+                     material == Material::steam) {
+            markMaterialActive(x, y, gasActivity | thermalActivity);
+            const bool steam = material == Material::steam;
+            heat_[index] *= steam ? 0.92F : 0.975F;
+            if (steam && heat_[index] < 0.055F) {
+              setCell(x, y, Material::water);
+              liquidAmount_[index] = maximumLiquidMass;
+              continue;
+            }
+            if (!steam) {
+              gasLifetime_[index] -= 1.0F / 30.0F;
+              if (gasLifetime_[index] <= 0.0F) {
+                setCell(x, y, Material::air);
+                continue;
+              }
+            }
+
+            int drift = static_cast<int>(gasDrift_[index]);
+            if (drift == 0) {
+              drift = coin(random_) == 0 ? -1 : 1;
+              gasDrift_[index] = static_cast<std::int8_t>(drift);
+            } else if (percent(random_) < (steam ? 4 : 7)) {
+              // Small independent eddies keep neighboring gas cells
+              // from locking into the same horizontal travel lane.
+              drift = -drift;
+              gasDrift_[index] = static_cast<std::int8_t>(drift);
+            }
+
+            const Material materialAbove = cell(x, y - 1);
+            const bool blockedByCeiling = materialAbove != Material::air &&
+                                          materialAbove != Material::fire &&
+                                          materialAbove != Material::smoke &&
+                                          materialAbove != Material::steam;
+            const int riseChance = steam ? 88 : 64;
+            if (percent(random_) < riseChance) {
+              // Persistent diagonal preference breaks up narrow vertical
+              // columns while still letting buoyancy dominate.
+              if (percent(random_) < 48 &&
+                  cell(x + drift, y - 1) == Material::air) {
+                moveCell(x, y, x + drift, y - 1);
+                continue;
+              }
+              if (cell(x, y - 1) == Material::air) {
+                moveCell(x, y, x, y - 1);
+                continue;
+              }
+              if (cell(x + drift, y - 1) == Material::air) {
+                moveCell(x, y, x + drift, y - 1);
+                continue;
+              }
+              if (cell(x - drift, y - 1) == Material::air) {
+                gasDrift_[index] = static_cast<std::int8_t>(-drift);
+                moveCell(x, y, x - drift, y - 1);
+                continue;
+              }
+            }
+
+            // Smoke fans out beneath ceilings and continues to meander
+            // laterally while rising through open rooms.
+            const int lateralChance =
+                blockedByCeiling ? (steam ? 58 : 76) : (steam ? 12 : 24);
+            if (percent(random_) < lateralChance) {
+              if (cell(x + drift, y) == Material::air) {
+                moveCell(x, y, x + drift, y);
+                continue;
+              }
+              if (cell(x - drift, y) == Material::air) {
+                gasDrift_[index] = static_cast<std::int8_t>(-drift);
+                moveCell(x, y, x - drift, y);
+                continue;
+              }
+              gasDrift_[index] = static_cast<std::int8_t>(-drift);
+            }
+          }
+        }
+      }
     }
     const auto gasAndReactionEnd =
         std::chrono::steady_clock::now();
@@ -2894,7 +3036,8 @@ void World::updateLiquids(const ActiveBounds& bounds, bool waterOnly) {
             index / static_cast<std::size_t>(width));
         if (x < bounds.minX || x >= bounds.maxX ||
             y < bounds.minY || y >= bounds.maxY ||
-            y >= height - 1 || !materialChunkActive(x, y)) {
+            y >= height - 1 ||
+            !materialChunkActive(x, y, liquidActivity)) {
             return false;
         }
         const Material material = cells_[index];
@@ -2929,8 +3072,6 @@ void World::updateLiquids(const ActiveBounds& bounds, bool waterOnly) {
         // Gather once from active chunks at the beginning of the material
         // tick. Later substeps advance a local frontier instead of rescanning
         // every active chunk.
-        constexpr int chunkColumns =
-            (width + chunkSize - 1) / chunkSize;
         const int firstChunkX = bounds.minX / chunkSize;
         const int finalChunkX =
             (bounds.maxX + chunkSize - 1) / chunkSize;
@@ -2940,9 +3081,10 @@ void World::updateLiquids(const ActiveBounds& bounds, bool waterOnly) {
             const int chunkY = y / chunkSize;
             for (int chunkX = firstChunkX; chunkX < finalChunkX;
                  ++chunkX) {
-                const std::size_t chunkIndex = static_cast<std::size_t>(
-                    chunkY * chunkColumns + chunkX);
-                if (materialChunkActivity_[chunkIndex] == 0) {
+                if (!materialChunkActive(
+                        chunkX * chunkSize,
+                        chunkY * chunkSize,
+                        liquidActivity)) {
                     continue;
                 }
                 const int beginX =
@@ -3172,7 +3314,8 @@ void World::updateLiquids(const ActiveBounds& bounds, bool waterOnly) {
                                        static_cast<std::size_t>(width));
         const int y = static_cast<int>(source /
                                        static_cast<std::size_t>(width));
-        if (!materialChunkActive(x, y)) {
+        if (!materialChunkActive(
+                x, y, liquidActivity)) {
             continue;
         }
         const Material material = cells_[source];
@@ -3383,7 +3526,8 @@ void World::prepareLiquidEqualization(const ActiveBounds& bounds) {
             // discovery only there avoids rebuilding every settled lake each
             // tick. Once seeded, traversal still follows the complete
             // connected liquid component through sleeping chunks.
-            if (!materialChunkActive(seedX, seedY)) {
+            if (!materialChunkActive(
+                    seedX, seedY, liquidActivity)) {
                 continue;
             }
             const std::size_t seed = indexOf(seedX, seedY);
@@ -3664,8 +3808,6 @@ void World::applyLiquidEqualizationPhase(
 
 void World::updateHeat() {
     const ActiveBounds bounds = activeBounds();
-    constexpr int chunkColumns =
-        (width + chunkSize - 1) / chunkSize;
     const int firstChunkX = bounds.minX / chunkSize;
     const int finalChunkX =
         (bounds.maxX + chunkSize - 1) / chunkSize;
@@ -3674,10 +3816,10 @@ void World::updateHeat() {
             const int chunkY = y / chunkSize;
             for (int chunkX = firstChunkX;
                  chunkX < finalChunkX; ++chunkX) {
-                const std::size_t chunkIndex =
-                    static_cast<std::size_t>(
-                        chunkY * chunkColumns + chunkX);
-                if (materialChunkActivity_[chunkIndex] == 0) {
+                if (!materialChunkActive(
+                        chunkX * chunkSize,
+                        chunkY * chunkSize,
+                        thermalActivity)) {
                     continue;
                 }
                 const int beginX =
@@ -3718,7 +3860,8 @@ void World::updateHeat() {
             }
             nextHeat_[index] = std::clamp(value, 0.0F, 1.0F);
             if (nextHeat_[index] > 0.015F) {
-                markMaterialActive(x, y);
+                markMaterialActive(
+                    x, y, thermalActivity);
             }
         });
     forEachActiveCell(

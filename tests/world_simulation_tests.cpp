@@ -149,6 +149,49 @@ int main() {
         return 1;
     }
 
+    gunpowder::World activityWorld;
+    constexpr int activityX = 100;
+    constexpr int activityY = 10;
+    activityWorld.clearMaterialActivityForTest();
+    activityWorld.setCellForTest(
+        activityX, activityY, gunpowder::Material::water);
+    const auto waterActivity =
+        activityWorld.materialActivityForTest(
+            activityX, activityY);
+    if (waterActivity[0] || !waterActivity[1] ||
+        waterActivity[2] || !waterActivity[3]) {
+        std::cerr << "Water woke unrelated material systems\n";
+        return 1;
+    }
+
+    activityWorld.setCellForTest(
+        activityX, activityY, gunpowder::Material::air);
+    activityWorld.clearMaterialActivityForTest();
+    activityWorld.setCellForTest(
+        activityX, activityY, gunpowder::Material::smoke);
+    const auto smokeActivity =
+        activityWorld.materialActivityForTest(
+            activityX, activityY);
+    if (smokeActivity[0] || smokeActivity[1] ||
+        !smokeActivity[2] || !smokeActivity[3]) {
+        std::cerr << "Smoke woke unrelated material systems\n";
+        return 1;
+    }
+
+    activityWorld.setCellForTest(
+        activityX, activityY, gunpowder::Material::air);
+    activityWorld.clearMaterialActivityForTest();
+    activityWorld.setCellForTest(
+        activityX, activityY, gunpowder::Material::sand);
+    const auto topologyActivity =
+        activityWorld.materialActivityForTest(
+            activityX, activityY);
+    if (!topologyActivity[0] || !topologyActivity[1] ||
+        !topologyActivity[2] || !topologyActivity[3]) {
+        std::cerr << "A changed solid boundary did not wake its neighbors\n";
+        return 1;
+    }
+
     gunpowder::SparseGrid<std::uint8_t> streamedState(
         4096, 2048, 0);
     const std::size_t distantState =

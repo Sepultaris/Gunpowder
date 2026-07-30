@@ -13,7 +13,8 @@ The current milestone includes:
 - compact diffuse/specular/metallic material shading with GGX highlights and
   thickness-aware marble subsurface scattering
 - flow-aware metaball skins for water and oil, with gradient-derived normals,
-  Fresnel reflections, depth absorption, subsurface color, and caustics
+  Fresnel reflections, depth absorption, subsurface color, and caustics;
+  lighting transmits straight through liquids without refracting ray paths
 - named, human-readable rendering profiles for lighting and material looks
 - visible-region texture uploads instead of full-world transfers
 - fixed-timestep gameplay

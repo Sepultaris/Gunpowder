@@ -1780,7 +1780,7 @@ void main() {
         // wavelength-dependent transmission. Water adds no opaque blue
         // diffuse body; its blue appearance emerges only as red and green
         // light are absorbed with increasing depth.
-        float refractiveVariation =
+        float transmissionVariation =
             mix(0.96, 1.04,
                 smoothNoise(
                     absoluteWorldPosition *
@@ -1789,11 +1789,11 @@ void main() {
                          -camera.time * 0.009)));
         vec3 emptyRoomColor =
             palette(0u, worldCell) * illumination;
-        vec3 refractedRoom =
+        vec3 transmittedRoom =
             emptyRoomColor *
             liquidTransmission *
-            refractiveVariation;
-        vec3 liquidBody = refractedRoom;
+            transmissionVariation;
+        vec3 liquidBody = transmittedRoom;
         if (material == 5u) {
             // Oil contains suspended pigment and remains visibly denser than
             // clear water, but even it approaches opacity gradually.
@@ -1802,7 +1802,7 @@ void main() {
             float oilOpacity =
                 clamp(oilDepthResponse * 0.64, 0.0, 0.76);
             liquidBody = mix(
-                refractedRoom,
+                transmittedRoom,
                 baseColor * illumination * 0.30,
                 oilOpacity);
         }

@@ -172,29 +172,18 @@ uint materialAtPosition(vec2 position, ivec2 extent) {
     return texelFetch(materialTexture, cell, 0).r;
 }
 
-float inspectStraightLightPath(
+float traceStraightLightSegment(
     vec2 startPosition, vec2 targetPosition,
-    float solidTransmission, ivec2 extent,
-    out int liquidInterfaceCount, out vec2 interfacePosition,
-    out ivec2 interfaceLiquidCell, out uint incidentMaterial,
-    out uint transmittedMaterial) {
+    float solidTransmission, ivec2 extent) {
     vec2 displacement = targetPosition - startPosition;
     float pathLength = length(displacement);
-    liquidInterfaceCount = 0;
-    interfacePosition = startPosition;
-    interfaceLiquidCell = ivec2(floor(startPosition));
-    incidentMaterial = materialAtPosition(startPosition, extent);
-    transmittedMaterial = incidentMaterial;
     if (pathLength < 0.001) {
         return 1.0;
     }
 
     vec2 direction = displacement / pathLength;
     vec2 position = startPosition;
-    vec2 previousPosition = position;
     ivec2 previousCell = ivec2(floor(position));
-    uint previousMaterial =
-        materialAtPosition(position, extent);
     float visibility = 1.0;
     float traveled = 0.0;
     for (int step = 0; step < 2048; ++step) {
@@ -202,7 +191,6 @@ float inspectStraightLightPath(
         if (advance <= 0.0001) {
             break;
         }
-        previousPosition = position;
         position += direction * advance;
         traveled += advance;
         ivec2 cell = ivec2(floor(position));
@@ -227,42 +215,12 @@ float inspectStraightLightPath(
             visibility *= 0.988;
         }
 
-        float previousIor = mediumIor(previousMaterial);
-        float nextIor = mediumIor(material);
-        if (abs(previousIor - nextIor) > 0.001 &&
-            (isLiquid(previousMaterial) || isLiquid(material))) {
-            ++liquidInterfaceCount;
-            if (liquidInterfaceCount == 1) {
-                interfacePosition =
-                    (previousPosition + position) * 0.5;
-                interfaceLiquidCell =
-                    isLiquid(material) ? cell : previousCell;
-                incidentMaterial = previousMaterial;
-                transmittedMaterial = material;
-            }
-        }
         previousCell = cell;
-        previousMaterial = material;
         if (visibility < 0.002 || traveled >= pathLength) {
             break;
         }
     }
     return visibility;
-}
-
-float traceStraightLightSegment(
-    vec2 startPosition, vec2 targetPosition,
-    float solidTransmission, ivec2 extent) {
-    int ignoredInterfaceCount;
-    vec2 ignoredInterfacePosition;
-    ivec2 ignoredLiquidCell;
-    uint ignoredIncidentMaterial;
-    uint ignoredTransmittedMaterial;
-    return inspectStraightLightPath(
-        startPosition, targetPosition, solidTransmission, extent,
-        ignoredInterfaceCount, ignoredInterfacePosition,
-        ignoredLiquidCell, ignoredIncidentMaterial,
-        ignoredTransmittedMaterial);
 }
 
 float traceVisibility(
@@ -273,108 +231,11 @@ float traceVisibility(
         absoluteLightPosition -
         vec2(trace.originAndOptions.xy);
     vec2 startPosition = vec2(startCell) + vec2(0.5);
-    int interfaceCount;
-    vec2 initialInterfacePosition;
-    ivec2 liquidCell;
-    uint incidentMaterial;
-    uint transmittedMaterial;
-    float straightVisibility = inspectStraightLightPath(
-        startPosition, targetPosition, solidTransmission, extent,
-        interfaceCount, initialInterfacePosition, liquidCell,
-        incidentMaterial, transmittedMaterial);
-    if (straightVisibility <= 0.0 || interfaceCount != 1) {
-        // Zero interfaces need no optical solve. Multiple interfaces require
-        // a more expensive multi-surface path search; straight visibility is
-        // stable and preferable to a fabricated connection.
-        return straightVisibility;
-    }
-
-    uint liquidMaterial =
-        isLiquid(incidentMaterial)
-            ? incidentMaterial
-            : transmittedMaterial;
-    vec2 geometricDirection =
-        normalize(targetPosition - startPosition);
-    vec2 interfaceNormal = surfaceNormal(
-        liquidCell, extent, liquidMaterial, geometricDirection);
-    vec2 tangent =
-        vec2(-interfaceNormal.y, interfaceNormal.x);
-    float startTangent =
-        dot(startPosition - initialInterfacePosition, tangent);
-    float targetTangent =
-        dot(targetPosition - initialInterfacePosition, tangent);
-    float startHeight = abs(dot(
-        startPosition - initialInterfacePosition,
-        interfaceNormal));
-    float targetHeight = abs(dot(
-        targetPosition - initialInterfacePosition,
-        interfaceNormal));
-    if (startHeight < 0.02 || targetHeight < 0.02) {
-        return straightVisibility;
-    }
-
-    float incidentIor = mediumIor(incidentMaterial);
-    float transmittedIor = mediumIor(transmittedMaterial);
-    float lower = min(startTangent, targetTangent);
-    float upper = max(startTangent, targetTangent);
-    for (int iteration = 0; iteration < 14; ++iteration) {
-        float candidate = (lower + upper) * 0.5;
-        float incidentSlope =
-            (candidate - startTangent) /
-            sqrt((candidate - startTangent) *
-                     (candidate - startTangent) +
-                 startHeight * startHeight);
-        float transmittedSlope =
-            (candidate - targetTangent) /
-            sqrt((candidate - targetTangent) *
-                     (candidate - targetTangent) +
-                 targetHeight * targetHeight);
-        float derivative =
-            incidentIor * incidentSlope +
-            transmittedIor * transmittedSlope;
-        if (derivative < 0.0) {
-            lower = candidate;
-        } else {
-            upper = candidate;
-        }
-    }
-    float crossingTangent = (lower + upper) * 0.5;
-    // The local cell normal is only a trustworthy surface approximation near
-    // the originally observed crossing.
-    crossingTangent = clamp(
-        crossingTangent, -24.0, 24.0);
-    vec2 crossingPosition =
-        initialInterfacePosition +
-        tangent * crossingTangent;
-    vec2 incomingDirection =
-        normalize(crossingPosition - startPosition);
-    vec2 outgoingDirection =
-        normalize(targetPosition - crossingPosition);
-    vec2 refractionNormal = interfaceNormal;
-    if (dot(refractionNormal, incomingDirection) > 0.0) {
-        refractionNormal = -refractionNormal;
-    }
-    vec2 refractedDirection = refract(
-        incomingDirection, refractionNormal,
-        incidentIor / transmittedIor);
-    if (length(refractedDirection) < 0.001 ||
-        dot(normalize(refractedDirection), outgoingDirection) < 0.992) {
-        return straightVisibility;
-    }
-
-    vec2 incidentEnd =
-        crossingPosition - incomingDirection * 0.06;
-    vec2 transmittedStart =
-        crossingPosition + outgoingDirection * 0.06;
-    float incidentVisibility = traceStraightLightSegment(
-        startPosition, incidentEnd, solidTransmission, extent);
-    float transmittedVisibility = traceStraightLightSegment(
-        transmittedStart, targetPosition, solidTransmission, extent);
-    float fresnel = interfaceFresnel(
-        incomingDirection, refractionNormal,
-        incidentIor, transmittedIor);
-    return incidentVisibility * transmittedVisibility *
-           (1.0 - fresnel);
+    // Liquids attenuate direct light but no longer alter its direction.
+    // Keeping the straight path avoids unstable, surface-dependent shadow
+    // angles while preserving absorption through water, oil, smoke, and steam.
+    return traceStraightLightSegment(
+        startPosition, targetPosition, solidTransmission, extent);
 }
 
 float traceSunMediaTransmittance(ivec2 startCell) {
@@ -690,11 +551,6 @@ float traceRefractedSunVisibility(ivec2 startCell) {
 float traceSunVisibility(ivec2 startCell) {
     if (trace.celestial.z <= 0.0001) {
         return 0.0;
-    }
-    float refractedVisibility =
-        traceRefractedSunVisibility(startCell);
-    if (refractedVisibility >= 0.0) {
-        return refractedVisibility;
     }
     float worldVisibility =
         float(imageLoad(derivedImage, startCell).a) / 255.0;
@@ -1039,8 +895,8 @@ vec3 traceGlobalIllumination(
     uint centerMaterial =
         texelFetch(materialTexture, cell, 0).r;
     // Solid GI starts in the outward hemisphere. Liquid GI starts inside the
-    // medium and samples all directions so transmitted paths can leave
-    // through the refractive interface instead of behaving like a mirror.
+    // medium and samples all directions so straight transmitted paths can
+    // leave through the transparent interface.
     bool surfaceCell = isSolid(centerMaterial);
     vec2 fallback = vec2(0.0, 1.0);
     vec2 initialNormal =
@@ -1096,42 +952,17 @@ vec3 traceGlobalIllumination(
             vec2 boundaryPosition =
                 position + direction * hitDistance;
             if (isLiquid(hitMaterial)) {
-                uint transmittedMaterial =
-                    isLiquid(incidentMaterial)
-                        ? texelFetch(
-                              materialTexture, openCell, 0).r
-                        : hitMaterial;
-                float incidentIor =
-                    mediumIor(incidentMaterial);
-                float transmittedIor =
-                    mediumIor(transmittedMaterial);
-                vec2 normal =
-                    surfaceNormal(
-                        hitCell, extent, hitMaterial, direction);
-                if (dot(normal, direction) > 0.0) {
-                    normal = -normal;
-                }
-                vec2 refracted = refract(
-                    direction, normal,
-                    incidentIor / transmittedIor);
-                float fresnel = interfaceFresnel(
-                    direction, normal,
-                    incidentIor, transmittedIor);
-                if (length(refracted) < 0.001) {
-                    direction =
-                        normalize(reflect(direction, normal));
-                } else {
-                    direction = normalize(refracted);
-                    throughput *= 1.0 - fresnel;
-                }
+                // Transparent liquid boundaries preserve the incoming ray
+                // direction. Absorption is accumulated while marching inside
+                // the liquid, but the interface creates no bent GI path.
                 position =
                     boundaryPosition + direction * 0.10;
                 if (max(throughput.r,
                         max(throughput.g, throughput.b)) < 0.015) {
                     break;
                 }
-                // Transparent interfaces alter the path but do not consume
-                // an indirect diffuse bounce.
+                // Transparent interfaces do not consume an indirect diffuse
+                // bounce.
                 continue;
             }
 

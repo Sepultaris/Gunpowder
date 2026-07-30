@@ -33,6 +33,8 @@ struct MaterialSimulationTimings {
     std::uint32_t activeLiquidChunks = 0;
     std::uint32_t activeGasChunks = 0;
     std::uint32_t activeThermalChunks = 0;
+    std::uint32_t activeLiquidMicrotiles = 0;
+    std::uint32_t activeThermalMicrotiles = 0;
     std::uint32_t liquidPreparationCellVisits = 0;
     std::uint32_t liquidHeadSummaryHits = 0;
     std::uint32_t liquidEqualizationSeedVisits = 0;
@@ -219,6 +221,8 @@ public:
     void clearMaterialActivityForTest();
     [[nodiscard]] std::array<bool, 4>
     materialActivityForTest(int x, int y) const;
+    [[nodiscard]] std::array<bool, 4>
+    materialMicrotileActivityForTest(int x, int y) const;
     [[nodiscard]] std::uint8_t
     liquidHeadDepthForTest(int x, int y) const {
         return x >= 0 && x < width &&
@@ -263,10 +267,19 @@ private:
         granularActivity | liquidActivity |
         gasActivity | thermalActivity;
     static constexpr std::size_t materialActivitySystemCount = 4;
+    static constexpr int materialMicrotileSize = 8;
+    static constexpr int materialMicrotilesPerAxis =
+        chunkSize / materialMicrotileSize;
+    static constexpr int materialMicrotilesPerChunk =
+        materialMicrotilesPerAxis * materialMicrotilesPerAxis;
+    static_assert(chunkSize % materialMicrotileSize == 0);
+    static_assert(materialMicrotilesPerChunk == 64);
 
     struct MaterialChunkActivity {
         std::array<std::uint8_t,
                    materialActivitySystemCount> lifetime{};
+        std::array<std::uint64_t,
+                   materialActivitySystemCount> microtiles{};
     };
 
     struct LiquidChunkColumnSummary {
@@ -289,6 +302,9 @@ private:
         int x, int y,
         std::uint8_t activityMask = allMaterialActivity);
     [[nodiscard]] bool materialChunkActive(
+        int x, int y,
+        std::uint8_t activityMask = allMaterialActivity) const;
+    [[nodiscard]] bool materialMicrotileActive(
         int x, int y,
         std::uint8_t activityMask = allMaterialActivity) const;
     void ageMaterialChunks();
@@ -359,6 +375,7 @@ private:
     SparseGrid<std::uint32_t> liquidComponentStamp_;
     std::vector<std::size_t> liquidWorklist_;
     std::vector<std::size_t> liquidNextWorklist_;
+    std::vector<std::size_t> thermalWorklist_;
     std::uint32_t liquidFrontierGeneration_ = 0;
     std::uint32_t liquidComponentGeneration_ = 0;
     bool rebuildLiquidWorklist_ = true;

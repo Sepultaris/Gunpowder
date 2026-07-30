@@ -163,6 +163,36 @@ int main() {
         std::cerr << "Water woke unrelated material systems\n";
         return 1;
     }
+    const auto waterMicrotile =
+        activityWorld.materialMicrotileActivityForTest(
+            activityX, activityY);
+    const auto distantMicrotile =
+        activityWorld.materialMicrotileActivityForTest(
+            activityX + 24, activityY);
+    if (waterMicrotile[0] || !waterMicrotile[1] ||
+        waterMicrotile[2] || !waterMicrotile[3] ||
+        distantMicrotile[0] || distantMicrotile[1] ||
+        distantMicrotile[2] || distantMicrotile[3]) {
+        std::cerr << "Material wake escaped its microtile halo\n";
+        return 1;
+    }
+
+    constexpr int microtileBoundaryX = 64;
+    activityWorld.clearMaterialActivityForTest();
+    activityWorld.setCellForTest(
+        microtileBoundaryX, activityY,
+        gunpowder::Material::water);
+    if (!activityWorld.materialMicrotileActivityForTest(
+             microtileBoundaryX - 8, activityY)[1] ||
+        !activityWorld.materialMicrotileActivityForTest(
+             microtileBoundaryX, activityY)[1] ||
+        !activityWorld.materialMicrotileActivityForTest(
+             microtileBoundaryX + 8, activityY)[1] ||
+        activityWorld.materialMicrotileActivityForTest(
+            microtileBoundaryX + 24, activityY)[1]) {
+        std::cerr << "Microtile halo did not cross a chunk boundary\n";
+        return 1;
+    }
 
     activityWorld.setCellForTest(
         activityX, activityY, gunpowder::Material::air);
@@ -211,9 +241,13 @@ int main() {
     }
     chunkHeadWorld.setCellForTest(
         headColumnX, 0, gunpowder::Material::air);
+    chunkHeadWorld.setCellForTest(
+        headColumnX, 64, gunpowder::Material::air);
     chunkHeadWorld.clearMaterialActivityForTest();
     chunkHeadWorld.setCellForTest(
         headColumnX, 0, gunpowder::Material::water);
+    chunkHeadWorld.setCellForTest(
+        headColumnX, 64, gunpowder::Material::water);
     gunpowder::InputState chunkHeadInput;
     chunkHeadWorld.update(1.0F / 30.0F, chunkHeadInput);
     if (chunkHeadWorld.liquidHeadDepthForTest(

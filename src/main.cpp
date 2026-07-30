@@ -567,6 +567,10 @@ bool drawDeveloperUi(bool* open,
             materialTimings.activeGasChunks,
             materialTimings.activeThermalChunks);
         ImGui::TextDisabled(
+            "Microtiles: liquid %u | thermal %u",
+            materialTimings.activeLiquidMicrotiles,
+            materialTimings.activeThermalMicrotiles);
+        ImGui::TextDisabled(
             "Liquid prep %u cells | Edge cache %u columns | "
             "Equalization seeds %u cells",
             materialTimings.liquidPreparationCellVisits,

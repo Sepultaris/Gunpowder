@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <limits>
@@ -117,6 +118,7 @@ void World::regenerate() {
     liquidComponentGeneration_ = 0;
     liquidWorklist_.clear();
     liquidNextWorklist_.clear();
+    thermalWorklist_.clear();
     liquidReservedCells_.clear();
     for (auto& summary : liquidChunkColumnSummaries_) {
         summary.reset();
@@ -981,23 +983,34 @@ void World::markMaterialActive(
     }
     constexpr int chunkColumns =
         (width + chunkSize - 1) / chunkSize;
-    constexpr int chunkRows =
-        (height + chunkSize - 1) / chunkSize;
-    const int centerChunkX = std::clamp(x / chunkSize, 0,
-                                        chunkColumns - 1);
-    const int centerChunkY = std::clamp(y / chunkSize, 0,
-                                        chunkRows - 1);
+    // Wake the touched microtile and a one-tile halo. Sampling one tile away
+    // naturally crosses a chunk boundary only when the source is close
+    // enough to affect it, unlike the old unconditional 3x3 chunk wake.
     for (int offsetY = -1; offsetY <= 1; ++offsetY) {
         for (int offsetX = -1; offsetX <= 1; ++offsetX) {
-            const int chunkX = centerChunkX + offsetX;
-            const int chunkY = centerChunkY + offsetY;
-            if (chunkX < 0 || chunkX >= chunkColumns ||
-                chunkY < 0 || chunkY >= chunkRows) {
-                continue;
-            }
+            const int wakeX = std::clamp(
+                x + offsetX * materialMicrotileSize,
+                0, width - 1);
+            const int wakeY = std::clamp(
+                y + offsetY * materialMicrotileSize,
+                0, height - 1);
+            const int chunkX = wakeX / chunkSize;
+            const int chunkY = wakeY / chunkSize;
             const std::size_t chunkIndex =
                 static_cast<std::size_t>(
                     chunkY * chunkColumns + chunkX);
+            const int localX = wakeX - chunkX * chunkSize;
+            const int localY = wakeY - chunkY * chunkSize;
+            const int microtileX =
+                localX / materialMicrotileSize;
+            const int microtileY =
+                localY / materialMicrotileSize;
+            const std::uint64_t microtileBit =
+                std::uint64_t{1}
+                << static_cast<unsigned int>(
+                       microtileY *
+                           materialMicrotilesPerAxis +
+                       microtileX);
             auto& activity =
                 materialChunkActivity_[chunkIndex];
             for (std::size_t system = 0;
@@ -1008,6 +1021,8 @@ void World::markMaterialActive(
                     activity.lifetime[system] =
                         std::max<std::uint8_t>(
                             activity.lifetime[system], 8);
+                    activity.microtiles[system] |=
+                        microtileBit;
                 }
             }
         }
@@ -1036,12 +1051,55 @@ bool World::materialChunkActive(
     return false;
 }
 
+bool World::materialMicrotileActive(
+    int x, int y, std::uint8_t activityMask) const {
+    constexpr int chunkColumns =
+        (width + chunkSize - 1) / chunkSize;
+    if (x < 0 || x >= width || y < 0 || y >= height) {
+        return false;
+    }
+    const int chunkX = x / chunkSize;
+    const int chunkY = y / chunkSize;
+    const int microtileX =
+        (x - chunkX * chunkSize) /
+        materialMicrotileSize;
+    const int microtileY =
+        (y - chunkY * chunkSize) /
+        materialMicrotileSize;
+    const std::uint64_t microtileBit =
+        std::uint64_t{1}
+        << static_cast<unsigned int>(
+               microtileY * materialMicrotilesPerAxis +
+               microtileX);
+    const auto& activity =
+        materialChunkActivity_[static_cast<std::size_t>(
+            chunkY * chunkColumns + chunkX)];
+    for (std::size_t system = 0;
+         system < materialActivitySystemCount; ++system) {
+        const std::uint8_t systemMask =
+            static_cast<std::uint8_t>(1U << system);
+        if ((activityMask & systemMask) != 0 &&
+            activity.lifetime[system] != 0 &&
+            (activity.microtiles[system] &
+             microtileBit) != 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void World::ageMaterialChunks() {
     for (MaterialChunkActivity& activity :
          materialChunkActivity_) {
-        for (std::uint8_t& lifetime : activity.lifetime) {
+        for (std::size_t system = 0;
+             system < materialActivitySystemCount; ++system) {
+            std::uint8_t& lifetime =
+                activity.lifetime[system];
             if (lifetime > 0) {
                 --lifetime;
+                if (lifetime == 0) {
+                    activity.microtiles[system] = 0;
+                }
             }
         }
     }
@@ -1061,6 +1119,16 @@ std::array<bool, 4> World::materialActivityForTest(
         materialChunkActive(x, y, liquidActivity),
         materialChunkActive(x, y, gasActivity),
         materialChunkActive(x, y, thermalActivity),
+    };
+}
+
+std::array<bool, 4> World::materialMicrotileActivityForTest(
+    int x, int y) const {
+    return {
+        materialMicrotileActive(x, y, granularActivity),
+        materialMicrotileActive(x, y, liquidActivity),
+        materialMicrotileActive(x, y, gasActivity),
+        materialMicrotileActive(x, y, thermalActivity),
     };
 }
 #endif
@@ -2590,6 +2658,8 @@ void World::updateMaterials() {
     currentEqualizedComponents_ = 0;
     currentEqualizedCells_ = 0;
     rebuildLiquidWorklist_ = true;
+    constexpr int chunkColumns =
+        (width + chunkSize - 1) / chunkSize;
     const int firstChunkX = bounds.minX / chunkSize;
     const int finalChunkX =
         (bounds.maxX + chunkSize - 1) / chunkSize;
@@ -2601,6 +2671,14 @@ void World::updateMaterials() {
     std::uint32_t activeLiquidChunkCount = 0;
     std::uint32_t activeGasChunkCount = 0;
     std::uint32_t activeThermalChunkCount = 0;
+    std::uint32_t activeLiquidMicrotileCount = 0;
+    std::uint32_t activeThermalMicrotileCount = 0;
+    constexpr std::size_t liquidSystem =
+        std::countr_zero(
+            static_cast<unsigned int>(liquidActivity));
+    constexpr std::size_t thermalSystem =
+        std::countr_zero(
+            static_cast<unsigned int>(thermalActivity));
     for (int chunkY = firstChunkY; chunkY < finalChunkY; ++chunkY) {
         for (int chunkX = firstChunkX; chunkX < finalChunkX; ++chunkX) {
             const int sampleX = chunkX * chunkSize;
@@ -2619,6 +2697,18 @@ void World::updateMaterials() {
             activeLiquidChunkCount += liquid ? 1U : 0U;
             activeGasChunkCount += gas ? 1U : 0U;
             activeThermalChunkCount += thermal ? 1U : 0U;
+            const auto& activity =
+                materialChunkActivity_[
+                    static_cast<std::size_t>(
+                        chunkY * chunkColumns + chunkX)];
+            activeLiquidMicrotileCount +=
+                static_cast<std::uint32_t>(
+                    std::popcount(
+                        activity.microtiles[liquidSystem]));
+            activeThermalMicrotileCount +=
+                static_cast<std::uint32_t>(
+                    std::popcount(
+                        activity.microtiles[thermalSystem]));
         }
     }
     materialSimulationTimings_.activeChunks = activeChunkCount;
@@ -2630,6 +2720,10 @@ void World::updateMaterials() {
         activeGasChunkCount;
     materialSimulationTimings_.activeThermalChunks =
         activeThermalChunkCount;
+    materialSimulationTimings_.activeLiquidMicrotiles =
+        activeLiquidMicrotileCount;
+    materialSimulationTimings_.activeThermalMicrotiles =
+        activeThermalMicrotileCount;
     for (int chunkY = firstChunkY; chunkY < finalChunkY; ++chunkY) {
         for (int chunkX = firstChunkX; chunkX < finalChunkX; ++chunkX) {
             if (!materialChunkActive(
@@ -3164,7 +3258,8 @@ void World::updateLiquids(const ActiveBounds& bounds, bool waterOnly) {
         if (x < bounds.minX || x >= bounds.maxX ||
             y < bounds.minY || y >= bounds.maxY ||
             y >= height - 1 ||
-            !materialChunkActive(x, y, liquidActivity)) {
+            !materialMicrotileActive(
+                x, y, liquidActivity)) {
             return false;
         }
         const Material material = cells_[index];
@@ -3214,21 +3309,40 @@ void World::updateLiquids(const ActiveBounds& bounds, bool waterOnly) {
                         liquidActivity)) {
                     continue;
                 }
-                const int beginX =
-                    std::max(bounds.minX, chunkX * chunkSize);
-                const int endX = std::min(
-                    bounds.maxX, (chunkX + 1) * chunkSize);
-                for (int x = beginX; x < endX; ++x) {
-                    moved_.set(indexOf(x, y), 0);
-                }
-                if (y >= height - 1) {
-                    continue;
-                }
-                for (int x = beginX; x < endX; ++x) {
-                    const std::size_t index = indexOf(x, y);
-                    if (liquidEqualizationReservation_[index] == 0 &&
-                        isCandidate(index)) {
-                        liquidWorklist_.push_back(index);
+                const int chunkOriginX =
+                    chunkX * chunkSize;
+                for (int microtileX = 0;
+                     microtileX < materialMicrotilesPerAxis;
+                     ++microtileX) {
+                    const int tileOriginX =
+                        chunkOriginX +
+                        microtileX *
+                            materialMicrotileSize;
+                    const int beginX = std::max(
+                        bounds.minX, tileOriginX);
+                    const int endX = std::min(
+                        bounds.maxX,
+                        tileOriginX +
+                            materialMicrotileSize);
+                    if (beginX >= endX ||
+                        !materialMicrotileActive(
+                            beginX, y, liquidActivity)) {
+                        continue;
+                    }
+                    for (int x = beginX; x < endX; ++x) {
+                        moved_.set(indexOf(x, y), 0);
+                    }
+                    if (y >= height - 1) {
+                        continue;
+                    }
+                    for (int x = beginX; x < endX; ++x) {
+                        const std::size_t index =
+                            indexOf(x, y);
+                        if (liquidEqualizationReservation_[index] ==
+                                0 &&
+                            isCandidate(index)) {
+                            liquidWorklist_.push_back(index);
+                        }
                     }
                 }
             }
@@ -3441,7 +3555,7 @@ void World::updateLiquids(const ActiveBounds& bounds, bool waterOnly) {
                                        static_cast<std::size_t>(width));
         const int y = static_cast<int>(source /
                                        static_cast<std::size_t>(width));
-        if (!materialChunkActive(
+        if (!materialMicrotileActive(
                 x, y, liquidActivity)) {
             continue;
         }
@@ -3665,9 +3779,24 @@ void World::prepareLiquidEqualization(const ActiveBounds& bounds) {
                                      liquidActivity)) {
                 continue;
             }
-            const int beginX = std::max(bounds.minX, chunkX * chunkSize);
-            const int endX = std::min(bounds.maxX, (chunkX + 1) * chunkSize);
-            for (int seedX = beginX; seedX < endX; ++seedX) {
+            const int chunkOriginX = chunkX * chunkSize;
+            for (int microtileX = 0;
+                 microtileX < materialMicrotilesPerAxis;
+                 ++microtileX) {
+                const int tileOriginX =
+                    chunkOriginX +
+                    microtileX * materialMicrotileSize;
+                const int beginX =
+                    std::max(bounds.minX, tileOriginX);
+                const int endX = std::min(
+                    bounds.maxX,
+                    tileOriginX + materialMicrotileSize);
+                if (beginX >= endX ||
+                    !materialMicrotileActive(
+                        beginX, seedY, liquidActivity)) {
+                    continue;
+                }
+                for (int seedX = beginX; seedX < endX; ++seedX) {
                 if (currentLiquidEqualizationSeedVisits_ <
                     std::numeric_limits<std::uint32_t>::max()) {
                     ++currentLiquidEqualizationSeedVisits_;
@@ -3835,6 +3964,7 @@ void World::prepareLiquidEqualization(const ActiveBounds& bounds) {
                     ++transfers;
                 }
             }
+            }
         }
     }
 }
@@ -3942,19 +4072,38 @@ void World::updateHeat() {
                         thermalActivity)) {
                     continue;
                 }
-                const int beginX =
-                    std::max(bounds.minX, chunkX * chunkSize);
-                const int endX = std::min(
-                    bounds.maxX, (chunkX + 1) * chunkSize);
-                for (int x = beginX; x < endX; ++x) {
-                    operation(x, y, indexOf(x, y));
+                const int chunkOriginX =
+                    chunkX * chunkSize;
+                for (int microtileX = 0;
+                     microtileX < materialMicrotilesPerAxis;
+                     ++microtileX) {
+                    const int tileOriginX =
+                        chunkOriginX +
+                        microtileX *
+                            materialMicrotileSize;
+                    const int beginX =
+                        std::max(bounds.minX, tileOriginX);
+                    const int endX = std::min(
+                        bounds.maxX,
+                        tileOriginX +
+                            materialMicrotileSize);
+                    if (beginX >= endX ||
+                        !materialMicrotileActive(
+                            beginX, y, thermalActivity)) {
+                        continue;
+                    }
+                    for (int x = beginX; x < endX; ++x) {
+                        operation(x, y, indexOf(x, y));
+                    }
                 }
             }
         }
     };
 
+    thermalWorklist_.clear();
     forEachActiveCell(
         [&](int x, int y, std::size_t index) {
+            thermalWorklist_.push_back(index);
             float neighborHeat = 0.0F;
             int neighborCount = 0;
             constexpr std::array<Vec2, 4> offsets{{
@@ -3984,10 +4133,9 @@ void World::updateHeat() {
                     x, y, thermalActivity);
             }
         });
-    forEachActiveCell(
-        [&](int, int, std::size_t index) {
-            heat_[index] = nextHeat_[index];
-        });
+    for (std::size_t index : thermalWorklist_) {
+        heat_[index] = nextHeat_[index];
+    }
 
     std::uniform_int_distribution<int> percent(0, 99);
     constexpr std::array<Vec2, 4> combustionNeighbors{{
@@ -4010,7 +4158,7 @@ void World::updateHeat() {
         }
     };
 
-    forEachActiveCell(
+    const auto updateCombustion =
         [&](int x, int y, std::size_t index) {
             const Material material = cells_[index];
             if (material == Material::water) {
@@ -4079,7 +4227,14 @@ void World::updateHeat() {
                     emitFlame(x, y);
                 }
             }
-        });
+        };
+    for (std::size_t index : thermalWorklist_) {
+        const int x = static_cast<int>(
+            index % static_cast<std::size_t>(width));
+        const int y = static_cast<int>(
+            index / static_cast<std::size_t>(width));
+        updateCombustion(x, y, index);
+    }
     ageMaterialChunks();
 }
 

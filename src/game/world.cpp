@@ -4507,9 +4507,6 @@ void World::updateLiquids(const ActiveBounds& bounds, bool waterOnly) {
                     job.candidates.end());
             }
         }
-        std::sort(
-            liquidWorklist_.begin(),
-            liquidWorklist_.end());
         rebuildLiquidWorklist_ = false;
     } else {
         // Generation-stamped insertion keeps this frontier unique without a
@@ -4564,31 +4561,54 @@ void World::updateLiquids(const ActiveBounds& bounds, bool waterOnly) {
                 candidates.begin(),
                 candidates.end());
         }
-        std::sort(
-            liquidWorklist_.begin(),
-            liquidWorklist_.end());
     }
-    // Preserve bottom-to-top row traversal while avoiding a persistent
-    // left/right bias within a row.
-    for (std::size_t rowBegin = 0;
-         rowBegin < liquidWorklist_.size();) {
+
+    // Downstream gravity needs rows in top-to-bottom order, but x order is
+    // deliberately randomized. A counting pass over the small active row
+    // range is linear and avoids comparison-sorting tens of thousands of
+    // candidates only to shuffle each row immediately afterward.
+    const int activeRowCount =
+        std::max(0, bounds.maxY - bounds.minY);
+    std::vector<std::size_t> rowOffsets(
+        static_cast<std::size_t>(activeRowCount) + 1, 0);
+    for (std::size_t index : liquidWorklist_) {
         const int row = static_cast<int>(
-            liquidWorklist_[rowBegin] /
-            static_cast<std::size_t>(width));
-        std::size_t rowEnd = rowBegin + 1;
-        while (rowEnd < liquidWorklist_.size() &&
-               static_cast<int>(
-                   liquidWorklist_[rowEnd] /
-                   static_cast<std::size_t>(width)) == row) {
-            ++rowEnd;
+            index / static_cast<std::size_t>(width)) -
+            bounds.minY;
+        if (row >= 0 && row < activeRowCount) {
+            ++rowOffsets[static_cast<std::size_t>(row) + 1];
         }
+    }
+    for (std::size_t row = 1;
+         row < rowOffsets.size(); ++row) {
+        rowOffsets[row] += rowOffsets[row - 1];
+    }
+    std::vector<std::size_t> rowWriteOffsets = rowOffsets;
+    std::vector<std::size_t> rowOrderedWorklist(
+        liquidWorklist_.size());
+    for (std::size_t index : liquidWorklist_) {
+        const int row = static_cast<int>(
+            index / static_cast<std::size_t>(width)) -
+            bounds.minY;
+        if (row < 0 || row >= activeRowCount) {
+            continue;
+        }
+        rowOrderedWorklist[
+            rowWriteOffsets[static_cast<std::size_t>(row)]++] =
+            index;
+    }
+    liquidWorklist_.swap(rowOrderedWorklist);
+    for (int row = 0; row < activeRowCount; ++row) {
+        const std::size_t rowBegin =
+            rowOffsets[static_cast<std::size_t>(row)];
+        const std::size_t rowEnd =
+            rowOffsets[static_cast<std::size_t>(row) + 1];
         std::shuffle(
             liquidWorklist_.begin() +
                 static_cast<std::ptrdiff_t>(rowBegin),
             liquidWorklist_.begin() +
                 static_cast<std::ptrdiff_t>(rowEnd),
             random_);
-        rowBegin = rowEnd;
     }
     currentLiquidCandidateVisits_ +=
         static_cast<std::uint32_t>(std::min<std::size_t>(

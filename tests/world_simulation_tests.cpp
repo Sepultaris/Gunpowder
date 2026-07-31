@@ -285,6 +285,58 @@ int main() {
         return 1;
     }
 
+    gunpowder::World streamedLiquidWorld;
+    constexpr int streamedLiquidX = 512;
+    constexpr int streamedLiquidY = 80;
+    gunpowder::InputState streamedLiquidInput;
+    streamedLiquidWorld.setPlayerForTest(
+        {static_cast<float>(streamedLiquidX), 100.0F});
+    streamedLiquidWorld.setCameraForTest(
+        {static_cast<float>(streamedLiquidX), 100.0F});
+    streamedLiquidWorld.update(
+        1.0F / 30.0F, streamedLiquidInput);
+    for (int x = streamedLiquidX - 10;
+         x <= streamedLiquidX + 10; ++x) {
+        streamedLiquidWorld.setCellForTest(
+            x, streamedLiquidY,
+            gunpowder::Material::water);
+        for (int y = streamedLiquidY + 1;
+             y <= streamedLiquidY + 12; ++y) {
+            streamedLiquidWorld.setCellForTest(
+                x, y,
+                gunpowder::Material::air);
+        }
+    }
+    streamedLiquidWorld.clearMaterialActivityForTest();
+    streamedLiquidWorld.setPlayerForTest(
+        {static_cast<float>(streamedLiquidX), 480.0F});
+    streamedLiquidWorld.setCameraForTest(
+        {static_cast<float>(streamedLiquidX), 480.0F});
+    streamedLiquidWorld.update(
+        1.0F / 30.0F, streamedLiquidInput);
+    streamedLiquidWorld.setPlayerForTest(
+        {static_cast<float>(streamedLiquidX), 100.0F});
+    streamedLiquidWorld.setCameraForTest(
+        {static_cast<float>(streamedLiquidX), 100.0F});
+    streamedLiquidWorld.update(
+        1.0F / 30.0F, streamedLiquidInput);
+    bool streamedLiquidResumed = false;
+    for (int y = streamedLiquidY + 1;
+         y <= streamedLiquidY + 12; ++y) {
+        for (int x = streamedLiquidX - 10;
+             x <= streamedLiquidX + 10; ++x) {
+            streamedLiquidResumed =
+                streamedLiquidResumed ||
+                streamedLiquidWorld.cell(x, y) ==
+                    gunpowder::Material::water;
+        }
+    }
+    if (!streamedLiquidResumed) {
+        std::cerr
+            << "Liquid did not resume after re-entering the camera window\n";
+        return 1;
+    }
+
     gunpowder::World chunkHeadWorld;
     constexpr int headColumnX = 100;
     constexpr int headBottomY = 71;

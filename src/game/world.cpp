@@ -175,6 +175,8 @@ void World::regenerate() {
     pendingGpuMaterialSteps_ = 0;
     materialScanRight_ = true;
     materialStep_ = 0;
+    previousMaterialBounds_ = {0, 0, 0, 0};
+    previousMaterialBoundsValid_ = false;
     grapple_ = Grapple{};
     playerSplashAccumulator_ = 0.0F;
     playerLiquidDisplacementAccumulator_ = 0.0F;
@@ -1208,6 +1210,132 @@ void World::markMaterialActive(
             }
         }
     }
+}
+
+void World::wakeMaterialChunksEntering(
+    const ActiveBounds& bounds) {
+    constexpr int chunksWide =
+        (width + chunkSize - 1) / chunkSize;
+    const int firstChunkX =
+        bounds.minX / chunkSize;
+    const int finalChunkX =
+        (bounds.maxX + chunkSize - 1) /
+        chunkSize;
+    const int firstChunkY =
+        bounds.minY / chunkSize;
+    const int finalChunkY =
+        (bounds.maxY + chunkSize - 1) /
+        chunkSize;
+    const auto wasPreviouslyActive =
+        [&](int chunkX, int chunkY) {
+            if (!previousMaterialBoundsValid_) {
+                return false;
+            }
+            const int originX =
+                chunkX * chunkSize;
+            const int originY =
+                chunkY * chunkSize;
+            return originX >=
+                       previousMaterialBounds_.minX &&
+                   originX <
+                       previousMaterialBounds_.maxX &&
+                   originY >=
+                       previousMaterialBounds_.minY &&
+                   originY <
+                       previousMaterialBounds_.maxY;
+        };
+    const auto& wakeCells =
+        std::as_const(cells_);
+    const auto& wakeHeat =
+        std::as_const(heat_);
+    bool wokeLiquid = false;
+    for (int chunkY = firstChunkY;
+         chunkY < finalChunkY; ++chunkY) {
+        for (int chunkX = firstChunkX;
+             chunkX < finalChunkX; ++chunkX) {
+            if (wasPreviouslyActive(
+                    chunkX, chunkY)) {
+                continue;
+            }
+            const std::size_t chunkIndex =
+                static_cast<std::size_t>(
+                    chunkY * chunksWide + chunkX);
+            if (generatedTerrainChunks_[
+                    chunkIndex] == 0) {
+                continue;
+            }
+            const int chunkOriginX =
+                chunkX * chunkSize;
+            const int chunkOriginY =
+                chunkY * chunkSize;
+            for (int microtileY = 0;
+                 microtileY <
+                     materialMicrotilesPerAxis;
+                 ++microtileY) {
+                for (int microtileX = 0;
+                     microtileX <
+                         materialMicrotilesPerAxis;
+                     ++microtileX) {
+                    const int beginX =
+                        std::max(
+                            bounds.minX,
+                            chunkOriginX +
+                                microtileX *
+                                    materialMicrotileSize);
+                    const int endX = std::min(
+                        bounds.maxX,
+                        chunkOriginX +
+                            (microtileX + 1) *
+                                materialMicrotileSize);
+                    const int beginY =
+                        std::max(
+                            bounds.minY,
+                            chunkOriginY +
+                                microtileY *
+                                    materialMicrotileSize);
+                    const int endY = std::min(
+                        bounds.maxY,
+                        chunkOriginY +
+                            (microtileY + 1) *
+                                materialMicrotileSize);
+                    std::uint8_t activityMask = 0;
+                    for (int y = beginY;
+                         y < endY; ++y) {
+                        for (int x = beginX;
+                             x < endX; ++x) {
+                            const std::size_t index =
+                                indexOf(x, y);
+                            activityMask |=
+                                materialActivityMask(
+                                    wakeCells[index]);
+                            if (wakeHeat[index] >
+                                0.015F) {
+                                activityMask |=
+                                    thermalActivity;
+                            }
+                        }
+                    }
+                    if (activityMask == 0) {
+                        continue;
+                    }
+                    markMaterialActive(
+                        beginX, beginY,
+                        activityMask);
+                    wokeLiquid =
+                        wokeLiquid ||
+                        (activityMask &
+                         liquidActivity) != 0;
+                }
+            }
+        }
+    }
+    if (wokeLiquid) {
+        // The persistent frontier only describes the window that was
+        // simulated most recently. Rebuild it after streamed liquid returns.
+        rebuildLiquidWorklist_ = true;
+    }
+    previousMaterialBounds_ = bounds;
+    previousMaterialBoundsValid_ = true;
 }
 
 bool World::materialChunkActive(
@@ -3023,6 +3151,7 @@ void World::updateMaterials() {
     const auto granularBegin =
         std::chrono::steady_clock::now();
     const ActiveBounds bounds = activeBounds();
+    wakeMaterialChunksEntering(bounds);
     currentLiquidSelectionMs_ = 0.0F;
     currentLiquidGravityMs_ = 0.0F;
     currentLiquidLateralMs_ = 0.0F;

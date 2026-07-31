@@ -254,6 +254,10 @@ public:
         player_.onGround = false;
         releaseGrapple();
     }
+    void setCameraForTest(Vec2 position) {
+        cameraCenter_ = position;
+        cameraShake_ = {};
+    }
     void clearMaterialActivityForTest();
     [[nodiscard]] std::array<bool, 4>
     materialActivityForTest(int x, int y) const;
@@ -343,6 +347,8 @@ private:
     void markMaterialActive(
         int x, int y,
         std::uint8_t activityMask = allMaterialActivity);
+    void wakeMaterialChunksEntering(
+        const ActiveBounds& bounds);
     void invalidateSettledLiquidNear(int x, int y);
     void invalidateSettledLiquidVerticalMove(
         int x, int sourceY, int destinationY);
@@ -466,6 +472,8 @@ private:
         std::vector<std::unique_ptr<DirectionalOccluderList>>,
         9> directionalOccluderLists_;
     mutable std::mutex directionalOccluderMutex_;
+    ActiveBounds previousMaterialBounds_{0, 0, 0, 0};
+    bool previousMaterialBoundsValid_ = false;
     std::vector<int> skyOccluderY_;
     std::vector<std::uint8_t> skyColumnDirty_;
     SparseGrid<std::uint8_t> interiorBackdrop_;

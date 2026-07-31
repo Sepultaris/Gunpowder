@@ -3563,9 +3563,6 @@ void World::updateMaterials() {
             index / static_cast<std::size_t>(width));
         const Material material = cells_[index];
         if (material == Material::fire) {
-            markMaterialActive(
-                x, y,
-                gasActivity | thermalActivity);
             heat_[index] =
                 std::max(
                     0.0F, heat_[index] - 0.045F);
@@ -3607,8 +3604,6 @@ void World::updateMaterials() {
             continue;
         }
 
-        markMaterialActive(
-            x, y, gasActivity | thermalActivity);
         const bool steam =
             material == Material::steam;
         heat_[index] *= steam ? 0.92F : 0.975F;
@@ -3645,6 +3640,59 @@ void World::updateMaterials() {
         }
         gasDrift_[index] =
             static_cast<std::int8_t>(drift);
+    }
+
+    const int firstGasTileX =
+        bounds.minX / materialMicrotileSize;
+    const int firstGasTileY =
+        bounds.minY / materialMicrotileSize;
+    const int gasTileColumns =
+        (bounds.maxX - bounds.minX +
+         materialMicrotileSize - 1) /
+        materialMicrotileSize;
+    const int gasTileRows =
+        (bounds.maxY - bounds.minY +
+         materialMicrotileSize - 1) /
+        materialMicrotileSize;
+    std::vector<std::uint8_t> occupiedGasTiles(
+        static_cast<std::size_t>(
+            gasTileColumns * gasTileRows),
+        0);
+    for (std::size_t index : gasReactionCells) {
+        const Material material = cells_[index];
+        if (material != Material::fire &&
+            material != Material::smoke &&
+            material != Material::steam) {
+            continue;
+        }
+        const int x = static_cast<int>(
+            index % static_cast<std::size_t>(width));
+        const int y = static_cast<int>(
+            index / static_cast<std::size_t>(width));
+        const int localTileX =
+            x / materialMicrotileSize - firstGasTileX;
+        const int localTileY =
+            y / materialMicrotileSize - firstGasTileY;
+        occupiedGasTiles[static_cast<std::size_t>(
+            localTileY * gasTileColumns +
+            localTileX)] = 1;
+    }
+    for (int localTileY = 0;
+         localTileY < gasTileRows; ++localTileY) {
+        for (int localTileX = 0;
+             localTileX < gasTileColumns; ++localTileX) {
+            if (occupiedGasTiles[static_cast<std::size_t>(
+                    localTileY * gasTileColumns +
+                    localTileX)] == 0) {
+                continue;
+            }
+            markMaterialActive(
+                (firstGasTileX + localTileX) *
+                    materialMicrotileSize,
+                (firstGasTileY + localTileY) *
+                    materialMicrotileSize,
+                gasActivity | thermalActivity);
+        }
     }
 
     struct GasTransfer {
@@ -3943,20 +3991,6 @@ void World::updateMaterials() {
                 transfer.material) {
                 gasDrift_[transfer.source] =
                     transfer.nextDrift;
-                const int sourceX =
-                    static_cast<int>(
-                        transfer.source %
-                        static_cast<std::size_t>(
-                            width));
-                const int sourceY =
-                    static_cast<int>(
-                        transfer.source /
-                        static_cast<std::size_t>(
-                            width));
-                markMaterialActive(
-                    sourceX, sourceY,
-                    gasActivity |
-                        thermalActivity);
             }
             continue;
         }
@@ -3980,9 +4014,6 @@ void World::updateMaterials() {
         moved_[transfer.destination] = 1;
         gasDrift_[transfer.destination] =
             transfer.nextDrift;
-        markMaterialActive(
-            destinationX, destinationY,
-            gasActivity | thermalActivity);
         ++gasMovesAccepted;
     }
     for (const GasTransfer& transfer :

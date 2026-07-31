@@ -563,6 +563,57 @@ int main() {
         }
     }
 
+    gunpowder::World incrementalHorizonWorld;
+    for (int y = 0; y <= 60; ++y) {
+        for (int x = 0; x <= 100; ++x) {
+            incrementalHorizonWorld.setCellForTest(
+                x, y, gunpowder::Material::air);
+        }
+    }
+    for (int x = 20; x <= 70; ++x) {
+        incrementalHorizonWorld.setCellForTest(
+            x, 28, gunpowder::Material::stone);
+    }
+    std::vector<float> incrementalDepths;
+    std::vector<std::int32_t> incrementalBlockers;
+    float incrementalMinimum = 0.0F;
+    const gunpowder::Vec2 incrementalDirection{
+        0.62F, -0.7846018F};
+    const gunpowder::Vec2 incrementalReceiverMinimum{
+        0.0F, 0.0F};
+    const gunpowder::Vec2 incrementalReceiverMaximum{
+        100.0F, 60.0F};
+    incrementalHorizonWorld.buildDirectionalSunHorizon(
+        incrementalDirection, horizonSamplesPerCell,
+        incrementalDepths, incrementalBlockers,
+        incrementalMinimum, incrementalReceiverMinimum,
+        incrementalReceiverMaximum);
+    static_cast<void>(
+        incrementalHorizonWorld.consumeSolidDirtyRegion());
+    incrementalHorizonWorld.setCellForTest(
+        44, 28, gunpowder::Material::air);
+    const gunpowder::SolidDirtyRegion removedRoofRegion =
+        incrementalHorizonWorld.consumeSolidDirtyRegion();
+    incrementalHorizonWorld.buildDirectionalSunHorizon(
+        incrementalDirection, horizonSamplesPerCell,
+        incrementalDepths, incrementalBlockers,
+        incrementalMinimum, incrementalReceiverMinimum,
+        incrementalReceiverMaximum, &removedRoofRegion);
+    std::vector<float> rebuiltDepths;
+    std::vector<std::int32_t> rebuiltBlockers;
+    float rebuiltMinimum = 0.0F;
+    incrementalHorizonWorld.buildDirectionalSunHorizon(
+        incrementalDirection, horizonSamplesPerCell,
+        rebuiltDepths, rebuiltBlockers, rebuiltMinimum,
+        incrementalReceiverMinimum,
+        incrementalReceiverMaximum);
+    if (incrementalMinimum != rebuiltMinimum ||
+        incrementalDepths != rebuiltDepths ||
+        incrementalBlockers != rebuiltBlockers) {
+        std::cerr << "Incremental sun horizon differed from a full rebuild\n";
+        return 1;
+    }
+
     gunpowder::World world;
     if (countOf(world, gunpowder::Material::wood) < 100 ||
         countOf(world, gunpowder::Material::stone) < 1000) {

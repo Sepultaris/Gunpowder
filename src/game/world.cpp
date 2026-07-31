@@ -103,6 +103,7 @@ World::World()
 }
 
 void World::regenerate() {
+    solidDirtyRegion_ = {};
     cells_.reset(Material::air);
     liquidAmount_.reset(0);
     liquidFlowX_.reset(0);
@@ -778,6 +779,7 @@ void World::ensureTerrainChunk(int chunkX, int chunkY) {
         }
     }
     if (containsSolid) {
+        markSolidDirty(beginX, beginY, endX - 1, endY - 1);
         ++solidRevision_;
     }
 }
@@ -836,6 +838,7 @@ void World::setCell(int x, int y, Material material) {
         } else if (y <= skyOccluderY_[column]) {
             skyColumnDirty_[column] = 1;
         }
+        markSolidDirty(x, y, x, y);
         ++solidRevision_;
     }
     if (material != previous) {
@@ -956,6 +959,11 @@ void World::swapCells(int firstX, int firstY, int secondX, int secondY) {
                      secondWasOccluder);
         updateColumn(secondX, secondY, secondWasOccluder,
                      firstWasOccluder);
+        markSolidDirty(
+            std::min(firstX, secondX),
+            std::min(firstY, secondY),
+            std::max(firstX, secondX),
+            std::max(firstY, secondY));
         ++solidRevision_;
     }
     std::swap(cells_[first], cells_[second]);
@@ -982,6 +990,35 @@ void World::swapCells(int firstX, int firstY, int secondX, int secondY) {
     }
     markMaterialActive(firstX, firstY, activityMask);
     markMaterialActive(secondX, secondY, activityMask);
+}
+
+void World::markSolidDirty(
+    int minX, int minY, int maxX, int maxY) {
+    minX = std::clamp(minX, 0, width - 1);
+    minY = std::clamp(minY, 0, height - 1);
+    maxX = std::clamp(maxX, 0, width - 1);
+    maxY = std::clamp(maxY, 0, height - 1);
+    if (minX > maxX || minY > maxY) {
+        return;
+    }
+    if (!solidDirtyRegion_.valid()) {
+        solidDirtyRegion_ = {minX, minY, maxX, maxY};
+        return;
+    }
+    solidDirtyRegion_.minX =
+        std::min(solidDirtyRegion_.minX, minX);
+    solidDirtyRegion_.minY =
+        std::min(solidDirtyRegion_.minY, minY);
+    solidDirtyRegion_.maxX =
+        std::max(solidDirtyRegion_.maxX, maxX);
+    solidDirtyRegion_.maxY =
+        std::max(solidDirtyRegion_.maxY, maxY);
+}
+
+SolidDirtyRegion World::consumeSolidDirtyRegion() {
+    const SolidDirtyRegion result = solidDirtyRegion_;
+    solidDirtyRegion_ = {};
+    return result;
 }
 
 std::uint8_t World::materialActivityMask(Material material) {
@@ -1222,7 +1259,8 @@ void World::buildDirectionalSunHorizon(
     std::vector<float>& depths,
     std::vector<std::int32_t>& blockers,
     float& minimumPerpendicularCoordinate,
-    Vec2 receiverMinimum, Vec2 receiverMaximum) const {
+    Vec2 receiverMinimum, Vec2 receiverMaximum,
+    const SolidDirtyRegion* dirtyRegion) const {
     const float directionLength = length(direction);
     if (directionLength < 0.0001F) {
         depths.assign(1, -std::numeric_limits<float>::infinity());
@@ -1247,18 +1285,91 @@ void World::buildDirectionalSunHorizon(
     const auto [minimumCorner, maximumCorner] =
         std::minmax_element(receiverCorners.begin(),
                             receiverCorners.end());
-    minimumPerpendicularCoordinate =
+    const float requestedMinimumPerpendicularCoordinate =
         *minimumCorner - samplesPerCell;
     const std::size_t sampleCount =
         static_cast<std::size_t>(
             std::ceil(
-                (*maximumCorner - minimumPerpendicularCoordinate +
+                (*maximumCorner -
+                     requestedMinimumPerpendicularCoordinate +
                  samplesPerCell) *
                 samplesPerCell)) +
         2;
-    depths.assign(
-        sampleCount, -std::numeric_limits<float>::infinity());
-    blockers.assign(sampleCount, -1);
+    const bool updateSubset =
+        dirtyRegion != nullptr && dirtyRegion->valid() &&
+        depths.size() == sampleCount &&
+        blockers.size() == sampleCount &&
+        std::abs(minimumPerpendicularCoordinate -
+                 requestedMinimumPerpendicularCoordinate) <
+            0.0001F;
+    minimumPerpendicularCoordinate =
+        requestedMinimumPerpendicularCoordinate;
+    int firstUpdatedSample = 0;
+    int lastUpdatedSample =
+        static_cast<int>(sampleCount) - 1;
+    if (updateSubset) {
+        const std::array<float, 4> dirtyCorners{
+            perpendicularCoordinate(
+                static_cast<float>(dirtyRegion->minX - 1),
+                static_cast<float>(dirtyRegion->minY - 1)),
+            perpendicularCoordinate(
+                static_cast<float>(dirtyRegion->maxX + 2),
+                static_cast<float>(dirtyRegion->minY - 1)),
+            perpendicularCoordinate(
+                static_cast<float>(dirtyRegion->minX - 1),
+                static_cast<float>(dirtyRegion->maxY + 2)),
+            perpendicularCoordinate(
+                static_cast<float>(dirtyRegion->maxX + 2),
+                static_cast<float>(dirtyRegion->maxY + 2)),
+        };
+        const auto [dirtyMinimum, dirtyMaximum] =
+            std::minmax_element(
+                dirtyCorners.begin(), dirtyCorners.end());
+        firstUpdatedSample =
+            static_cast<int>(std::floor(
+                (*dirtyMinimum -
+                 minimumPerpendicularCoordinate) *
+                samplesPerCell)) -
+            1;
+        lastUpdatedSample =
+            static_cast<int>(std::floor(
+                (*dirtyMaximum -
+                 minimumPerpendicularCoordinate) *
+                samplesPerCell)) +
+            1;
+        if (lastUpdatedSample < 0 ||
+            firstUpdatedSample >=
+                static_cast<int>(sampleCount)) {
+            return;
+        }
+        firstUpdatedSample =
+            std::max(firstUpdatedSample, 0);
+        lastUpdatedSample =
+            std::min(
+                lastUpdatedSample,
+                static_cast<int>(sampleCount) - 1);
+        std::fill(
+            depths.begin() + firstUpdatedSample,
+            depths.begin() + lastUpdatedSample + 1,
+            -std::numeric_limits<float>::infinity());
+        std::fill(
+            blockers.begin() + firstUpdatedSample,
+            blockers.begin() + lastUpdatedSample + 1,
+            -1);
+    } else {
+        depths.assign(
+            sampleCount,
+            -std::numeric_limits<float>::infinity());
+        blockers.assign(sampleCount, -1);
+    }
+    const float updatedMinimumPerpendicularCoordinate =
+        minimumPerpendicularCoordinate +
+        static_cast<float>(firstUpdatedSample) /
+            samplesPerCell;
+    const float updatedMaximumPerpendicularCoordinate =
+        minimumPerpendicularCoordinate +
+        static_cast<float>(lastUpdatedSample + 1) /
+            samplesPerCell;
 
     // A directional light collapses the world onto one axis perpendicular to
     // the rays. Rasterizing every solid's full projected square footprint
@@ -1329,12 +1440,13 @@ void World::buildDirectionalSunHorizon(
             const float perpendicular =
                 perpendicularCoordinate(centerX, centerY);
             const int firstSample = std::max(
-                0, static_cast<int>(std::floor(
+                firstUpdatedSample,
+                static_cast<int>(std::floor(
                        (perpendicular - projectedHalfExtent -
                         minimumPerpendicularCoordinate) *
                        samplesPerCell)));
             const int lastSample = std::min(
-                static_cast<int>(sampleCount) - 1,
+                lastUpdatedSample,
                 static_cast<int>(std::floor(
                     (perpendicular + projectedHalfExtent -
                      minimumPerpendicularCoordinate) *
@@ -1403,9 +1515,6 @@ void World::buildDirectionalSunHorizon(
     cells_.forEachAllocatedChunk(
         [&](int chunkX, int chunkY,
             const SparseGrid<Material>::Chunk& chunk) {
-            const float maximumPerpendicularCoordinate =
-                minimumPerpendicularCoordinate +
-                static_cast<float>(sampleCount) / samplesPerCell;
             const int chunkMinX =
                 chunkX * SparseGrid<Material>::chunkSize;
             const int chunkMinY =
@@ -1437,9 +1546,9 @@ void World::buildDirectionalSunHorizon(
                         segmentCorners.begin(),
                         segmentCorners.end());
                 if (*segmentMaximum + projectedHalfExtent >=
-                        minimumPerpendicularCoordinate &&
+                        updatedMinimumPerpendicularCoordinate &&
                     *segmentMinimum - projectedHalfExtent <=
-                        maximumPerpendicularCoordinate) {
+                        updatedMaximumPerpendicularCoordinate) {
                     const std::size_t localBegin =
                         static_cast<std::size_t>(
                             y - chunkMinY) *
@@ -1452,9 +1561,9 @@ void World::buildDirectionalSunHorizon(
                                 static_cast<float>(x) + 0.5F,
                                 static_cast<float>(y) + 0.5F);
                         if (perpendicular + projectedHalfExtent <
-                                minimumPerpendicularCoordinate ||
+                                updatedMinimumPerpendicularCoordinate ||
                             perpendicular - projectedHalfExtent >
-                                maximumPerpendicularCoordinate) {
+                                updatedMaximumPerpendicularCoordinate) {
                             continue;
                         }
                         if (isSkyOccluder(
@@ -1473,9 +1582,6 @@ void World::buildDirectionalSunHorizon(
     // deep world for every change to directional sunlight.
     const int chunksWide =
         (width + chunkSize - 1) / chunkSize;
-    const float maximumPerpendicularCoordinate =
-        minimumPerpendicularCoordinate +
-        static_cast<float>(sampleCount) / samplesPerCell;
     for (int x = 0; x < width; ++x) {
         const int y = proceduralSurfaceY(x);
         const float perpendicular =
@@ -1483,9 +1589,9 @@ void World::buildDirectionalSunHorizon(
                 static_cast<float>(x) + 0.5F,
                 static_cast<float>(y) + 0.5F);
         if (perpendicular + projectedHalfExtent <
-                minimumPerpendicularCoordinate ||
+                updatedMinimumPerpendicularCoordinate ||
             perpendicular - projectedHalfExtent >
-                maximumPerpendicularCoordinate) {
+                updatedMaximumPerpendicularCoordinate) {
             continue;
         }
         const std::size_t chunkIndex =

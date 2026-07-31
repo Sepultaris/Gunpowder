@@ -64,6 +64,17 @@ struct MaterialSimulationTimings {
     bool valid = false;
 };
 
+struct SolidDirtyRegion {
+    int minX = 0;
+    int minY = 0;
+    int maxX = -1;
+    int maxY = -1;
+
+    [[nodiscard]] bool valid() const {
+        return minX <= maxX && minY <= maxY;
+    }
+};
+
 enum class Material : std::uint8_t {
     air,
     dirt,
@@ -218,6 +229,7 @@ public:
     [[nodiscard]] std::uint64_t solidRevision() const {
         return solidRevision_;
     }
+    [[nodiscard]] SolidDirtyRegion consumeSolidDirtyRegion();
     void buildDirectionalSunHorizon(
         Vec2 direction, float samplesPerCell,
         std::vector<float>& depths,
@@ -227,7 +239,8 @@ public:
         Vec2 receiverMaximum = {
             static_cast<float>(width),
             static_cast<float>(height),
-        }) const;
+        },
+        const SolidDirtyRegion* dirtyRegion = nullptr) const;
 #ifdef GUNPOWDER_TEST_SCALE
     void setCellForTest(int x, int y, Material material) {
         setCell(x, y, material);
@@ -328,6 +341,7 @@ private:
         int x, int y,
         std::uint8_t activityMask = allMaterialActivity) const;
     void ageMaterialChunks();
+    void markSolidDirty(int minX, int minY, int maxX, int maxY);
     void rebuildDirtySkyColumns();
     void captureInteriorBackdrop();
     void destroyCircle(Vec2 center, float radius);
@@ -460,6 +474,7 @@ private:
     float playerLiquidDisplacementAccumulator_ = 0.0F;
     float statusParticleAccumulator_ = 0.0F;
     std::uint64_t solidRevision_ = 0;
+    SolidDirtyRegion solidDirtyRegion_{};
 };
 
 } // namespace gunpowder

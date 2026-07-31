@@ -4419,6 +4419,31 @@ void VulkanRenderer::draw(World& world) {
     const Vec2 camera = world.renderCameraTopLeft();
     const CelestialState currentCelestial =
         celestialState(rayTracingSettings_);
+    const auto mergeDirtyRegion =
+        [](SolidDirtyRegion& destination,
+           const SolidDirtyRegion& source) {
+            if (!source.valid()) {
+                return;
+            }
+            if (!destination.valid()) {
+                destination = source;
+                return;
+            }
+            destination.minX =
+                std::min(destination.minX, source.minX);
+            destination.minY =
+                std::min(destination.minY, source.minY);
+            destination.maxX =
+                std::max(destination.maxX, source.maxX);
+            destination.maxY =
+                std::max(destination.maxY, source.maxY);
+        };
+    const SolidDirtyRegion changedSolidRegion =
+        world.consumeSolidDirtyRegion();
+    mergeDirtyRegion(
+        pendingSunSolidDirty_, changedSolidRegion);
+    mergeDirtyRegion(
+        pendingSkySolidDirty_, changedSolidRegion);
     const std::int32_t currentLightingOriginX =
         static_cast<std::int32_t>(std::floor(camera.x));
     const std::int32_t currentLightingOriginY =
@@ -4501,6 +4526,12 @@ void VulkanRenderer::draw(World& world) {
     const bool sunCacheThrottleExpired =
         !sunVisibilityCacheValid_ ||
         particleTicks - lastSunOcclusionTicks_ >= 33;
+    const bool incrementalSunRebuild =
+        sunVisibilityCacheValid_ &&
+        solidFieldChanged &&
+        !sunDirectionChanged &&
+        !sunReceiverMoved &&
+        pendingSunSolidDirty_.valid();
     const bool rebuildSunHorizon =
         (!sunVisibilityCacheValid_ ||
          sunDirectionChanged || solidFieldChanged ||
@@ -4521,6 +4552,12 @@ void VulkanRenderer::draw(World& world) {
     const bool skyCacheThrottleExpired =
         !skyVisibilityCacheValid_ ||
         particleTicks - lastSkyOcclusionTicks_ >= 100;
+    const bool incrementalSkyRebuild =
+        skyVisibilityCacheValid_ &&
+        skySolidFieldChanged &&
+        !skyReceiverMoved &&
+        !skyRayCountChanged &&
+        pendingSkySolidDirty_.valid();
     const bool rebuildSkyHorizons =
         rayTracingSettings_.skyLightIntensity > 0.0001F &&
         (!skyVisibilityCacheValid_ ||
@@ -4571,7 +4608,10 @@ void VulkanRenderer::draw(World& world) {
                                 World::viewWidth),
                             static_cast<float>(
                                 World::viewHeight),
-                        } + receiverMargin);
+                        } + receiverMargin,
+                        incrementalSunRebuild
+                            ? &pendingSunSolidDirty_
+                            : nullptr);
                     sunHorizonBuildMs =
                         std::chrono::duration<float, std::milli>(
                             RenderClock::now() - horizonBegin)
@@ -4605,7 +4645,10 @@ void VulkanRenderer::draw(World& world) {
                     camera + Vec2{
                         static_cast<float>(World::viewWidth),
                         static_cast<float>(World::viewHeight),
-                    } + receiverMargin);
+                    } + receiverMargin,
+                    incrementalSkyRebuild
+                        ? &pendingSkySolidDirty_
+                        : nullptr);
                 skyRayBuildMilliseconds[rayIndex] =
                     std::chrono::duration<float, std::milli>(
                         RenderClock::now() - horizonBegin)
@@ -4624,6 +4667,7 @@ void VulkanRenderer::draw(World& world) {
         cachedSunSolidRevision_ = world.solidRevision();
         lastSunOcclusionTicks_ = particleTicks;
         sunVisibilityCacheValid_ = true;
+        pendingSunSolidDirty_ = {};
     }
     if (rebuildSkyHorizons) {
         cachedSkyCamera_ = camera;
@@ -4631,6 +4675,7 @@ void VulkanRenderer::draw(World& world) {
         cachedSkyRayCount_ = requestedSkyRayCount;
         lastSkyOcclusionTicks_ = particleTicks;
         skyVisibilityCacheValid_ = true;
+        pendingSkySolidDirty_ = {};
     }
     if (lastParticleTicks_ != 0) {
         particleDeltaTime_ = std::clamp(

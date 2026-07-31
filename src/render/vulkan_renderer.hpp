@@ -367,9 +367,11 @@ private:
     std::uint64_t lastSunTransmittanceTicks_ = 0;
     std::uint64_t cachedSunSolidRevision_ =
         std::numeric_limits<std::uint64_t>::max();
+    SolidDirtyRegion pendingSunSolidDirty_{};
     Vec2 cachedSunCamera_{};
     std::uint64_t cachedSkySolidRevision_ =
         std::numeric_limits<std::uint64_t>::max();
+    SolidDirtyRegion pendingSkySolidDirty_{};
     Vec2 cachedSkyCamera_{};
     std::int32_t cachedSkyRayCount_ = 0;
     bool skyVisibilityCacheValid_ = false;

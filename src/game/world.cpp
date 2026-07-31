@@ -4948,6 +4948,9 @@ void World::updateLiquids(const ActiveBounds& bounds, bool waterOnly) {
             ++currentLiquidGravityConflicts_;
         }
     }
+    std::vector<std::size_t> liquidRestingAfterGravity;
+    liquidRestingAfterGravity.reserve(
+        liquidWorklist_.size());
     if (!useParallelLiquidTransport) {
         struct VerticalMoveSideEffects {
             std::size_t source = 0;
@@ -5296,12 +5299,20 @@ void World::updateLiquids(const ActiveBounds& bounds, bool waterOnly) {
                 ++currentLiquidMovesAccepted_;
                 break;
             }
+            if (moved_[source] == 0) {
+                liquidRestingAfterGravity.push_back(source);
+            }
         }
     }
 
     // Impact metadata is resolved after transport, once destination locks
-    // make it clear which cells actually remained supported.
-    for (std::size_t source : liquidWorklist_) {
+    // make it clear which cells actually remained supported. The bottom-up
+    // gravity pass already identified that subset; reverse it to retain the
+    // original top-to-bottom impact/RNG order without rescanning moved cells.
+    for (auto resting = liquidRestingAfterGravity.rbegin();
+         resting != liquidRestingAfterGravity.rend();
+         ++resting) {
+        const std::size_t source = *resting;
         const int x = static_cast<int>(
             source %
             static_cast<std::size_t>(width));
@@ -5309,12 +5320,6 @@ void World::updateLiquids(const ActiveBounds& bounds, bool waterOnly) {
             source /
             static_cast<std::size_t>(width));
         const Material material = cells_[source];
-        if (!isLiquid(material) ||
-            (waterOnly &&
-             material != Material::water) ||
-            moved_[source] != 0) {
-            continue;
-        }
         liquidAmount_[source] =
             maximumLiquidMass;
         const int impactSpeed =

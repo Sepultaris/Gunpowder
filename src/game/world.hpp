@@ -7,7 +7,9 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
+#include <mutex>
 #include <random>
 #include <utility>
 #include <vector>
@@ -322,6 +324,12 @@ private:
         std::uint32_t generation = 0;
     };
 
+    struct DirectionalOccluderList {
+        std::uint64_t revision =
+            std::numeric_limits<std::uint64_t>::max();
+        std::vector<std::uint16_t> offsets;
+    };
+
     [[nodiscard]] bool isSolid(int x, int y) const;
     [[nodiscard]] bool overlapsTerrain(Vec2 center, Vec2 halfSize) const;
     void ensureTerrainGenerated(const ActiveBounds& bounds);
@@ -450,6 +458,11 @@ private:
     std::vector<std::unique_ptr<LiquidChunkColumnSummary>>
         liquidChunkColumnSummaries_;
     std::uint32_t liquidPreparationGeneration_ = 0;
+    std::vector<std::uint64_t> solidChunkRevisions_;
+    mutable std::array<
+        std::vector<std::unique_ptr<DirectionalOccluderList>>,
+        9> directionalOccluderLists_;
+    mutable std::mutex directionalOccluderMutex_;
     std::vector<int> skyOccluderY_;
     std::vector<std::uint8_t> skyColumnDirty_;
     SparseGrid<std::uint8_t> interiorBackdrop_;

@@ -92,6 +92,11 @@ World::World()
           static_cast<std::size_t>(
               ((width + chunkSize - 1) / chunkSize) *
               ((height + chunkSize - 1) / chunkSize))),
+      solidChunkRevisions_(
+          static_cast<std::size_t>(
+              ((width + chunkSize - 1) / chunkSize) *
+              ((height + chunkSize - 1) / chunkSize)),
+          0),
       skyOccluderY_(static_cast<std::size_t>(width), height),
       skyColumnDirty_(static_cast<std::size_t>(width), 1),
       interiorBackdrop_(width, height, 0),
@@ -100,6 +105,9 @@ World::World()
               ((width + chunkSize - 1) / chunkSize) *
               ((height + chunkSize - 1) / chunkSize)),
           0) {
+    for (auto& directionLists : directionalOccluderLists_) {
+        directionLists.resize(solidChunkRevisions_.size());
+    }
     regenerate();
 }
 
@@ -133,6 +141,14 @@ void World::regenerate() {
     liquidReservedCells_.clear();
     for (auto& summary : liquidChunkColumnSummaries_) {
         summary.reset();
+    }
+    std::fill(
+        solidChunkRevisions_.begin(),
+        solidChunkRevisions_.end(), 0);
+    for (auto& directionLists : directionalOccluderLists_) {
+        for (auto& list : directionLists) {
+            list.reset();
+        }
     }
     liquidPreparationGeneration_ = 0;
     std::fill(materialChunkActivity_.begin(),
@@ -1016,6 +1032,24 @@ void World::markSolidDirty(
     if (minX > maxX || minY > maxY) {
         return;
     }
+    constexpr int chunkColumns =
+        (width + chunkSize - 1) / chunkSize;
+    const int firstChunkX =
+        std::max(0, minX - 1) / chunkSize;
+    const int finalChunkX =
+        std::min(width - 1, maxX + 1) / chunkSize;
+    const int firstChunkY =
+        std::max(0, minY - 1) / chunkSize;
+    const int finalChunkY =
+        std::min(height - 1, maxY + 1) / chunkSize;
+    for (int chunkY = firstChunkY;
+         chunkY <= finalChunkY; ++chunkY) {
+        for (int chunkX = firstChunkX;
+             chunkX <= finalChunkX; ++chunkX) {
+            ++solidChunkRevisions_[static_cast<std::size_t>(
+                chunkY * chunkColumns + chunkX)];
+        }
+    }
     if (!solidDirtyRegion_.valid()) {
         solidDirtyRegion_ = {minX, minY, maxX, maxY};
         return;
@@ -1469,6 +1503,9 @@ void World::buildDirectionalSunHorizon(
         direction.y > 0.00001F
             ? 1
             : (direction.y < -0.00001F ? -1 : 0);
+    const std::size_t directionKey =
+        static_cast<std::size_t>(
+            (sunwardY + 1) * 3 + (sunwardX + 1));
     const auto solidAt = [&](int x, int y) {
         if (x < 0 || x >= width || y < 0 || y >= height) {
             return false;
@@ -1485,6 +1522,88 @@ void World::buildDirectionalSunHorizon(
                 : proceduralMaterial(x, y);
         return isSkyOccluder(material);
     };
+    {
+        // Exposure depends only on the signs of the direction components.
+        // Cache boundary offsets per chunk and octant; local topology edits
+        // invalidate only the edited chunk and its one-cell neighbor halo.
+        std::lock_guard lock(directionalOccluderMutex_);
+        auto& directionLists =
+            directionalOccluderLists_[directionKey];
+        constexpr int chunksWide =
+            (width + chunkSize - 1) / chunkSize;
+        cells_.forEachAllocatedChunk(
+            [&](int chunkX, int chunkY,
+                const SparseGrid<Material>::Chunk& chunk) {
+                const std::size_t chunkIndex =
+                    static_cast<std::size_t>(
+                        chunkY * chunksWide + chunkX);
+                auto& cached = directionLists[chunkIndex];
+                if (!cached) {
+                    cached =
+                        std::make_unique<
+                            DirectionalOccluderList>();
+                }
+                if (cached->revision ==
+                    solidChunkRevisions_[chunkIndex]) {
+                    return;
+                }
+                cached->offsets.clear();
+                const int chunkMinX =
+                    chunkX * chunkSize;
+                const int chunkMinY =
+                    chunkY * chunkSize;
+                const int chunkMaxX = std::min(
+                    width, chunkMinX + chunkSize);
+                const int chunkMaxY = std::min(
+                    height, chunkMinY + chunkSize);
+                cached->offsets.reserve(
+                    static_cast<std::size_t>(
+                        (chunkMaxX - chunkMinX +
+                         chunkMaxY - chunkMinY) *
+                        2));
+                for (int y = chunkMinY;
+                     y < chunkMaxY; ++y) {
+                    const std::size_t localBegin =
+                        static_cast<std::size_t>(
+                            y - chunkMinY) *
+                        static_cast<std::size_t>(
+                            chunkSize);
+                    for (int x = chunkMinX;
+                         x < chunkMaxX; ++x) {
+                        const std::size_t offset =
+                            localBegin +
+                            static_cast<std::size_t>(
+                                x - chunkMinX);
+                        if (!isSkyOccluder(chunk[offset])) {
+                            continue;
+                        }
+                        const bool exposedHorizontally =
+                            sunwardX != 0 &&
+                            !solidAt(
+                                x + sunwardX, y);
+                        const bool exposedVertically =
+                            sunwardY != 0 &&
+                            !solidAt(
+                                x, y + sunwardY);
+                        const bool exposedDiagonally =
+                            sunwardX != 0 &&
+                            sunwardY != 0 &&
+                            !solidAt(
+                                x + sunwardX,
+                                y + sunwardY);
+                        if (exposedHorizontally ||
+                            exposedVertically ||
+                            exposedDiagonally) {
+                            cached->offsets.push_back(
+                                static_cast<std::uint16_t>(
+                                    offset));
+                        }
+                    }
+                }
+                cached->revision =
+                    solidChunkRevisions_[chunkIndex];
+            });
+    }
     const auto processSampleRange =
         [&](int rangeFirstSample, int rangeLastSample) {
     const float updatedMinimumPerpendicularCoordinate =
@@ -1495,28 +1614,29 @@ void World::buildDirectionalSunHorizon(
         minimumPerpendicularCoordinate +
         static_cast<float>(rangeLastSample + 1) /
             samplesPerCell;
-    const auto rasterizeCell = [&](int x, int y) {
+    const auto rasterizeCell =
+        [&](int x, int y, bool boundaryKnown) {
             const std::size_t cellIndex = indexOf(x, y);
-            if (!solidAt(x, y)) {
-                return;
-            }
-            // Only cells on a sun-facing material boundary can contribute to
-            // the foremost horizon. Skipping buried cells changes no shadow
-            // silhouette and avoids rasterizing millions of redundant solid
-            // footprints in dense terrain.
-            const bool exposedHorizontally =
-                sunwardX != 0 &&
-                !solidAt(x + sunwardX, y);
-            const bool exposedVertically =
-                sunwardY != 0 &&
-                !solidAt(x, y + sunwardY);
-            const bool exposedDiagonally =
-                sunwardX != 0 && sunwardY != 0 &&
-                !solidAt(x + sunwardX, y + sunwardY);
-            if (!exposedHorizontally &&
-                !exposedVertically &&
-                !exposedDiagonally) {
-                return;
+            if (!boundaryKnown) {
+                if (!solidAt(x, y)) {
+                    return;
+                }
+                const bool exposedHorizontally =
+                    sunwardX != 0 &&
+                    !solidAt(x + sunwardX, y);
+                const bool exposedVertically =
+                    sunwardY != 0 &&
+                    !solidAt(x, y + sunwardY);
+                const bool exposedDiagonally =
+                    sunwardX != 0 && sunwardY != 0 &&
+                    !solidAt(
+                        x + sunwardX,
+                        y + sunwardY);
+                if (!exposedHorizontally &&
+                    !exposedVertically &&
+                    !exposedDiagonally) {
+                    return;
+                }
             }
             const float centerX = static_cast<float>(x) + 0.5F;
             const float centerY = static_cast<float>(y) + 0.5F;
@@ -1595,9 +1715,13 @@ void World::buildDirectionalSunHorizon(
             }
     };
 
+    constexpr int chunksWide =
+        (width + chunkSize - 1) / chunkSize;
+    const auto& directionLists =
+        directionalOccluderLists_[directionKey];
     cells_.forEachAllocatedChunk(
         [&](int chunkX, int chunkY,
-            const SparseGrid<Material>::Chunk& chunk) {
+            const SparseGrid<Material>::Chunk&) {
             const int chunkMinX =
                 chunkX * SparseGrid<Material>::chunkSize;
             const int chunkMinY =
@@ -1629,65 +1753,45 @@ void World::buildDirectionalSunHorizon(
                     updatedMaximumPerpendicularCoordinate) {
                 return;
             }
-            for (int y = chunkMinY; y < chunkMaxY; ++y) {
-                const int beginX = chunkMinX;
-                const int rowCells = chunkMaxX - chunkMinX;
-                const int endX = beginX + rowCells;
-                const std::array<float, 4> segmentCorners{
-                    perpendicularCoordinate(
-                        static_cast<float>(beginX),
-                        static_cast<float>(y)),
-                    perpendicularCoordinate(
-                        static_cast<float>(endX),
-                        static_cast<float>(y)),
-                    perpendicularCoordinate(
-                        static_cast<float>(beginX),
-                        static_cast<float>(y + 1)),
-                    perpendicularCoordinate(
-                        static_cast<float>(endX),
-                        static_cast<float>(y + 1)),
-                };
-                const auto [segmentMinimum, segmentMaximum] =
-                    std::minmax_element(
-                        segmentCorners.begin(),
-                        segmentCorners.end());
-                if (*segmentMaximum + projectedHalfExtent >=
-                        updatedMinimumPerpendicularCoordinate &&
-                    *segmentMinimum - projectedHalfExtent <=
-                        updatedMaximumPerpendicularCoordinate) {
-                    const std::size_t localBegin =
-                        static_cast<std::size_t>(
-                            y - chunkMinY) *
-                        static_cast<std::size_t>(
-                            SparseGrid<Material>::chunkSize);
-                    for (int offset = 0; offset < rowCells; ++offset) {
-                        const int x = beginX + offset;
-                        const float perpendicular =
-                            perpendicularCoordinate(
-                                static_cast<float>(x) + 0.5F,
-                                static_cast<float>(y) + 0.5F);
-                        if (perpendicular + projectedHalfExtent <
-                                updatedMinimumPerpendicularCoordinate ||
-                            perpendicular - projectedHalfExtent >
-                                updatedMaximumPerpendicularCoordinate) {
-                            continue;
-                        }
-                        if (isSkyOccluder(
-                                chunk[localBegin +
-                                      static_cast<std::size_t>(
-                                          offset)])) {
-                            rasterizeCell(x, y);
-                        }
-                    }
+            const std::size_t chunkIndex =
+                static_cast<std::size_t>(
+                    chunkY * chunksWide + chunkX);
+            const auto& cached =
+                directionLists[chunkIndex];
+            if (!cached) {
+                return;
+            }
+            for (const std::uint16_t offset :
+                 cached->offsets) {
+                const int localY =
+                    static_cast<int>(offset) /
+                    SparseGrid<Material>::chunkSize;
+                const int localX =
+                    static_cast<int>(offset) -
+                    localY *
+                        SparseGrid<Material>::chunkSize;
+                const int x = chunkMinX + localX;
+                const int y = chunkMinY + localY;
+                if (x >= chunkMaxX || y >= chunkMaxY) {
+                    continue;
                 }
+                const float perpendicular =
+                    perpendicularCoordinate(
+                        static_cast<float>(x) + 0.5F,
+                        static_cast<float>(y) + 0.5F);
+                if (perpendicular + projectedHalfExtent <
+                        updatedMinimumPerpendicularCoordinate ||
+                    perpendicular - projectedHalfExtent >
+                        updatedMaximumPerpendicularCoordinate) {
+                    continue;
+                }
+                rasterizeCell(x, y, true);
             }
         });
 
     // Unvisited chunks still have a deterministic surface silhouette. Add
     // that single boundary rather than scanning or materializing the entire
     // deep world for every change to directional sunlight.
-    const int chunksWide =
-        (width + chunkSize - 1) / chunkSize;
     for (int x = 0; x < width; ++x) {
         const int y = proceduralSurfaceY(x);
         const float perpendicular =
@@ -1705,7 +1809,7 @@ void World::buildDirectionalSunHorizon(
                 (y / chunkSize) * chunksWide +
                 (x / chunkSize));
         if (generatedTerrainChunks_[chunkIndex] == 0) {
-            rasterizeCell(x, y);
+            rasterizeCell(x, y, false);
         }
     }
     };

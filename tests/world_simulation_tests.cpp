@@ -246,9 +246,9 @@ int main() {
     const auto topologyActivity =
         activityWorld.materialActivityForTest(
             activityX, activityY);
-    if (!topologyActivity[0] || !topologyActivity[1] ||
-        !topologyActivity[2] || !topologyActivity[3]) {
-        std::cerr << "A changed solid boundary did not wake its neighbors\n";
+    if (!topologyActivity[0] || topologyActivity[1] ||
+        topologyActivity[2] || topologyActivity[3]) {
+        std::cerr << "A dry solid boundary woke unrelated systems\n";
         return 1;
     }
     const auto sandMicrotile =
@@ -257,13 +257,31 @@ int main() {
     const auto distantSandMicrotile =
         activityWorld.materialMicrotileActivityForTest(
             activityX + 24, activityY);
-    if (!sandMicrotile[0] || !sandMicrotile[1] ||
-        !sandMicrotile[2] || !sandMicrotile[3] ||
+    if (!sandMicrotile[0] || sandMicrotile[1] ||
+        sandMicrotile[2] || sandMicrotile[3] ||
         distantSandMicrotile[0] ||
         distantSandMicrotile[1] ||
         distantSandMicrotile[2] ||
         distantSandMicrotile[3]) {
         std::cerr << "Solid-boundary wake escaped its microtile halo\n";
+        return 1;
+    }
+
+    activityWorld.setCellForTest(
+        activityX, activityY, gunpowder::Material::air);
+    activityWorld.setCellForTest(
+        activityX + 1, activityY, gunpowder::Material::water);
+    activityWorld.clearMaterialActivityForTest();
+    activityWorld.setCellForTest(
+        activityX, activityY, gunpowder::Material::sand);
+    const auto wetTopologyActivity =
+        activityWorld.materialActivityForTest(
+            activityX, activityY);
+    if (!wetTopologyActivity[0] ||
+        !wetTopologyActivity[1] ||
+        wetTopologyActivity[2] ||
+        !wetTopologyActivity[3]) {
+        std::cerr << "A nearby liquid did not wake for a topology edit\n";
         return 1;
     }
 

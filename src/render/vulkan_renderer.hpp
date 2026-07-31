@@ -106,6 +106,8 @@ struct CpuRenderTimings {
     float synchronizeMs = 0.0F;
     float frameWaitMs = 0.0F;
     float directionalCacheMs = 0.0F;
+    float sunHorizonMs = 0.0F;
+    float skyHorizonMs = 0.0F;
     float sceneBuildMs = 0.0F;
     float materialTextureMs = 0.0F;
     float occupancyMs = 0.0F;

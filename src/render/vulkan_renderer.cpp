@@ -4501,31 +4501,11 @@ void VulkanRenderer::draw(World& world) {
     const bool sunCacheThrottleExpired =
         !sunVisibilityCacheValid_ ||
         particleTicks - lastSunOcclusionTicks_ >= 33;
-    if ((!sunVisibilityCacheValid_ ||
+    const bool rebuildSunHorizon =
+        (!sunVisibilityCacheValid_ ||
          sunDirectionChanged || solidFieldChanged ||
          sunReceiverMoved) &&
-        sunCacheThrottleExpired) {
-        const Vec2 receiverMargin{
-            static_cast<float>(World::viewWidth) * 0.5F,
-            static_cast<float>(World::viewHeight) * 0.5F,
-        };
-        world.buildDirectionalSunHorizon(
-            currentCelestial.sunDirection,
-            sunHorizonSamplesPerCell,
-            sunHorizonDepths_,
-            sunHorizonBlockers_,
-            sunHorizonMinimum_,
-            camera - receiverMargin,
-            camera + Vec2{
-                static_cast<float>(World::viewWidth),
-                static_cast<float>(World::viewHeight),
-            } + receiverMargin);
-        cachedSunDirection_ = currentCelestial.sunDirection;
-        cachedSunCamera_ = camera;
-        cachedSunSolidRevision_ = world.solidRevision();
-        lastSunOcclusionTicks_ = particleTicks;
-        sunVisibilityCacheValid_ = true;
-    }
+        sunCacheThrottleExpired;
     const std::int32_t requestedSkyRayCount =
         std::clamp(rayTracingSettings_.skyRays, 1, 9);
     const bool skySolidFieldChanged =
@@ -4541,23 +4521,65 @@ void VulkanRenderer::draw(World& world) {
     const bool skyCacheThrottleExpired =
         !skyVisibilityCacheValid_ ||
         particleTicks - lastSkyOcclusionTicks_ >= 100;
-    if (rayTracingSettings_.skyLightIntensity > 0.0001F &&
+    const bool rebuildSkyHorizons =
+        rayTracingSettings_.skyLightIntensity > 0.0001F &&
         (!skyVisibilityCacheValid_ ||
          skySolidFieldChanged || skyReceiverMoved ||
          skyRayCountChanged) &&
-        skyCacheThrottleExpired) {
+        skyCacheThrottleExpired;
+    float sunHorizonBuildMs = 0.0F;
+    float skyHorizonBuildMs = 0.0F;
+    if (rebuildSunHorizon || rebuildSkyHorizons) {
         const Vec2 receiverMargin{
             static_cast<float>(World::viewWidth) * 0.5F,
             static_cast<float>(World::viewHeight) * 0.5F,
         };
-        skyHorizons_.resize(
-            static_cast<std::size_t>(
-                requestedSkyRayCount));
+        if (rebuildSkyHorizons) {
+            skyHorizons_.resize(
+                static_cast<std::size_t>(
+                    requestedSkyRayCount));
+        }
         constexpr float maximumSkyAngle =
             80.0F / 360.0F * tau;
+        const std::size_t sunTaskCount =
+            rebuildSunHorizon ? 1U : 0U;
+        const std::size_t skyTaskCount =
+            rebuildSkyHorizons
+                ? static_cast<std::size_t>(
+                      requestedSkyRayCount)
+                : 0U;
+        std::vector<float> skyRayBuildMilliseconds(
+            skyTaskCount, 0.0F);
+        // Solid edits invalidate both fields together. Submit the sun and all
+        // sky directions as one batch so a bullet impact pays the cost of the
+        // slowest horizon instead of the sum of two global rebuilds.
         renderWorkerExecutor_.run(
-            static_cast<std::size_t>(requestedSkyRayCount),
-            [&](std::size_t rayIndex) {
+            sunTaskCount + skyTaskCount,
+            [&](std::size_t taskIndex) {
+                const auto horizonBegin =
+                    RenderClock::now();
+                if (rebuildSunHorizon && taskIndex == 0) {
+                    world.buildDirectionalSunHorizon(
+                        currentCelestial.sunDirection,
+                        sunHorizonSamplesPerCell,
+                        sunHorizonDepths_,
+                        sunHorizonBlockers_,
+                        sunHorizonMinimum_,
+                        camera - receiverMargin,
+                        camera + Vec2{
+                            static_cast<float>(
+                                World::viewWidth),
+                            static_cast<float>(
+                                World::viewHeight),
+                        } + receiverMargin);
+                    sunHorizonBuildMs =
+                        std::chrono::duration<float, std::milli>(
+                            RenderClock::now() - horizonBegin)
+                            .count();
+                    return;
+                }
+                const std::size_t rayIndex =
+                    taskIndex - sunTaskCount;
                 const float sample =
                     requestedSkyRayCount == 1
                         ? 0.5F
@@ -4584,7 +4606,26 @@ void VulkanRenderer::draw(World& world) {
                         static_cast<float>(World::viewWidth),
                         static_cast<float>(World::viewHeight),
                     } + receiverMargin);
+                skyRayBuildMilliseconds[rayIndex] =
+                    std::chrono::duration<float, std::milli>(
+                        RenderClock::now() - horizonBegin)
+                        .count();
             });
+        if (!skyRayBuildMilliseconds.empty()) {
+            skyHorizonBuildMs =
+                *std::max_element(
+                    skyRayBuildMilliseconds.begin(),
+                    skyRayBuildMilliseconds.end());
+        }
+    }
+    if (rebuildSunHorizon) {
+        cachedSunDirection_ = currentCelestial.sunDirection;
+        cachedSunCamera_ = camera;
+        cachedSunSolidRevision_ = world.solidRevision();
+        lastSunOcclusionTicks_ = particleTicks;
+        sunVisibilityCacheValid_ = true;
+    }
+    if (rebuildSkyHorizons) {
         cachedSkyCamera_ = camera;
         cachedSkySolidRevision_ = world.solidRevision();
         cachedSkyRayCount_ = requestedSkyRayCount;
@@ -5108,6 +5149,8 @@ void VulkanRenderer::draw(World& world) {
             milliseconds(synchronizeEnd, frameWaitEnd),
         .directionalCacheMs =
             milliseconds(frameWaitEnd, directionalCacheEnd),
+        .sunHorizonMs = sunHorizonBuildMs,
+        .skyHorizonMs = skyHorizonBuildMs,
         .sceneBuildMs =
             milliseconds(directionalCacheEnd, sceneBuildEnd),
         .materialTextureMs =
@@ -5134,6 +5177,10 @@ void VulkanRenderer::draw(World& world) {
               sample.frameWaitMs);
         blend(cpuRenderTimings_.directionalCacheMs,
               sample.directionalCacheMs);
+        blend(cpuRenderTimings_.sunHorizonMs,
+              sample.sunHorizonMs);
+        blend(cpuRenderTimings_.skyHorizonMs,
+              sample.skyHorizonMs);
         blend(cpuRenderTimings_.sceneBuildMs,
               sample.sceneBuildMs);
         blend(cpuRenderTimings_.materialTextureMs,

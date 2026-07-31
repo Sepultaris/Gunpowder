@@ -545,6 +545,10 @@ bool drawDeveloperUi(bool* open,
             cpuRenderTimings.directionalCacheMs,
             cpuRenderTimings.sceneBuildMs);
         ImGui::TextDisabled(
+            "Sun field %.3f | Sky field %.3f ms",
+            cpuRenderTimings.sunHorizonMs,
+            cpuRenderTimings.skyHorizonMs);
+        ImGui::TextDisabled(
             "Pack %.3f | Occupancy %.3f | Commands %.3f | Present %.3f ms",
             cpuRenderTimings.materialTextureMs,
             cpuRenderTimings.occupancyMs,

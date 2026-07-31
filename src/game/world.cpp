@@ -844,9 +844,31 @@ void World::setCell(int x, int y, Material material) {
             materialActivityMask(material);
         if (isSkyOccluder(previous) !=
             isSkyOccluder(material)) {
-            // Explicit construction or destruction can change support,
-            // containment, gas paths, and heat conduction simultaneously.
-            activityMask |= allMaterialActivity;
+            // A topology edit always changes granular support, but it should
+            // only wake the more expensive liquid, gas, and thermal solvers
+            // when one of those materials is actually close enough to use the
+            // new opening. Repeated bullet damage used to wake every solver in
+            // a growing trail of otherwise dry microtiles.
+            activityMask |= granularActivity;
+            for (int offsetY = -1; offsetY <= 1; ++offsetY) {
+                const int neighborY = y + offsetY;
+                if (neighborY < 0 || neighborY >= height) {
+                    continue;
+                }
+                for (int offsetX = -1; offsetX <= 1; ++offsetX) {
+                    const int neighborX = x + offsetX;
+                    if (neighborX < 0 || neighborX >= width) {
+                        continue;
+                    }
+                    const std::size_t neighbor =
+                        indexOf(neighborX, neighborY);
+                    activityMask |= materialActivityMask(
+                        cells_[neighbor]);
+                    if (heat_[neighbor] > 0.015F) {
+                        activityMask |= thermalActivity;
+                    }
+                }
+            }
         }
         markMaterialActive(x, y, activityMask);
     }
@@ -953,9 +975,7 @@ void World::swapCells(int firstX, int firstY, int secondX, int secondY) {
         materialActivityMask(firstMaterial) |
         materialActivityMask(secondMaterial);
     if (firstWasOccluder != secondWasOccluder) {
-        activityMask |= granularActivity |
-                        liquidActivity |
-                        gasActivity;
+        activityMask |= granularActivity;
     }
     if (heat_[first] > 0.015F || heat_[second] > 0.015F) {
         activityMask |= thermalActivity;

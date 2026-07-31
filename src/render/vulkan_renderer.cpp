@@ -1762,10 +1762,6 @@ void VulkanRenderer::createFrameResources() {
                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                          VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                      frame.textureStagingBuffer, frame.textureStagingMemory);
-        frame.textureShadow.resize(
-            static_cast<std::size_t>(textureBytes), 0);
-        frame.pendingTextureCopies.reserve(
-            materialUploadTileRows);
         createBuffer(particleBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                          VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
@@ -3482,65 +3478,77 @@ void VulkanRenderer::recordCommands(VkCommandBuffer commandBuffer,
             &readbackToHost, 0, nullptr);
     }
 
-    if (!frame.pendingTextureCopies.empty()) {
-        const VkImageMemoryBarrier toTransfer{
-            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-            .pNext = nullptr,
-            .srcAccessMask =
-                frame.textureInitialized ? VK_ACCESS_SHADER_READ_BIT : 0U,
-            .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-            .oldLayout = frame.textureInitialized
-                             ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
-                             : VK_IMAGE_LAYOUT_UNDEFINED,
-            .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .image = frame.textureImage,
-            .subresourceRange = {
-                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-                .baseMipLevel = 0,
-                .levelCount = 1,
-                .baseArrayLayer = 0,
-                .layerCount = 1,
-            },
-        };
-        vkCmdPipelineBarrier(
-            commandBuffer,
-            frame.textureInitialized
-                ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
-                      VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT
-                : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-            VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1,
-            &toTransfer);
-        vkCmdCopyBufferToImage(
-            commandBuffer, frame.textureStagingBuffer,
-            frame.textureImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-            static_cast<std::uint32_t>(
-                frame.pendingTextureCopies.size()),
-            frame.pendingTextureCopies.data());
-        const VkImageMemoryBarrier toCompute{
-            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-            .pNext = nullptr,
-            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
-            .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-            .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .image = frame.textureImage,
-            .subresourceRange = {
-                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-                .baseMipLevel = 0,
-                .levelCount = 1,
-                .baseArrayLayer = 0,
-                .layerCount = 1,
-            },
-        };
-        vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
-                                 VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-                             0, 0, nullptr, 0, nullptr, 1, &toCompute);
-    }
+    const VkImageMemoryBarrier toTransfer{
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .pNext = nullptr,
+        .srcAccessMask =
+            frame.textureInitialized ? VK_ACCESS_SHADER_READ_BIT : 0U,
+        .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+        .oldLayout = frame.textureInitialized
+                         ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+                         : VK_IMAGE_LAYOUT_UNDEFINED,
+        .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = frame.textureImage,
+        .subresourceRange = {
+            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+            .baseMipLevel = 0,
+            .levelCount = 1,
+            .baseArrayLayer = 0,
+            .layerCount = 1,
+        },
+    };
+    vkCmdPipelineBarrier(
+        commandBuffer,
+        frame.textureInitialized
+            ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                  VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT
+            : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1,
+        &toTransfer);
+    const VkBufferImageCopy copyRegion{
+        .bufferOffset = 0,
+        .bufferRowLength = 0,
+        .bufferImageHeight = 0,
+        .imageSubresource = {
+            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+            .mipLevel = 0,
+            .baseArrayLayer = 0,
+            .layerCount = 1,
+        },
+        .imageOffset = {0, 0, 0},
+        .imageExtent = {
+            textureWidth,
+            textureHeight,
+            1,
+        },
+    };
+    vkCmdCopyBufferToImage(commandBuffer, frame.textureStagingBuffer,
+                           frame.textureImage,
+                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copyRegion);
+    const VkImageMemoryBarrier toCompute{
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .pNext = nullptr,
+        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+        .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = frame.textureImage,
+        .subresourceRange = {
+            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+            .baseMipLevel = 0,
+            .levelCount = 1,
+            .baseArrayLayer = 0,
+            .layerCount = 1,
+        },
+    };
+    vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                             VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                         0, 0, nullptr, 0, nullptr, 1, &toCompute);
 
     const VkImageMemoryBarrier historyToCompute{
         .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
@@ -4965,178 +4973,6 @@ void VulkanRenderer::draw(World& world) {
                     (sunlit ? 1U : 0U));
         }
     }
-
-    frame.pendingTextureCopies.clear();
-    const bool cameraOriginChanged =
-        !frame.textureShadowValid ||
-        frame.textureOriginX != originX ||
-        frame.textureOriginY != originY;
-    std::array<std::uint8_t,
-               materialUploadTileColumns *
-                   materialUploadTileRows>
-        dirtyTiles{};
-    std::uint32_t dirtyTileCount = 0;
-    std::uint64_t dirtyPixelCount = 0;
-    for (std::uint32_t tileY = 0;
-         tileY < materialUploadTileRows; ++tileY) {
-        const std::uint32_t beginY =
-            tileY * materialUploadTileSize;
-        const std::uint32_t tileHeight =
-            std::min(materialUploadTileSize,
-                     textureHeight - beginY);
-        for (std::uint32_t tileX = 0;
-             tileX < materialUploadTileColumns; ++tileX) {
-            const std::uint32_t beginX =
-                tileX * materialUploadTileSize;
-            const std::uint32_t tileWidth =
-                std::min(materialUploadTileSize,
-                         textureWidth - beginX);
-            bool dirty = cameraOriginChanged;
-            if (!dirty) {
-                for (std::uint32_t row = 0;
-                     row < tileHeight; ++row) {
-                    const std::size_t byteOffset =
-                        (static_cast<std::size_t>(
-                             beginY + row) *
-                             textureWidth +
-                         beginX) *
-                        4U;
-                    if (std::memcmp(
-                            texturePixels + byteOffset,
-                            frame.textureShadow.data() +
-                                byteOffset,
-                            static_cast<std::size_t>(
-                                tileWidth) *
-                                4U) != 0) {
-                        dirty = true;
-                        break;
-                    }
-                }
-            }
-            if (!dirty) {
-                continue;
-            }
-            dirtyTiles[
-                static_cast<std::size_t>(tileY) *
-                    materialUploadTileColumns +
-                tileX] = 1;
-            ++dirtyTileCount;
-            dirtyPixelCount +=
-                static_cast<std::uint64_t>(tileWidth) *
-                tileHeight;
-        }
-    }
-
-    const std::uint64_t texturePixelCount =
-        static_cast<std::uint64_t>(textureWidth) *
-        textureHeight;
-    constexpr std::uint64_t fullUploadThresholdPercent = 60;
-    const bool useFullUpload =
-        !frame.textureInitialized ||
-        dirtyPixelCount * 100U >=
-            texturePixelCount *
-                fullUploadThresholdPercent;
-    std::uint64_t uploadedPixelCount = 0;
-    const VkImageSubresourceLayers colorSubresource{
-        .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-        .mipLevel = 0,
-        .baseArrayLayer = 0,
-        .layerCount = 1,
-    };
-    if (dirtyTileCount != 0 && useFullUpload) {
-        frame.pendingTextureCopies.push_back({
-            .bufferOffset = 0,
-            .bufferRowLength = textureWidth,
-            .bufferImageHeight = textureHeight,
-            .imageSubresource = colorSubresource,
-            .imageOffset = {0, 0, 0},
-            .imageExtent = {
-                textureWidth,
-                textureHeight,
-                1,
-            },
-        });
-        uploadedPixelCount = texturePixelCount;
-    } else {
-        // Merge horizontally adjacent dirty tiles into one copy command.
-        for (std::uint32_t tileY = 0;
-             tileY < materialUploadTileRows; ++tileY) {
-            std::uint32_t tileX = 0;
-            while (tileX < materialUploadTileColumns) {
-                while (tileX < materialUploadTileColumns &&
-                       dirtyTiles[
-                           static_cast<std::size_t>(tileY) *
-                               materialUploadTileColumns +
-                           tileX] == 0) {
-                    ++tileX;
-                }
-                if (tileX >= materialUploadTileColumns) {
-                    break;
-                }
-                const std::uint32_t runBegin = tileX;
-                while (tileX < materialUploadTileColumns &&
-                       dirtyTiles[
-                           static_cast<std::size_t>(tileY) *
-                               materialUploadTileColumns +
-                           tileX] != 0) {
-                    ++tileX;
-                }
-                const std::uint32_t beginX =
-                    runBegin * materialUploadTileSize;
-                const std::uint32_t beginY =
-                    tileY * materialUploadTileSize;
-                const std::uint32_t copyWidth =
-                    std::min(
-                        textureWidth,
-                        tileX * materialUploadTileSize) -
-                    beginX;
-                const std::uint32_t copyHeight =
-                    std::min(materialUploadTileSize,
-                             textureHeight - beginY);
-                frame.pendingTextureCopies.push_back({
-                    .bufferOffset =
-                        (static_cast<VkDeviceSize>(beginY) *
-                             textureWidth +
-                         beginX) *
-                        4U,
-                    .bufferRowLength = textureWidth,
-                    .bufferImageHeight = textureHeight,
-                    .imageSubresource = colorSubresource,
-                    .imageOffset = {
-                        static_cast<std::int32_t>(beginX),
-                        static_cast<std::int32_t>(beginY),
-                        0,
-                    },
-                    .imageExtent = {
-                        copyWidth,
-                        copyHeight,
-                        1,
-                    },
-                });
-                uploadedPixelCount +=
-                    static_cast<std::uint64_t>(
-                        copyWidth) *
-                    copyHeight;
-            }
-        }
-    }
-    std::memcpy(frame.textureShadow.data(), texturePixels,
-                static_cast<std::size_t>(textureBytes));
-    frame.textureOriginX = originX;
-    frame.textureOriginY = originY;
-    frame.textureShadowValid = true;
-    materialTextureUploadStats_ = {
-        .dirtyTiles = dirtyTileCount,
-        .copyRegions = static_cast<std::uint32_t>(
-            frame.pendingTextureCopies.size()),
-        .uploadedBytes = uploadedPixelCount * 4U,
-        .uploadedFraction =
-            static_cast<float>(uploadedPixelCount) /
-            static_cast<float>(texturePixelCount),
-        .fullRefresh =
-            !frame.pendingTextureCopies.empty() &&
-            useFullUpload,
-    };
     vkUnmapMemory(device_, frame.textureStagingMemory);
     for (std::uint32_t largeY = 0;
          largeY < occupancyLargeRows; ++largeY) {

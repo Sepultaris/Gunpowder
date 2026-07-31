@@ -100,14 +100,6 @@ struct GpuRayTimings {
     bool valid = false;
 };
 
-struct MaterialTextureUploadStats {
-    std::uint32_t dirtyTiles = 0;
-    std::uint32_t copyRegions = 0;
-    std::uint64_t uploadedBytes = 0;
-    float uploadedFraction = 0.0F;
-    bool fullRefresh = true;
-};
-
 class VulkanRenderer {
 public:
     explicit VulkanRenderer(SDL_Window* window);
@@ -133,23 +125,12 @@ public:
     [[nodiscard]] const GpuRayTimings& gpuRayTimings() const {
         return gpuRayTimings_;
     }
-    [[nodiscard]] const MaterialTextureUploadStats&
-    materialTextureUploadStats() const {
-        return materialTextureUploadStats_;
-    }
 
 private:
     static constexpr std::size_t framesInFlight = 2;
     static constexpr VkDeviceSize vertexBufferBytes = 16U * 1024U * 1024U;
     static constexpr std::uint32_t textureWidth = World::viewWidth + 2;
     static constexpr std::uint32_t textureHeight = World::viewHeight + 2;
-    static constexpr std::uint32_t materialUploadTileSize = 32;
-    static constexpr std::uint32_t materialUploadTileColumns =
-        (textureWidth + materialUploadTileSize - 1) /
-        materialUploadTileSize;
-    static constexpr std::uint32_t materialUploadTileRows =
-        (textureHeight + materialUploadTileSize - 1) /
-        materialUploadTileSize;
     // Lighting matches the material grid exactly. Display resolution remains
     // independent and can upscale both fields together.
     static constexpr std::uint32_t lightingResolutionScale = 1;
@@ -233,11 +214,6 @@ private:
         std::uint32_t particleSpawnCount = 0;
         VkDescriptorSet textureDescriptor = VK_NULL_HANDLE;
         bool textureInitialized = false;
-        std::vector<std::uint8_t> textureShadow;
-        std::vector<VkBufferImageCopy> pendingTextureCopies;
-        std::int32_t textureOriginX = 0;
-        std::int32_t textureOriginY = 0;
-        bool textureShadowValid = false;
         bool lightingHistoryValid = false;
         std::int32_t lightingOriginX = 0;
         std::int32_t lightingOriginY = 0;
@@ -441,7 +417,6 @@ private:
     bool imguiInitialized_ = false;
     float timestampPeriodNanoseconds_ = 1.0F;
     GpuRayTimings gpuRayTimings_{};
-    MaterialTextureUploadStats materialTextureUploadStats_{};
 };
 
 } // namespace gunpowder

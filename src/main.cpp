@@ -503,8 +503,6 @@ void sliderFloatWithReset(const char* label, float* value, float minimum,
 bool drawDeveloperUi(bool* open,
                      gunpowder::RayTracingSettings& settings,
                      const gunpowder::GpuRayTimings& gpuTimings,
-                     const gunpowder::MaterialTextureUploadStats&
-                         uploadStats,
                      const gunpowder::MaterialSimulationTimings&
                          materialTimings,
                      DisplaySettings& displaySettings,
@@ -536,13 +534,6 @@ bool drawDeveloperUi(bool* open,
     } else {
         ImGui::TextDisabled("GPU lighting timings: collecting...");
     }
-    ImGui::TextDisabled(
-        "Material upload: %.1f%% | %u dirty tiles | %u regions | %.1f KiB",
-        uploadStats.uploadedFraction * 100.0F,
-        uploadStats.dirtyTiles,
-        uploadStats.copyRegions,
-        static_cast<double>(uploadStats.uploadedBytes) /
-            1024.0);
     if (materialTimings.valid) {
         ImGui::Text(
             "CPU materials: %.3f ms", materialTimings.totalMs);
@@ -1306,7 +1297,6 @@ int main(int, char**) {
                 applyDisplay = drawDeveloperUi(
                     &developerUiOpen, renderer.rayTracingSettings(),
                     renderer.gpuRayTimings(),
-                    renderer.materialTextureUploadStats(),
                     world.materialSimulationTimings(),
                     displaySettings, renderProfiles,
                     displayError,

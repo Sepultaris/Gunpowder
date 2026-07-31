@@ -420,7 +420,10 @@ private:
     SparseGrid<float> granularFallRemainder_;
     SparseGrid<std::uint8_t> moved_;
     SparseGrid<std::uint32_t> liquidFrontierStamp_;
-    SparseGrid<std::uint32_t> liquidComponentStamp_;
+    // Equalization traversal is confined to the active camera window. A
+    // dense local stamp avoids sparse-world address translation for every
+    // one of the eight connectivity probes made per liquid cell.
+    std::vector<std::uint32_t> liquidComponentStamp_;
     SparseGrid<std::uint32_t> liquidSettledComponent_;
     std::vector<std::size_t> liquidWorklist_;
     std::vector<std::size_t> liquidNextWorklist_;

@@ -82,7 +82,6 @@ World::World()
       granularFallRemainder_(width, height, 0.0F),
       moved_(width, height, 0),
       liquidFrontierStamp_(width, height, 0),
-      liquidComponentStamp_(width, height, 0),
       liquidSettledComponent_(width, height, 0),
       materialChunkActivity_(
           static_cast<std::size_t>(
@@ -129,7 +128,9 @@ void World::regenerate() {
     granularFallRemainder_.reset(0.0F);
     moved_.reset(0);
     liquidFrontierStamp_.reset(0);
-    liquidComponentStamp_.reset(0);
+    std::fill(
+        liquidComponentStamp_.begin(),
+        liquidComponentStamp_.end(), 0);
     liquidSettledComponent_.reset(0);
     liquidFrontierGeneration_ = 0;
     liquidComponentGeneration_ = 0;
@@ -6096,11 +6097,34 @@ void World::prepareLiquidEqualization(const ActiveBounds& bounds) {
         liquidEqualizationReservation_.set(index, 0);
     }
     liquidReservedCells_.clear();
+    const int componentWidth =
+        std::max(0, bounds.maxX - bounds.minX);
+    const int componentHeight =
+        std::max(0, bounds.maxY - bounds.minY);
+    const std::size_t componentCellCount =
+        static_cast<std::size_t>(componentWidth) *
+        static_cast<std::size_t>(componentHeight);
+    if (liquidComponentStamp_.size() <
+        componentCellCount) {
+        liquidComponentStamp_.resize(
+            componentCellCount, 0);
+    }
     ++liquidComponentGeneration_;
     if (liquidComponentGeneration_ == 0) {
-        liquidComponentStamp_.reset(0);
+        std::fill(
+            liquidComponentStamp_.begin(),
+            liquidComponentStamp_.end(), 0);
         ++liquidComponentGeneration_;
     }
+    const auto componentStampIndex =
+        [&](int x, int y) {
+            return static_cast<std::size_t>(
+                       y - bounds.minY) *
+                       static_cast<std::size_t>(
+                           componentWidth) +
+                   static_cast<std::size_t>(
+                       x - bounds.minX);
+        };
     const auto reserveCell = [&](std::size_t index, std::uint8_t reservation) {
         if (liquidEqualizationReservation_[index] == 0) {
             liquidReservedCells_.push_back(index);
@@ -6191,8 +6215,11 @@ void World::prepareLiquidEqualization(const ActiveBounds& bounds) {
                     continue;
                 }
                 const Material material = cells_[seed];
+                const std::size_t seedStamp =
+                    componentStampIndex(
+                        seedX, seedY);
                 if (!isLiquid(material) ||
-                    liquidComponentStamp_[seed] ==
+                    liquidComponentStamp_[seedStamp] ==
                         liquidComponentGeneration_) {
                     continue;
                 }
@@ -6204,7 +6231,8 @@ void World::prepareLiquidEqualization(const ActiveBounds& bounds) {
                 liquidHighSurfaces_.clear();
                 liquidLowSurfaces_.clear();
                 liquidComponentQueue_.push_back(seed);
-                liquidComponentStamp_[seed] = liquidComponentGeneration_;
+                liquidComponentStamp_[seedStamp] =
+                    liquidComponentGeneration_;
                 int highestSurfaceY = bounds.maxY;
                 int lowestSurfaceY = bounds.minY - 1;
                 bool hasDownwardPath = false;
@@ -6256,10 +6284,15 @@ void World::prepareLiquidEqualization(const ActiveBounds& bounds) {
                         }
                         const std::size_t neighbor =
                             indexOf(neighborX, neighborY);
-                        if (liquidComponentStamp_[neighbor] !=
+                        const std::size_t neighborStamp =
+                            componentStampIndex(
+                                neighborX, neighborY);
+                        if (liquidComponentStamp_[
+                                neighborStamp] !=
                                 liquidComponentGeneration_ &&
                             cells_[neighbor] == material) {
-                            liquidComponentStamp_[neighbor] =
+                            liquidComponentStamp_[
+                                neighborStamp] =
                                 liquidComponentGeneration_;
                             liquidComponentQueue_.push_back(neighbor);
                         }
@@ -6849,7 +6882,6 @@ void World::releaseEmptySimulationPages() {
     release(gasDrift_);
     release(moved_);
     release(liquidFrontierStamp_);
-    release(liquidComponentStamp_);
 }
 
 void World::updateCamera(float dt) {

@@ -4555,37 +4555,36 @@ void VulkanRenderer::draw(World& world) {
                 requestedSkyRayCount));
         constexpr float maximumSkyAngle =
             80.0F / 360.0F * tau;
-        for (std::int32_t rayIndex = 0;
-             rayIndex < requestedSkyRayCount;
-             ++rayIndex) {
-            const float sample =
-                requestedSkyRayCount == 1
-                    ? 0.5F
-                    : static_cast<float>(rayIndex) /
-                          static_cast<float>(
-                              requestedSkyRayCount - 1);
-            const float angle =
-                -maximumSkyAngle +
-                sample * maximumSkyAngle * 2.0F;
-            DirectionalHorizon& horizon =
-                skyHorizons_[static_cast<std::size_t>(
-                    rayIndex)];
-            horizon.direction = {
-                std::sin(angle),
-                -std::cos(angle),
-            };
-            world.buildDirectionalSunHorizon(
-                horizon.direction,
-                skyHorizonSamplesPerCell,
-                horizon.depths,
-                horizon.blockers,
-                horizon.minimumPerpendicularCoordinate,
-                camera - receiverMargin,
-                camera + Vec2{
-                    static_cast<float>(World::viewWidth),
-                    static_cast<float>(World::viewHeight),
-                } + receiverMargin);
-        }
+        renderWorkerExecutor_.run(
+            static_cast<std::size_t>(requestedSkyRayCount),
+            [&](std::size_t rayIndex) {
+                const float sample =
+                    requestedSkyRayCount == 1
+                        ? 0.5F
+                        : static_cast<float>(rayIndex) /
+                              static_cast<float>(
+                                  requestedSkyRayCount - 1);
+                const float angle =
+                    -maximumSkyAngle +
+                    sample * maximumSkyAngle * 2.0F;
+                DirectionalHorizon& horizon =
+                    skyHorizons_[rayIndex];
+                horizon.direction = {
+                    std::sin(angle),
+                    -std::cos(angle),
+                };
+                world.buildDirectionalSunHorizon(
+                    horizon.direction,
+                    skyHorizonSamplesPerCell,
+                    horizon.depths,
+                    horizon.blockers,
+                    horizon.minimumPerpendicularCoordinate,
+                    camera - receiverMargin,
+                    camera + Vec2{
+                        static_cast<float>(World::viewWidth),
+                        static_cast<float>(World::viewHeight),
+                    } + receiverMargin);
+            });
         cachedSkyCamera_ = camera;
         cachedSkySolidRevision_ = world.solidRevision();
         cachedSkyRayCount_ = requestedSkyRayCount;
@@ -4790,12 +4789,29 @@ void VulkanRenderer::draw(World& world) {
                        skyHorizons_.size());
         };
 
-    for (std::uint32_t textureY = 0; textureY < textureHeight; ++textureY) {
-        const int worldY = std::clamp(
-            originY + static_cast<int>(textureY), 0, World::height - 1);
-        const std::size_t rowStart =
-            static_cast<std::size_t>(worldY) * World::width;
-        for (std::uint32_t textureX = 0; textureX < textureWidth; ++textureX) {
+    // Each job owns one complete occupancy-block row. This keeps material
+    // pixels and the matching occupancy bytes disjoint while spreading the
+    // expensive whole-world sun/skylight horizon lookups across the persistent
+    // worker group. The packed texture is bit-for-bit identical to the serial
+    // path; only its construction is parallel.
+    renderWorkerExecutor_.run(
+        occupancyRows,
+        [&](std::size_t blockRowIndex) {
+            const std::uint32_t firstTextureY =
+                static_cast<std::uint32_t>(blockRowIndex) *
+                occupancyBlockSize;
+            const std::uint32_t lastTextureY =
+                std::min(firstTextureY + occupancyBlockSize,
+                         textureHeight);
+            for (std::uint32_t textureY = firstTextureY;
+                 textureY < lastTextureY; ++textureY) {
+                const int worldY = std::clamp(
+                    originY + static_cast<int>(textureY),
+                    0, World::height - 1);
+                const std::size_t rowStart =
+                    static_cast<std::size_t>(worldY) * World::width;
+                for (std::uint32_t textureX = 0;
+                     textureX < textureWidth; ++textureX) {
             const int worldX = std::clamp(
                 originX + static_cast<int>(textureX), 0, World::width - 1);
             const std::size_t worldIndex =
@@ -4978,8 +4994,9 @@ void VulkanRenderer::draw(World& world) {
                     (packedSky4 << 4U) |
                     ((packedFoam & 0x07U) << 1U) |
                     (sunlit ? 1U : 0U));
-        }
-    }
+                }
+            }
+        });
     vkUnmapMemory(device_, frame.textureStagingMemory);
     const auto materialTextureEnd = RenderClock::now();
     for (std::uint32_t largeY = 0;

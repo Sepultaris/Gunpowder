@@ -1,5 +1,6 @@
 #pragma once
 
+#include "game/parallel_executor.hpp"
 #include "game/world.hpp"
 
 #include <SDL.h>
@@ -434,6 +435,7 @@ private:
     float timestampPeriodNanoseconds_ = 1.0F;
     GpuRayTimings gpuRayTimings_{};
     CpuRenderTimings cpuRenderTimings_{};
+    ParallelExecutor renderWorkerExecutor_{};
 };
 
 } // namespace gunpowder

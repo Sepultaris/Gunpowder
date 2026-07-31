@@ -336,6 +336,8 @@ private:
         int x, int y,
         std::uint8_t activityMask = allMaterialActivity);
     void invalidateSettledLiquidNear(int x, int y);
+    void invalidateSettledLiquidVerticalMove(
+        int x, int sourceY, int destinationY);
     [[nodiscard]] bool
     liquidCellBelongsToSettledComponent(std::size_t index) const;
     [[nodiscard]] bool materialChunkActive(

@@ -1063,6 +1063,35 @@ void World::invalidateSettledLiquidNear(int x, int y) {
     }
 }
 
+void World::invalidateSettledLiquidVerticalMove(
+    int x, int sourceY, int destinationY) {
+    const int firstY =
+        std::max(0, std::min(sourceY, destinationY) - 1);
+    const int finalY =
+        std::min(
+            height - 1,
+            std::max(sourceY, destinationY) + 1);
+    for (int sampleY = firstY;
+         sampleY <= finalY; ++sampleY) {
+        for (int sampleX = std::max(0, x - 1);
+             sampleX <= std::min(width - 1, x + 1);
+             ++sampleX) {
+            const std::uint32_t component =
+                liquidSettledComponent_[
+                    indexOf(sampleX, sampleY)];
+            if (component != 0 &&
+                component <
+                    settledLiquidComponentValid_.size()) {
+                settledLiquidComponentValid_[component] = 0;
+            }
+        }
+    }
+    liquidSettledComponent_.set(
+        indexOf(x, sourceY), 0);
+    liquidSettledComponent_.set(
+        indexOf(x, destinationY), 0);
+}
+
 bool World::liquidCellBelongsToSettledComponent(
     std::size_t index) const {
     const std::uint32_t component =
@@ -4176,12 +4205,18 @@ void World::cacheLiquidColumnHeads(const ActiveBounds& bounds) {
                 }
             }
 
+            std::array<Material, chunkSize>
+                cachedMaterials{};
+            std::array<std::uint8_t, chunkSize>
+                cachedDepths{};
             for (int x = beginX; x < endX; ++x) {
                 const std::size_t localX =
                     static_cast<std::size_t>(
                         x - chunkOriginX);
-                Material cachedMaterial = Material::air;
-                std::uint8_t cachedDepth = 0;
+                Material& cachedMaterial =
+                    cachedMaterials[localX];
+                std::uint8_t& cachedDepth =
+                    cachedDepths[localX];
                 if (aboveSummary) {
                     cachedMaterial =
                         aboveSummary->bottomMaterial[localX];
@@ -4211,8 +4246,20 @@ void World::cacheLiquidColumnHeads(const ActiveBounds& bounds) {
                         cachedMaterial = Material::air;
                     }
                 }
+            }
 
-                for (int y = beginY; y < endY; ++y) {
+            // Chunk storage is row-major. Advancing x in the inner loop keeps
+            // material, depth, and foam accesses contiguous while the two
+            // small arrays retain each column's vertical recurrence.
+            for (int y = beginY; y < endY; ++y) {
+                for (int x = beginX; x < endX; ++x) {
+                    const std::size_t localX =
+                        static_cast<std::size_t>(
+                            x - chunkOriginX);
+                    Material& cachedMaterial =
+                        cachedMaterials[localX];
+                    std::uint8_t& cachedDepth =
+                        cachedDepths[localX];
                     const std::size_t index = indexOf(x, y);
                     const Material material = cells_[index];
                     ++visitCount;
@@ -4248,11 +4295,16 @@ void World::cacheLiquidColumnHeads(const ActiveBounds& bounds) {
                         liquidFoam_[index] = 0;
                     }
                 }
+            }
 
+            for (int x = beginX; x < endX; ++x) {
+                const std::size_t localX =
+                    static_cast<std::size_t>(
+                        x - chunkOriginX);
                 summary->bottomMaterial[localX] =
-                    cachedMaterial;
+                    cachedMaterials[localX];
                 summary->bottomDepth[localX] =
-                    cachedDepth;
+                    cachedDepths[localX];
             }
             summary->generation =
                 liquidPreparationGeneration_;
@@ -5141,13 +5193,18 @@ void World::updateLiquids(const ActiveBounds& bounds, bool waterOnly) {
                     static_cast<std::size_t>(width));
                 markMaterialActive(
                     sourceX, sourceY, effect.activityMask);
-                markMaterialActive(
-                    destinationX, destinationY,
-                    effect.activityMask);
-                invalidateSettledLiquidNear(
-                    sourceX, sourceY);
-                invalidateSettledLiquidNear(
-                    destinationX, destinationY);
+                const bool crossesActivityTile =
+                    sourceX / materialMicrotileSize !=
+                        destinationX / materialMicrotileSize ||
+                    sourceY / materialMicrotileSize !=
+                        destinationY / materialMicrotileSize;
+                if (crossesActivityTile) {
+                    markMaterialActive(
+                        destinationX, destinationY,
+                        effect.activityMask);
+                }
+                invalidateSettledLiquidVerticalMove(
+                    sourceX, sourceY, destinationY);
                 for (int offsetY = -1; offsetY <= 1; ++offsetY) {
                     for (int offsetX = -1;
                          offsetX <= 1; ++offsetX) {

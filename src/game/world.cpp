@@ -5200,6 +5200,10 @@ void World::updateLiquids(const ActiveBounds& bounds, bool waterOnly) {
                 verticalAccepted[jobIndex];
             currentParallelLiquidVerticalMoves_ +=
                 verticalAccepted[jobIndex];
+            int previousDestinationX =
+                std::numeric_limits<int>::min();
+            int previousDestinationY =
+                std::numeric_limits<int>::min();
             for (const VerticalMoveSideEffects& effect :
                  verticalSideEffects[jobIndex]) {
                 const int sourceX = static_cast<int>(
@@ -5228,14 +5232,30 @@ void World::updateLiquids(const ActiveBounds& bounds, bool waterOnly) {
                 }
                 invalidateSettledLiquidVerticalMove(
                     sourceX, sourceY, destinationY);
-                for (int offsetY = -1; offsetY <= 1; ++offsetY) {
+                if (destinationX == previousDestinationX &&
+                    destinationY == previousDestinationY - 1) {
+                    // Consecutive bottom-to-top moves in one column have
+                    // overlapping 3x3 frontier neighborhoods. Only their new
+                    // top row has not already been enqueued.
                     for (int offsetX = -1;
                          offsetX <= 1; ++offsetX) {
                         enqueueNext(
                             destinationX + offsetX,
-                            destinationY + offsetY);
+                            destinationY - 1);
+                    }
+                } else {
+                    for (int offsetY = -1;
+                         offsetY <= 1; ++offsetY) {
+                        for (int offsetX = -1;
+                             offsetX <= 1; ++offsetX) {
+                            enqueueNext(
+                                destinationX + offsetX,
+                                destinationY + offsetY);
+                        }
                     }
                 }
+                previousDestinationX = destinationX;
+                previousDestinationY = destinationY;
             }
         }
 
@@ -6315,6 +6335,8 @@ void World::updateHeat() {
         int chunkX = 0;
         int chunkY = 0;
         std::vector<std::size_t> cells;
+        std::array<std::uint16_t, chunkSize + 1>
+            rowOffsets{};
     };
     std::array<std::vector<ThermalChunkJob>, 4> phaseJobs;
     constexpr std::size_t thermalSystem =
@@ -6383,6 +6405,12 @@ void World::updateHeat() {
                     bounds.maxY,
                     chunkOriginY + chunkSize);
                 for (int y = beginY; y < endY; ++y) {
+                    const std::size_t localY =
+                        static_cast<std::size_t>(
+                            y - chunkOriginY);
+                    job.rowOffsets[localY] =
+                        static_cast<std::uint16_t>(
+                            job.cells.size());
                     for (int microtileX = 0;
                          microtileX <
                              materialMicrotilesPerAxis;
@@ -6447,18 +6475,64 @@ void World::updateHeat() {
                                     value, 0.0F, 1.0F);
                         }
                     }
+                    job.rowOffsets[localY + 1] =
+                        static_cast<std::uint16_t>(
+                            job.cells.size());
                 }
             });
     }
+    const int activeChunkColumns =
+        finalChunkX - firstChunkX;
+    const int activeChunkRows =
+        finalChunkY - firstChunkY;
+    std::vector<const ThermalChunkJob*> thermalJobsByChunk(
+        static_cast<std::size_t>(
+            activeChunkColumns * activeChunkRows),
+        nullptr);
+    std::size_t thermalCellCount = 0;
     for (const auto& jobs : phaseJobs) {
         for (const ThermalChunkJob& job : jobs) {
-            thermalWorklist_.insert(
-                thermalWorklist_.end(),
-                job.cells.begin(), job.cells.end());
+            const int localChunkX =
+                job.chunkX - firstChunkX;
+            const int localChunkY =
+                job.chunkY - firstChunkY;
+            thermalJobsByChunk[static_cast<std::size_t>(
+                localChunkY * activeChunkColumns +
+                localChunkX)] = &job;
+            thermalCellCount += job.cells.size();
         }
     }
-    std::sort(thermalWorklist_.begin(),
-              thermalWorklist_.end());
+    thermalWorklist_.reserve(thermalCellCount);
+    // Each job already records cells in ascending x order for every row.
+    // Merge row slices from left-to-right chunks to recover the exact global
+    // index order without comparison-sorting the entire thermal frontier.
+    for (int y = bounds.minY; y < bounds.maxY; ++y) {
+        const int chunkY = y / chunkSize;
+        const std::size_t localY =
+            static_cast<std::size_t>(
+                y - chunkY * chunkSize);
+        for (int chunkX = firstChunkX;
+             chunkX < finalChunkX; ++chunkX) {
+            const ThermalChunkJob* job =
+                thermalJobsByChunk[static_cast<std::size_t>(
+                    (chunkY - firstChunkY) *
+                        activeChunkColumns +
+                    (chunkX - firstChunkX))];
+            if (job == nullptr) {
+                continue;
+            }
+            const std::size_t rowBegin =
+                job->rowOffsets[localY];
+            const std::size_t rowEnd =
+                job->rowOffsets[localY + 1];
+            thermalWorklist_.insert(
+                thermalWorklist_.end(),
+                job->cells.begin() +
+                    static_cast<std::ptrdiff_t>(rowBegin),
+                job->cells.begin() +
+                    static_cast<std::ptrdiff_t>(rowEnd));
+        }
+    }
     for (std::size_t index : thermalWorklist_) {
         if (nextHeat_[index] > 0.015F) {
             const int x = static_cast<int>(

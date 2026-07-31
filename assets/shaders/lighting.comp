@@ -27,6 +27,7 @@ layout(std430, binding = 17) readonly buffer OccupancyHierarchy {
     uint occupied[];
 } occupancyHierarchy;
 layout(rgba16f, binding = 18) uniform image2D sunTransmittanceImage;
+layout(rgba16f, binding = 19) uniform image2D giScratch;
 
 layout(push_constant) uniform TraceSettings {
     // x/y: absolute world origin, z: packed options, w: rays per light
@@ -49,14 +50,22 @@ const float goldenAngle = 2.39996323;
 const int lightingResolutionScale = 1;
 const int shadowFilterRadius = 3;
 const int visibilityFilterRadius = 2;
-const int shadowTileWidth = 8 + shadowFilterRadius * 2;
-const int shadowTileHeight = 8 + shadowFilterRadius * 2;
+const int maximumGiFilterRadius = 5;
+const int filterTileRadius = maximumGiFilterRadius;
+const int shadowTileWidth = 8 + filterTileRadius * 2;
+const int shadowTileHeight = 8 + filterTileRadius * 2;
 // A mild sigma ~= 1.65 Gaussian. The samples are already resident in shared
 // memory for the edge-aware GI filter, so this changes weighting without
 // adding another image pass or any global texture reads.
 const float giGaussianWeights[7] = float[](
     0.1915, 0.4804, 0.8324, 1.0,
     0.8324, 0.4804, 0.1915);
+// Low ray counts need a wider reconstruction footprint. This remains
+// edge-aware below, so it smooths irradiance without leaking it through
+// material boundaries.
+const float giWideGaussianWeights[11] = float[](
+    0.1040, 0.2350, 0.4430, 0.6960, 0.9130, 1.0,
+    0.9130, 0.6960, 0.4430, 0.2350, 0.1040);
 shared vec4 shadowTile[shadowTileWidth * shadowTileHeight];
 shared vec3 giTile[shadowTileWidth * shadowTileHeight];
 shared uint solidTile[shadowTileWidth * shadowTileHeight];
@@ -138,6 +147,27 @@ vec4 packGiColor(vec3 gi, uint material) {
     return vec4(
         clamp(gi, vec3(0.0), vec3(1.0)),
         float(material & 15u));
+}
+
+uint unpackGiCacheMaterial(vec4 packedGi) {
+    return uint(floor(packedGi.a + 0.001));
+}
+
+float unpackGiCacheDirect(vec4 packedGi) {
+    return fract(packedGi.a) * 4.0;
+}
+
+vec4 packGiCacheColor(
+    vec3 gi, uint material, float directIllumination) {
+    // RGBA16F leaves enough precision in alpha to retain the material class
+    // and a small direct-light signature together. The signature lets the
+    // adaptive GI cache distinguish a genuinely stable world cell from one
+    // whose player, fire, or sun lighting changed.
+    float directSignature =
+        clamp(directIllumination, 0.0, 2.0) * 0.25;
+    return vec4(
+        clamp(gi, vec3(0.0), vec3(1.0)),
+        float(material & 15u) + directSignature);
 }
 
 float giLuminance(vec3 gi) {
@@ -632,9 +662,20 @@ uint hashUint(uint value) {
 float pathRandom(ivec2 cell, int rayIndex, int bounceIndex) {
     uint frameSeed =
         (uint(trace.originAndOptions.z) >> 17u) & 0x3fffu;
+    int giRayCount =
+        (trace.originAndOptions.z >> 8) & 255;
+    // With only a handful of paths, rotating the complete sample set each
+    // time a cached cell refreshes produces visible temporal crawling. Keep
+    // those sparse samples deterministic in world space and let the
+    // edge-aware spatial filter remove their fixed grain. Larger sample sets
+    // still advance over time and converge through temporal accumulation.
+    if (giRayCount < 6) {
+        frameSeed = 0u;
+    }
+    ivec2 worldCell = trace.originAndOptions.xy + cell;
     uint spatialSeed =
-        uint(cell.x) * 0x9e3779b9u ^
-        uint(cell.y) * 0x85ebca6bu ^
+        uint(worldCell.x) * 0x9e3779b9u ^
+        uint(worldCell.y) * 0x85ebca6bu ^
         uint(rayIndex + 1) * 0xc2b2ae35u ^
         uint(bounceIndex + 7) * 0x27d4eb2fu;
     float baseSample =
@@ -1028,6 +1069,58 @@ bool filterPathMatchesMaterialClass(
     return true;
 }
 
+bool horizontalFilterPathMatchesMaterialClass(
+    ivec2 centerCell, ivec2 extent, int offsetX,
+    uint centerClass) {
+    int direction = offsetX < 0 ? -1 : 1;
+    for (int step = 1; step < abs(offsetX); ++step) {
+        ivec2 pathCell = clamp(
+            centerCell + ivec2(step * direction, 0),
+            ivec2(0), extent - ivec2(1));
+        uint pathMaterial =
+            texelFetch(materialTexture, pathCell, 0).r;
+        if (giFilterClass(pathMaterial) != centerClass) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void prefilterGiHorizontal(ivec2 cell, ivec2 extent) {
+    uint material =
+        texelFetch(materialTexture, cell, 0).r;
+    uint centerClass = giFilterClass(material);
+    vec3 filteredGi = vec3(0.0);
+    float totalWeight = 0.0;
+    for (int offsetX = -maximumGiFilterRadius;
+         offsetX <= maximumGiFilterRadius; ++offsetX) {
+        ivec2 sampleCell = clamp(
+            cell + ivec2(offsetX, 0),
+            ivec2(0), extent - ivec2(1));
+        uint sampleMaterial =
+            texelFetch(materialTexture, sampleCell, 0).r;
+        if (giFilterClass(sampleMaterial) != centerClass ||
+            !horizontalFilterPathMatchesMaterialClass(
+                cell, extent, offsetX, centerClass)) {
+            continue;
+        }
+        float weight =
+            giWideGaussianWeights[
+                offsetX + maximumGiFilterRadius];
+        filteredGi +=
+            unpackGiColor(
+                imageLoad(giIntermediate, sampleCell)) *
+            weight;
+        totalWeight += weight;
+    }
+    vec4 centerGi = imageLoad(giIntermediate, cell);
+    imageStore(
+        giScratch, cell,
+        packGiCacheColor(
+            filteredGi / max(totalWeight, 1.0), material,
+            unpackGiCacheDirect(centerGi)));
+}
+
 ivec2 historyCameraOffset() {
     uint packedOffset = floatBitsToUint(trace.indirect.w);
     int offsetX = int(packedOffset & 0xffffu);
@@ -1053,7 +1146,7 @@ bool loadHistory(
         return false;
     }
     history = texelFetch(historyImage, historyCell, 0);
-    return uint(round(history.a)) == currentMaterial;
+    return unpackGiCacheMaterial(history) == currentMaterial;
 }
 
 void filterVisibility(ivec2 cell, ivec2 extent) {
@@ -1067,13 +1160,17 @@ void filterVisibility(ivec2 cell, ivec2 extent) {
         int tileY = int(index / uint(shadowTileWidth));
         ivec2 sampleCell = clamp(
             groupBase +
-                ivec2(tileX - shadowFilterRadius,
-                      tileY - shadowFilterRadius),
+                ivec2(tileX - filterTileRadius,
+                      tileY - filterTileRadius),
             ivec2(0), extent - ivec2(1));
         uvec4 rawVisibility =
             imageLoad(lightingIntermediate, sampleCell);
+        int giRayCount =
+            (trace.originAndOptions.z >> 8) & 255;
         vec4 rawGi =
-            imageLoad(giIntermediate, sampleCell);
+            giRayCount < 6
+                ? imageLoad(giScratch, sampleCell)
+                : imageLoad(giIntermediate, sampleCell);
         uvec4 derived = imageLoad(derivedImage, sampleCell);
         shadowTile[index] = vec4(
             vec2(rawVisibility.rg) / 255.0,
@@ -1090,9 +1187,9 @@ void filterVisibility(ivec2 cell, ivec2 extent) {
         return;
     }
     int centerX =
-        int(gl_LocalInvocationID.x) + shadowFilterRadius;
+        int(gl_LocalInvocationID.x) + filterTileRadius;
     int centerY =
-        int(gl_LocalInvocationID.y) + shadowFilterRadius;
+        int(gl_LocalInvocationID.y) + filterTileRadius;
     uint centerSolid =
         solidTile[centerY * shadowTileWidth + centerX];
     vec4 filtered = vec4(0.0);
@@ -1102,6 +1199,9 @@ void filterVisibility(ivec2 cell, ivec2 extent) {
     float sunVisibilityWeight = 0.0;
     vec3 giMinimum = vec3(1.0);
     vec3 giMaximum = vec3(0.0);
+    int giRayCount =
+        (trace.originAndOptions.z >> 8) & 255;
+    bool wideGiFilter = giRayCount < 6;
     for (int offsetY = -shadowFilterRadius;
          offsetY <= shadowFilterRadius; ++offsetY) {
         for (int offsetX = -shadowFilterRadius;
@@ -1117,11 +1217,20 @@ void filterVisibility(ivec2 cell, ivec2 extent) {
                     centerSolid)) {
                 continue;
             }
-            float weight =
-                giGaussianWeights[offsetX + shadowFilterRadius] *
-                giGaussianWeights[offsetY + shadowFilterRadius];
-            filteredGi += giTile[tileIndex] * weight;
-            giWeight += weight;
+            if (!wideGiFilter) {
+                float giSampleWeight =
+                    giGaussianWeights[
+                        offsetX + shadowFilterRadius] *
+                    giGaussianWeights[
+                        offsetY + shadowFilterRadius];
+                filteredGi +=
+                    giTile[tileIndex] * giSampleWeight;
+                giWeight += giSampleWeight;
+                giMinimum =
+                    min(giMinimum, giTile[tileIndex]);
+                giMaximum =
+                    max(giMaximum, giTile[tileIndex]);
+            }
             if (abs(offsetX) <= visibilityFilterRadius &&
                 abs(offsetY) <= visibilityFilterRadius) {
                 float visibilityWeightAtSample =
@@ -1143,7 +1252,10 @@ void filterVisibility(ivec2 cell, ivec2 extent) {
                 abs(offsetY) <= sunFilterRadius) {
                 float sunWeight =
                     centerSolid == 2u || centerSolid == 3u
-                        ? weight
+                        ? giGaussianWeights[
+                              offsetX + shadowFilterRadius] *
+                              giGaussianWeights[
+                                  offsetY + shadowFilterRadius]
                         : float(sunFilterRadius + 1 -
                                 abs(offsetX)) *
                               float(sunFilterRadius + 1 -
@@ -1152,6 +1264,26 @@ void filterVisibility(ivec2 cell, ivec2 extent) {
                     shadowTile[tileIndex].a * sunWeight;
                 sunVisibilityWeight += sunWeight;
             }
+        }
+    }
+    if (wideGiFilter) {
+        for (int offsetY = -maximumGiFilterRadius;
+             offsetY <= maximumGiFilterRadius; ++offsetY) {
+            int tileIndex =
+                (centerY + offsetY) * shadowTileWidth +
+                centerX;
+            if (solidTile[tileIndex] != centerSolid ||
+                !filterPathMatchesMaterialClass(
+                    centerX, centerY, 0, offsetY,
+                    centerSolid)) {
+                continue;
+            }
+            float giSampleWeight =
+                giWideGaussianWeights[
+                    offsetY + maximumGiFilterRadius];
+            filteredGi +=
+                giTile[tileIndex] * giSampleWeight;
+            giWeight += giSampleWeight;
             giMinimum =
                 min(giMinimum, giTile[tileIndex]);
             giMaximum =
@@ -1187,7 +1319,10 @@ void filterVisibility(ivec2 cell, ivec2 extent) {
                packLighting(filtered.rg, filtered.b,
                             currentMaterial));
     imageStore(giFinal, cell,
-               packGiColor(filteredGi, currentMaterial));
+               packGiCacheColor(
+                   filteredGi, currentMaterial,
+                   unpackGiCacheDirect(
+                       imageLoad(giIntermediate, cell))));
     uvec4 derived = imageLoad(derivedImage, cell);
     derived.g = uint(round(clamp(filtered.a, 0.0, 1.0) * 255.0));
     imageStore(derivedImage, cell, derived);
@@ -1196,6 +1331,15 @@ void filterVisibility(ivec2 cell, ivec2 extent) {
 void main() {
     ivec2 outputCell = ivec2(gl_GlobalInvocationID.xy);
     ivec2 extent = imageSize(lightingIntermediate);
+    bool giPrefilterStage =
+        (uint(trace.originAndOptions.z) & 0x80000000u) != 0u;
+    if (giPrefilterStage) {
+        if (any(greaterThanEqual(outputCell, extent))) {
+            return;
+        }
+        prefilterGiHorizontal(outputCell, extent);
+        return;
+    }
     if (trace.sunCache.w != 0) {
         if (any(greaterThanEqual(outputCell, extent))) {
             return;
@@ -1245,27 +1389,41 @@ void main() {
             imageLoad(lightingFinal, outputCell);
         vec2 visibility = vec2(cachedDirect.rg) / 255.0;
         vec3 indirectLight = vec3(0.0);
+        float giCacheDirect =
+            unpackGi(cachedDirect) * 2.0;
         if (!debugMode) {
             bool reusedHistory = false;
             bool adaptiveSampling =
                 (trace.originAndOptions.z & 8) != 0;
             vec4 history;
+            float directIllumination =
+                unpackGi(cachedDirect) * 2.0;
             if (adaptiveSampling &&
                 loadHistory(
                     outputCell, extent, material, history)) {
                 uint frameSeed =
                     (uint(trace.originAndOptions.z) >> 17u) &
                     0x3fffu;
-                float directIllumination =
-                    unpackGi(cachedDirect) * 2.0;
+                float cachedDirectIllumination =
+                    unpackGiCacheDirect(history);
+                float directDifference = abs(
+                    directIllumination -
+                    cachedDirectIllumination);
+                // Bright or changing regions react sooner. Stable dark
+                // regions retain their world-space irradiance longer.
                 uint updatePeriod =
-                    directIllumination > 0.08 ? 2u : 4u;
+                    directIllumination > 0.08 ? 4u : 8u;
+                ivec2 worldCell =
+                    trace.originAndOptions.xy + cell;
                 uint updatePhase =
-                    (uint(outputCell.x) +
-                     uint(outputCell.y) * 3u + frameSeed) &
+                    (uint(worldCell.x) +
+                     uint(worldCell.y) * 3u + frameSeed) &
                     (updatePeriod - 1u);
-                if (updatePhase != 0u) {
+                if (directDifference < 0.025 &&
+                    updatePhase != 0u) {
                     indirectLight = unpackGiColor(history);
+                    giCacheDirect =
+                        cachedDirectIllumination;
                     reusedHistory = true;
                 }
             }
@@ -1285,7 +1443,8 @@ void main() {
                 visibility, giLuminance(indirectLight), material));
         imageStore(
             giIntermediate, outputCell,
-            packGiColor(indirectLight, material));
+            packGiCacheColor(
+                indirectLight, material, giCacheDirect));
         return;
     }
 

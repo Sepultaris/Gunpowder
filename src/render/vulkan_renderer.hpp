@@ -222,6 +222,9 @@ private:
         VkImage giFinalImage = VK_NULL_HANDLE;
         VkDeviceMemory giFinalMemory = VK_NULL_HANDLE;
         VkImageView giFinalView = VK_NULL_HANDLE;
+        VkImage giScratchImage = VK_NULL_HANDLE;
+        VkDeviceMemory giScratchMemory = VK_NULL_HANDLE;
+        VkImageView giScratchView = VK_NULL_HANDLE;
         VkBuffer particleSpawnBuffer = VK_NULL_HANDLE;
         VkDeviceMemory particleSpawnMemory = VK_NULL_HANDLE;
         VkBuffer sceneLightBuffer = VK_NULL_HANDLE;

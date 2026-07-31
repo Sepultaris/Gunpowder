@@ -376,6 +376,15 @@ VulkanRenderer::~VulkanRenderer() {
             if (frame.giFinalMemory != VK_NULL_HANDLE) {
                 vkFreeMemory(device_, frame.giFinalMemory, nullptr);
             }
+            if (frame.giScratchView != VK_NULL_HANDLE) {
+                vkDestroyImageView(device_, frame.giScratchView, nullptr);
+            }
+            if (frame.giScratchImage != VK_NULL_HANDLE) {
+                vkDestroyImage(device_, frame.giScratchImage, nullptr);
+            }
+            if (frame.giScratchMemory != VK_NULL_HANDLE) {
+                vkFreeMemory(device_, frame.giScratchMemory, nullptr);
+            }
             if (frame.particleSpawnBuffer != VK_NULL_HANDLE) {
                 vkDestroyBuffer(device_, frame.particleSpawnBuffer, nullptr);
             }
@@ -949,6 +958,13 @@ void VulkanRenderer::createTextureDescriptors() {
             .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
             .pImmutableSamplers = nullptr,
         },
+        VkDescriptorSetLayoutBinding{
+            .binding = 19,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+            .descriptorCount = 1,
+            .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+            .pImmutableSamplers = nullptr,
+        },
     };
     const VkDescriptorSetLayoutCreateInfo layoutInfo{
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
@@ -993,7 +1009,7 @@ void VulkanRenderer::createTextureDescriptors() {
         VkDescriptorPoolSize{
             .type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
             .descriptorCount =
-                static_cast<std::uint32_t>(framesInFlight * 6),
+                static_cast<std::uint32_t>(framesInFlight * 7),
         },
         VkDescriptorPoolSize{
             .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
@@ -2036,6 +2052,8 @@ void VulkanRenderer::createFrameResources() {
                       frame.giIntermediateView);
         createGiImage(frame.giFinalImage, frame.giFinalMemory,
                       frame.giFinalView);
+        createGiImage(frame.giScratchImage, frame.giScratchMemory,
+                      frame.giScratchView);
 
         const VkDescriptorSetAllocateInfo descriptorAllocateInfo{
             .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
@@ -2091,6 +2109,11 @@ void VulkanRenderer::createFrameResources() {
             .sampler = textureSampler_,
             .imageView = frame.giFinalView,
             .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        };
+        const VkDescriptorImageInfo storageGiScratch{
+            .sampler = VK_NULL_HANDLE,
+            .imageView = frame.giScratchView,
+            .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
         };
         const VkDescriptorImageInfo storageSunTransmittance{
             .sampler = VK_NULL_HANDLE,
@@ -2356,6 +2379,18 @@ void VulkanRenderer::createFrameResources() {
                 .descriptorCount = 1,
                 .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                 .pImageInfo = &storageSunTransmittance,
+                .pBufferInfo = nullptr,
+                .pTexelBufferView = nullptr,
+            },
+            VkWriteDescriptorSet{
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .pNext = nullptr,
+                .dstSet = frame.textureDescriptor,
+                .dstBinding = 19,
+                .dstArrayElement = 0,
+                .descriptorCount = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                .pImageInfo = &storageGiScratch,
                 .pBufferInfo = nullptr,
                 .pTexelBufferView = nullptr,
             },
@@ -3647,6 +3682,17 @@ void VulkanRenderer::recordCommands(VkCommandBuffer commandBuffer,
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0,
         nullptr, 1, &giFinalToCompute);
 
+    VkImageMemoryBarrier giScratchToCompute =
+        visibilityToCompute;
+    giScratchToCompute.image = frame.giScratchImage;
+    vkCmdPipelineBarrier(
+        commandBuffer,
+        frame.textureInitialized
+            ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT
+            : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0,
+        nullptr, 1, &giScratchToCompute);
+
     VkImageMemoryBarrier derivedToCompute = visibilityToCompute;
     derivedToCompute.image = frame.derivedImage;
     derivedToCompute.srcAccessMask =
@@ -4086,11 +4132,47 @@ void VulkanRenderer::recordCommands(VkCommandBuffer commandBuffer,
         nullptr, static_cast<std::uint32_t>(giToFilter.size()),
         giToFilter.data());
 
-    TracePush filterPush = tracePush;
-    filterPush.originAndOptions[2] |= 2;
     vkCmdWriteTimestamp(commandBuffer,
                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                         frame.rayTimingQueryPool, denoiseTimingStart);
+    if (rayTracingSettings_.giRays < 6) {
+        TracePush prefilterPush = tracePush;
+        prefilterPush.originAndOptions[2] =
+            static_cast<std::int32_t>(
+                static_cast<std::uint32_t>(
+                    prefilterPush.originAndOptions[2]) |
+                0x80000000U);
+        vkCmdPushConstants(commandBuffer, computePipelineLayout_,
+                           VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                           sizeof(prefilterPush), &prefilterPush);
+        vkCmdDispatch(commandBuffer, (lightingWidth + 7U) / 8U,
+                      (lightingHeight + 7U) / 8U, 1);
+        const VkImageMemoryBarrier horizontalGiToVertical{
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .pNext = nullptr,
+            .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+            .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
+            .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = frame.giScratchImage,
+            .subresourceRange = {
+                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .baseMipLevel = 0,
+                .levelCount = 1,
+                .baseArrayLayer = 0,
+                .layerCount = 1,
+            },
+        };
+        vkCmdPipelineBarrier(
+            commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0,
+            nullptr, 1, &horizontalGiToVertical);
+    }
+
+    TracePush filterPush = tracePush;
+    filterPush.originAndOptions[2] |= 2;
     vkCmdPushConstants(commandBuffer, computePipelineLayout_,
                        VK_SHADER_STAGE_COMPUTE_BIT, 0,
                        sizeof(filterPush), &filterPush);

@@ -3655,50 +3655,16 @@ void World::updateMaterials() {
         std::uint32_t priority = 0;
         bool moving = false;
     };
-    struct GasChunkJob {
-        int chunkX = 0;
-        int chunkY = 0;
-        std::vector<GasTransfer> transfers;
-    };
-
-    std::array<std::vector<GasChunkJob>, 4>
-        gasPhaseJobs;
-    std::uint32_t gasChunkCount = 0;
-    for (int chunkY = firstChunkY;
-         chunkY < finalChunkY; ++chunkY) {
-        for (int chunkX = firstChunkX;
-             chunkX < finalChunkX; ++chunkX) {
-            if (!materialChunkActive(
-                    chunkX * chunkSize,
-                    chunkY * chunkSize,
-                    gasActivity)) {
-                continue;
-            }
-            const std::size_t chunkIndex =
-                static_cast<std::size_t>(
-                    chunkY * chunkColumns + chunkX);
-            const std::size_t activeCells =
-                static_cast<std::size_t>(
-                    std::popcount(
-                        materialChunkActivity_[chunkIndex]
-                            .microtiles[gasSystem])) *
-                static_cast<std::size_t>(
-                    materialMicrotileSize *
-                    materialMicrotileSize);
-            const int phase =
-                (chunkX & 1) |
-                ((chunkY & 1) << 1);
-            auto& job = gasPhaseJobs[
-                static_cast<std::size_t>(
-                    phase)].emplace_back();
-            job.chunkX = chunkX;
-            job.chunkY = chunkY;
-            job.transfers.reserve(activeCells);
-            ++gasChunkCount;
-        }
-    }
     materialSimulationTimings_.parallelGasChunks =
-        gasChunkCount;
+        activeGasChunkCount;
+    const std::size_t gasTransferJobCount =
+        gasReactionCells.empty()
+            ? 0
+            : std::min<std::size_t>(
+                  executor.workerCount(),
+                  (gasReactionCells.size() + 255) / 256);
+    std::vector<std::vector<GasTransfer>>
+        gasTransferJobs(gasTransferJobCount);
 
     const auto& gasCells = std::as_const(cells_);
     const auto& gasMoved = std::as_const(moved_);
@@ -3737,50 +3703,29 @@ void World::updateMaterials() {
                    100U;
         };
 
-    for (auto& jobs : gasPhaseJobs) {
-        executor.run(
-            jobs.size(),
-            [&](std::size_t jobIndex) {
-                GasChunkJob& job =
-                    jobs[jobIndex];
-                const int chunkOriginX =
-                    job.chunkX * chunkSize;
-                const int chunkOriginY =
-                    job.chunkY * chunkSize;
-                const int beginY = std::max({
-                    bounds.minY,
-                    chunkOriginY,
-                    1,
-                });
-                const int endY = std::min(
-                    bounds.maxY,
-                    chunkOriginY + chunkSize);
-                for (int y = beginY;
-                     y < endY; ++y) {
-                    for (int microtileX = 0;
-                         microtileX <
-                             materialMicrotilesPerAxis;
-                         ++microtileX) {
-                        const int tileOriginX =
-                            chunkOriginX +
-                            microtileX *
-                                materialMicrotileSize;
-                        const int beginX = std::max(
-                            bounds.minX, tileOriginX);
-                        const int endX = std::min(
-                            bounds.maxX,
-                            tileOriginX +
-                                materialMicrotileSize);
-                        if (beginX >= endX ||
-                            !materialMicrotileActive(
-                                beginX, y,
-                                gasActivity)) {
-                            continue;
-                        }
-                        for (int x = beginX;
-                             x < endX; ++x) {
+    executor.run(
+        gasTransferJobCount,
+        [&](std::size_t jobIndex) {
+            const std::size_t begin =
+                gasReactionCells.size() * jobIndex /
+                gasTransferJobCount;
+            const std::size_t end =
+                gasReactionCells.size() *
+                (jobIndex + 1) /
+                gasTransferJobCount;
+            auto& transfers =
+                gasTransferJobs[jobIndex];
+            transfers.reserve(end - begin);
+            for (std::size_t workIndex = begin;
+                 workIndex < end; ++workIndex) {
                             const std::size_t source =
-                                indexOf(x, y);
+                                gasReactionCells[workIndex];
+                            const int x = static_cast<int>(
+                                source %
+                                static_cast<std::size_t>(width));
+                            const int y = static_cast<int>(
+                                source /
+                                static_cast<std::size_t>(width));
                             if (gasMoved[source] != 0) {
                                 continue;
                             }
@@ -3828,7 +3773,7 @@ void World::updateMaterials() {
                                             y - 1);
                                     transfer.moving = true;
                                 }
-                                job.transfers.push_back(
+                                transfers.push_back(
                                     transfer);
                                 continue;
                             }
@@ -3952,22 +3897,18 @@ void World::updateMaterials() {
                                             -drift);
                                 }
                             }
-                            job.transfers.push_back(
+                            transfers.push_back(
                                 transfer);
-                        }
-                    }
-                }
-            });
-    }
+            }
+        });
 
     std::vector<GasTransfer> gasTransfers;
-    for (const auto& jobs : gasPhaseJobs) {
-        for (const GasChunkJob& job : jobs) {
-            gasTransfers.insert(
-                gasTransfers.end(),
-                job.transfers.begin(),
-                job.transfers.end());
-        }
+    gasTransfers.reserve(gasReactionCells.size());
+    for (const auto& transfers : gasTransferJobs) {
+        gasTransfers.insert(
+            gasTransfers.end(),
+            transfers.begin(),
+            transfers.end());
     }
     std::sort(
         gasTransfers.begin(), gasTransfers.end(),

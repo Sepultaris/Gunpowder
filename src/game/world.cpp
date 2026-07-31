@@ -4217,6 +4217,7 @@ void World::cacheLiquidColumnHeads(const ActiveBounds& bounds) {
         (bounds.maxY + chunkSize - 1) / chunkSize;
     constexpr std::uint8_t maximumCachedHead = 255;
     constexpr std::uint8_t foamDecayPerTick = 9;
+    constexpr std::size_t liquidSystemIndex = 1;
     const std::size_t columnJobCount =
         static_cast<std::size_t>(
             std::max(0, finalChunkX - firstChunkX));
@@ -4226,8 +4227,8 @@ void World::cacheLiquidColumnHeads(const ActiveBounds& bounds) {
         columnJobCount, 0);
 
     // Chunk columns are independent. Keep each column top-to-bottom on one
-    // worker so the exact bottom summary feeds the awake chunk below, while
-    // separate columns prepare concurrently.
+    // worker so an awake microtile can reuse the exact head depths just
+    // prepared above it, while separate columns prepare concurrently.
     materialExecutor().run(
         columnJobCount,
         [&](std::size_t jobIndex) {
@@ -4241,149 +4242,193 @@ void World::cacheLiquidColumnHeads(const ActiveBounds& bounds) {
              chunkY < finalChunkY; ++chunkY) {
             const int chunkOriginX = chunkX * chunkSize;
             const int chunkOriginY = chunkY * chunkSize;
-            if (!materialChunkActive(
-                    chunkOriginX, chunkOriginY,
-                    liquidActivity)) {
-                continue;
-            }
-
             const std::size_t chunkIndex =
                 static_cast<std::size_t>(
                     chunkY * chunkColumns + chunkX);
-            auto& summary =
-                liquidChunkColumnSummaries_[chunkIndex];
-            if (!summary) {
-                summary =
-                    std::make_unique<LiquidChunkColumnSummary>();
+            const MaterialChunkActivity& activity =
+                materialChunkActivity_[chunkIndex];
+            if (activity.lifetime[liquidSystemIndex] == 0) {
+                continue;
             }
-
-            const int beginX =
-                std::max(bounds.minX, chunkOriginX);
-            const int endX = std::min(
-                bounds.maxX, chunkOriginX + chunkSize);
-            const int beginY =
-                std::max(bounds.minY, chunkOriginY);
-            const int endY = std::min(
-                bounds.maxY, chunkOriginY + chunkSize);
-
-            const LiquidChunkColumnSummary* aboveSummary = nullptr;
-            if (chunkY > firstChunkY &&
-                beginY == chunkOriginY) {
-                const std::size_t aboveIndex =
-                    static_cast<std::size_t>(
-                        (chunkY - 1) * chunkColumns + chunkX);
-                const auto& above =
-                    liquidChunkColumnSummaries_[aboveIndex];
-                if (above &&
-                    above->generation ==
-                        liquidPreparationGeneration_) {
-                    aboveSummary = above.get();
+            const std::uint64_t activeMicrotiles =
+                activity.microtiles[liquidSystemIndex];
+            for (int microtileY = 0;
+                 microtileY < materialMicrotilesPerAxis;
+                 ++microtileY) {
+                const std::uint64_t activeRow =
+                    (activeMicrotiles >>
+                     static_cast<unsigned int>(
+                         microtileY *
+                         materialMicrotilesPerAxis)) &
+                    ((std::uint64_t{1}
+                      << materialMicrotilesPerAxis) -
+                     1U);
+                if (activeRow == 0) {
+                    continue;
                 }
-            }
-
-            std::array<Material, chunkSize>
-                cachedMaterials{};
-            std::array<std::uint8_t, chunkSize>
-                cachedDepths{};
-            for (int x = beginX; x < endX; ++x) {
-                const std::size_t localX =
-                    static_cast<std::size_t>(
-                        x - chunkOriginX);
-                Material& cachedMaterial =
-                    cachedMaterials[localX];
-                std::uint8_t& cachedDepth =
-                    cachedDepths[localX];
-                if (aboveSummary) {
-                    cachedMaterial =
-                        aboveSummary->bottomMaterial[localX];
-                    cachedDepth =
-                        aboveSummary->bottomDepth[localX];
-                    if (summaryHits <
-                        std::numeric_limits<std::uint32_t>::max()) {
-                        ++summaryHits;
+                const int tileOriginY =
+                    chunkOriginY +
+                    microtileY * materialMicrotileSize;
+                const int beginY =
+                    std::max(bounds.minY, tileOriginY);
+                const int endY = std::min(
+                    bounds.maxY,
+                    tileOriginY + materialMicrotileSize);
+                if (beginY >= endY) {
+                    continue;
+                }
+                for (int microtileX = 0;
+                     microtileX <
+                         materialMicrotilesPerAxis;
+                     ++microtileX) {
+                    if ((activeRow &
+                         (std::uint64_t{1}
+                          << static_cast<unsigned int>(
+                              microtileX))) == 0) {
+                        continue;
                     }
-                } else if (beginY > bounds.minY) {
-                    int scanY = beginY - 1;
-                    cachedMaterial =
-                        cells_[indexOf(x, scanY)];
-                    ++visitCount;
-                    if (isLiquid(cachedMaterial)) {
-                        cachedDepth = 1;
-                        while (cachedDepth <
-                                   maximumCachedHead &&
-                               scanY > bounds.minY &&
-                               cells_[indexOf(x, scanY - 1)] ==
-                                   cachedMaterial) {
-                            --scanY;
-                            ++cachedDepth;
-                            ++visitCount;
+                    const int tileOriginX =
+                        chunkOriginX +
+                        microtileX *
+                            materialMicrotileSize;
+                    const int beginX =
+                        std::max(
+                            bounds.minX, tileOriginX);
+                    const int endX = std::min(
+                        bounds.maxX,
+                        tileOriginX +
+                            materialMicrotileSize);
+                    if (beginX >= endX) {
+                        continue;
+                    }
+
+                    std::array<
+                        Material,
+                        materialMicrotileSize>
+                        cachedMaterials{};
+                    std::array<
+                        std::uint8_t,
+                        materialMicrotileSize>
+                        cachedDepths{};
+                    for (int x = beginX;
+                         x < endX; ++x) {
+                        const std::size_t localX =
+                            static_cast<std::size_t>(
+                                x - tileOriginX);
+                        Material& cachedMaterial =
+                            cachedMaterials[localX];
+                        std::uint8_t& cachedDepth =
+                            cachedDepths[localX];
+                        if (beginY <= bounds.minY) {
+                            continue;
                         }
-                    } else {
-                        cachedMaterial = Material::air;
-                    }
-                }
-            }
 
-            // Chunk storage is row-major. Advancing x in the inner loop keeps
-            // material, depth, and foam accesses contiguous while the two
-            // small arrays retain each column's vertical recurrence.
-            for (int y = beginY; y < endY; ++y) {
-                for (int x = beginX; x < endX; ++x) {
-                    const std::size_t localX =
-                        static_cast<std::size_t>(
-                            x - chunkOriginX);
-                    Material& cachedMaterial =
-                        cachedMaterials[localX];
-                    std::uint8_t& cachedDepth =
-                        cachedDepths[localX];
-                    const std::size_t index = indexOf(x, y);
-                    const Material material = cells_[index];
-                    ++visitCount;
-                    if (isLiquid(material)) {
-                        if (cachedMaterial == material) {
+                        const int aboveY = beginY - 1;
+                        cachedMaterial =
+                            cells_[indexOf(x, aboveY)];
+                        ++visitCount;
+                        if (!isLiquid(cachedMaterial)) {
+                            cachedMaterial =
+                                Material::air;
+                            continue;
+                        }
+
+                        // A directly adjacent awake tile was processed
+                        // earlier by this same column job. Reuse its exact
+                        // recurrence. Across a sleeping gap, reconstruct the
+                        // run so old cached depth cannot leak through a
+                        // topology edit that happened while this tile slept.
+                        if (materialMicrotileActive(
+                                x, aboveY,
+                                liquidActivity)) {
                             cachedDepth =
-                                static_cast<std::uint8_t>(
-                                    std::min<int>(
-                                        maximumCachedHead,
-                                        static_cast<int>(
-                                            cachedDepth) +
-                                            1));
-                        } else {
-                            cachedMaterial = material;
-                            cachedDepth = 1;
+                                liquidHeadDepth_[
+                                    indexOf(x, aboveY)];
+                            if (summaryHits <
+                                std::numeric_limits<
+                                    std::uint32_t>::max()) {
+                                ++summaryHits;
+                            }
                         }
-                        liquidHeadDepth_[index] = cachedDepth;
-                    } else {
-                        cachedMaterial = Material::air;
-                        cachedDepth = 0;
-                        liquidHeadDepth_[index] = 0;
+                        if (cachedDepth == 0) {
+                            int scanY = aboveY;
+                            cachedDepth = 1;
+                            while (
+                                cachedDepth <
+                                    maximumCachedHead &&
+                                scanY > bounds.minY &&
+                                cells_[indexOf(
+                                    x, scanY - 1)] ==
+                                    cachedMaterial) {
+                                --scanY;
+                                ++cachedDepth;
+                                ++visitCount;
+                            }
+                        }
                     }
 
-                    if (material != Material::water) {
-                        liquidFoam_[index] = 0;
-                    } else if (liquidFoam_[index] >
-                               foamDecayPerTick) {
-                        liquidFoam_[index] =
-                            static_cast<std::uint8_t>(
-                                liquidFoam_[index] -
-                                foamDecayPerTick);
-                    } else {
-                        liquidFoam_[index] = 0;
+                    // The tile is row-major, preserving locality while the
+                    // small arrays carry each of its eight vertical runs.
+                    for (int y = beginY;
+                         y < endY; ++y) {
+                        for (int x = beginX;
+                             x < endX; ++x) {
+                            const std::size_t localX =
+                                static_cast<std::size_t>(
+                                    x - tileOriginX);
+                            Material& cachedMaterial =
+                                cachedMaterials[localX];
+                            std::uint8_t& cachedDepth =
+                                cachedDepths[localX];
+                            const std::size_t index =
+                                indexOf(x, y);
+                            const Material material =
+                                cells_[index];
+                            ++visitCount;
+                            if (isLiquid(material)) {
+                                if (cachedMaterial ==
+                                    material) {
+                                    cachedDepth =
+                                        static_cast<
+                                            std::uint8_t>(
+                                            std::min<int>(
+                                                maximumCachedHead,
+                                                static_cast<int>(
+                                                    cachedDepth) +
+                                                    1));
+                                } else {
+                                    cachedMaterial =
+                                        material;
+                                    cachedDepth = 1;
+                                }
+                                liquidHeadDepth_[index] =
+                                    cachedDepth;
+                            } else {
+                                cachedMaterial =
+                                    Material::air;
+                                cachedDepth = 0;
+                                liquidHeadDepth_[index] =
+                                    0;
+                            }
+
+                            if (material !=
+                                Material::water) {
+                                liquidFoam_[index] = 0;
+                            } else if (
+                                liquidFoam_[index] >
+                                foamDecayPerTick) {
+                                liquidFoam_[index] =
+                                    static_cast<
+                                        std::uint8_t>(
+                                        liquidFoam_[index] -
+                                        foamDecayPerTick);
+                            } else {
+                                liquidFoam_[index] = 0;
+                            }
+                        }
                     }
                 }
             }
-
-            for (int x = beginX; x < endX; ++x) {
-                const std::size_t localX =
-                    static_cast<std::size_t>(
-                        x - chunkOriginX);
-                summary->bottomMaterial[localX] =
-                    cachedMaterials[localX];
-                summary->bottomDepth[localX] =
-                    cachedDepths[localX];
-            }
-            summary->generation =
-                liquidPreparationGeneration_;
         }
     });
     for (std::size_t jobIndex = 0;

@@ -322,10 +322,18 @@ private:
                    materialActivitySystemCount> microtiles{};
     };
 
+    struct LiquidMicrotileColumnSummary {
+        std::array<Material, materialMicrotileSize> inputMaterial{};
+        std::array<std::uint8_t, materialMicrotileSize> inputDepth{};
+        std::array<Material, materialMicrotileSize> bottomMaterial{};
+        std::array<std::uint8_t, materialMicrotileSize> bottomDepth{};
+        bool valid = false;
+        bool hasFoam = false;
+    };
+
     struct LiquidChunkColumnSummary {
-        std::array<Material, chunkSize> bottomMaterial{};
-        std::array<std::uint8_t, chunkSize> bottomDepth{};
-        std::uint32_t generation = 0;
+        std::array<LiquidMicrotileColumnSummary,
+                   materialMicrotilesPerChunk> microtiles{};
     };
 
     struct DirectionalOccluderList {
@@ -352,6 +360,7 @@ private:
     void invalidateSettledLiquidNear(int x, int y);
     void invalidateSettledLiquidVerticalMove(
         int x, int sourceY, int destinationY);
+    void invalidateLiquidPreparationAt(int x, int y);
     [[nodiscard]] bool
     liquidCellBelongsToSettledComponent(std::size_t index) const;
     [[nodiscard]] bool materialChunkActive(
@@ -466,7 +475,8 @@ private:
     std::vector<MaterialChunkActivity> materialChunkActivity_;
     std::vector<std::unique_ptr<LiquidChunkColumnSummary>>
         liquidChunkColumnSummaries_;
-    std::uint32_t liquidPreparationGeneration_ = 0;
+    std::vector<std::uint64_t>
+        liquidPreparationDirtyMicrotiles_;
     std::vector<std::uint64_t> solidChunkRevisions_;
     mutable std::array<
         std::vector<std::unique_ptr<DirectionalOccluderList>>,

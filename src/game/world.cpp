@@ -91,6 +91,11 @@ World::World()
           static_cast<std::size_t>(
               ((width + chunkSize - 1) / chunkSize) *
               ((height + chunkSize - 1) / chunkSize))),
+      liquidPreparationDirtyMicrotiles_(
+          static_cast<std::size_t>(
+              ((width + chunkSize - 1) / chunkSize) *
+              ((height + chunkSize - 1) / chunkSize)),
+          0),
       solidChunkRevisions_(
           static_cast<std::size_t>(
               ((width + chunkSize - 1) / chunkSize) *
@@ -144,6 +149,9 @@ void World::regenerate() {
         summary.reset();
     }
     std::fill(
+        liquidPreparationDirtyMicrotiles_.begin(),
+        liquidPreparationDirtyMicrotiles_.end(), 0);
+    std::fill(
         solidChunkRevisions_.begin(),
         solidChunkRevisions_.end(), 0);
     for (auto& directionLists : directionalOccluderLists_) {
@@ -151,7 +159,6 @@ void World::regenerate() {
             list.reset();
         }
     }
-    liquidPreparationGeneration_ = 0;
     std::fill(materialChunkActivity_.begin(),
               materialChunkActivity_.end(),
               MaterialChunkActivity{});
@@ -901,6 +908,7 @@ void World::setCell(int x, int y, Material material) {
             // liquid edge outside the persistent transport frontier.
             rebuildLiquidWorklist_ = true;
             invalidateSettledLiquidNear(x, y);
+            invalidateLiquidPreparationAt(x, y);
         }
         markMaterialActive(x, y, activityMask);
     }
@@ -974,6 +982,8 @@ void World::swapCells(int firstX, int firstY, int secondX, int secondY) {
         isLiquid(secondMaterial)) {
         invalidateSettledLiquidNear(firstX, firstY);
         invalidateSettledLiquidNear(secondX, secondY);
+        invalidateLiquidPreparationAt(firstX, firstY);
+        invalidateLiquidPreparationAt(secondX, secondY);
     }
     if (firstWasOccluder != secondWasOccluder) {
         const auto updateColumn =
@@ -1129,6 +1139,27 @@ void World::invalidateSettledLiquidVerticalMove(
         indexOf(x, destinationY), 0);
 }
 
+void World::invalidateLiquidPreparationAt(int x, int y) {
+    if (x < 0 || x >= width || y < 0 || y >= height) {
+        return;
+    }
+    constexpr int chunkColumns =
+        (width + chunkSize - 1) / chunkSize;
+    const int chunkX = x / chunkSize;
+    const int chunkY = y / chunkSize;
+    const int localX = x - chunkX * chunkSize;
+    const int localY = y - chunkY * chunkSize;
+    const int microtileX = localX / materialMicrotileSize;
+    const int microtileY = localY / materialMicrotileSize;
+    const unsigned int microtile =
+        static_cast<unsigned int>(
+            microtileY * materialMicrotilesPerAxis + microtileX);
+    liquidPreparationDirtyMicrotiles_[
+        static_cast<std::size_t>(
+            chunkY * chunkColumns + chunkX)] |=
+        std::uint64_t{1} << microtile;
+}
+
 bool World::liquidCellBelongsToSettledComponent(
     std::size_t index) const {
     const std::uint32_t component =
@@ -1264,6 +1295,11 @@ void World::wakeMaterialChunksEntering(
                     chunkIndex] == 0) {
                 continue;
             }
+            // Sparse head-depth pages may have been released while this
+            // chunk was outside the simulation window. Rebuild its cached
+            // microtiles before allowing persistent summaries to skip them.
+            liquidPreparationDirtyMicrotiles_[chunkIndex] =
+                std::numeric_limits<std::uint64_t>::max();
             const int chunkOriginX =
                 chunkX * chunkSize;
             const int chunkOriginY =
@@ -4327,16 +4363,6 @@ void World::updateMaterials() {
 }
 
 void World::cacheLiquidColumnHeads(const ActiveBounds& bounds) {
-    ++liquidPreparationGeneration_;
-    if (liquidPreparationGeneration_ == 0) {
-        for (auto& summary : liquidChunkColumnSummaries_) {
-            if (summary) {
-                summary->generation = 0;
-            }
-        }
-        ++liquidPreparationGeneration_;
-    }
-
     constexpr int chunkColumns =
         (width + chunkSize - 1) / chunkSize;
     const int firstChunkX = bounds.minX / chunkSize;
@@ -4379,6 +4405,12 @@ void World::cacheLiquidColumnHeads(const ActiveBounds& bounds) {
                 materialChunkActivity_[chunkIndex];
             if (activity.lifetime[liquidSystemIndex] == 0) {
                 continue;
+            }
+            auto& chunkSummary =
+                liquidChunkColumnSummaries_[chunkIndex];
+            if (!chunkSummary) {
+                chunkSummary =
+                    std::make_unique<LiquidChunkColumnSummary>();
             }
             const std::uint64_t activeMicrotiles =
                 activity.microtiles[liquidSystemIndex];
@@ -4431,6 +4463,18 @@ void World::cacheLiquidColumnHeads(const ActiveBounds& bounds) {
                     if (beginX >= endX) {
                         continue;
                     }
+
+                    const unsigned int microtileIndex =
+                        static_cast<unsigned int>(
+                            microtileY *
+                                materialMicrotilesPerAxis +
+                            microtileX);
+                    const std::uint64_t microtileBit =
+                        std::uint64_t{1} << microtileIndex;
+                    LiquidMicrotileColumnSummary& tileSummary =
+                        chunkSummary->microtiles[
+                            static_cast<std::size_t>(
+                                microtileIndex)];
 
                     std::array<
                         Material,
@@ -4497,8 +4541,34 @@ void World::cacheLiquidColumnHeads(const ActiveBounds& bounds) {
                         }
                     }
 
+                    const auto inputMaterials =
+                        cachedMaterials;
+                    const auto inputDepths = cachedDepths;
+                    const bool fullMicrotile =
+                        beginX == tileOriginX &&
+                        endX == tileOriginX +
+                                    materialMicrotileSize &&
+                        beginY == tileOriginY &&
+                        endY == tileOriginY +
+                                    materialMicrotileSize;
+                    const bool dirty =
+                        (liquidPreparationDirtyMicrotiles_[
+                             chunkIndex] &
+                         microtileBit) != 0;
+                    if (fullMicrotile && tileSummary.valid &&
+                        !dirty && !tileSummary.hasFoam &&
+                        tileSummary.inputMaterial ==
+                            inputMaterials &&
+                        tileSummary.inputDepth == inputDepths) {
+                        summaryHits += static_cast<std::uint32_t>(
+                            materialMicrotileSize *
+                            materialMicrotileSize);
+                        continue;
+                    }
+
                     // The tile is row-major, preserving locality while the
                     // small arrays carry each of its eight vertical runs.
+                    bool hasFoam = false;
                     for (int y = beginY;
                          y < endY; ++y) {
                         for (int x = beginX;
@@ -4555,7 +4625,22 @@ void World::cacheLiquidColumnHeads(const ActiveBounds& bounds) {
                             } else {
                                 liquidFoam_[index] = 0;
                             }
+                            hasFoam =
+                                hasFoam ||
+                                liquidFoam_[index] != 0;
                         }
+                    }
+                    if (fullMicrotile) {
+                        tileSummary.inputMaterial =
+                            inputMaterials;
+                        tileSummary.inputDepth = inputDepths;
+                        tileSummary.bottomMaterial =
+                            cachedMaterials;
+                        tileSummary.bottomDepth = cachedDepths;
+                        tileSummary.valid = true;
+                        tileSummary.hasFoam = hasFoam;
+                        liquidPreparationDirtyMicrotiles_[
+                            chunkIndex] &= ~microtileBit;
                     }
                 }
             }
@@ -5483,6 +5568,9 @@ void World::updateLiquids(const ActiveBounds& bounds, bool waterOnly) {
                 }
                 invalidateSettledLiquidVerticalMove(
                     sourceX, sourceY, destinationY);
+                invalidateLiquidPreparationAt(sourceX, sourceY);
+                invalidateLiquidPreparationAt(
+                    destinationX, destinationY);
                 if (destinationX == previousDestinationX &&
                     destinationY == previousDestinationY - 1) {
                     // Consecutive bottom-to-top moves in one column have
@@ -5610,6 +5698,7 @@ void World::updateLiquids(const ActiveBounds& bounds, bool waterOnly) {
                         std::min(
                             255,
                             72 + impactSpeed)));
+            invalidateLiquidPreparationAt(x, y);
             liquidFlowY_[source] = 0;
             if (impactSpeed > 104 &&
                 percent(random_) < 4) {

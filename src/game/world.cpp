@@ -6120,43 +6120,80 @@ void World::prepareLiquidEqualization(const ActiveBounds& bounds) {
     }};
     const int firstChunkX = bounds.minX / chunkSize;
     const int finalChunkX = (bounds.maxX + chunkSize - 1) / chunkSize;
-    for (int seedY = bounds.minY; seedY < bounds.maxY; ++seedY) {
-        const int chunkY = seedY / chunkSize;
-        for (int chunkX = firstChunkX; chunkX < finalChunkX; ++chunkX) {
-            // A moving region wakes its own and neighboring chunks. Starting
-            // discovery only there avoids rebuilding every settled lake each
-            // tick. Once seeded, traversal still follows the complete
-            // connected liquid component through sleeping chunks.
-            if (!materialChunkActive(chunkX * chunkSize, chunkY * chunkSize,
-                                     liquidActivity)) {
-                continue;
-            }
-            const int chunkOriginX = chunkX * chunkSize;
-            for (int microtileX = 0;
-                 microtileX < materialMicrotilesPerAxis;
-                 ++microtileX) {
-                const int tileOriginX =
-                    chunkOriginX +
-                    microtileX * materialMicrotileSize;
-                const int beginX =
-                    std::max(bounds.minX, tileOriginX);
-                const int endX = std::min(
-                    bounds.maxX,
-                    tileOriginX + materialMicrotileSize);
-                if (beginX >= endX ||
-                    !materialMicrotileActive(
-                        beginX, seedY, liquidActivity)) {
+    std::vector<std::size_t> equalizationSeeds;
+    if (!rebuildLiquidWorklist_ &&
+        !liquidWorklist_.empty()) {
+        // The final substep of the previous material tick leaves a unique
+        // frontier around every still-moving liquid region. It is sufficient
+        // to discover the same complete connected components without walking
+        // every awake microtile a second time.
+        equalizationSeeds.assign(
+            liquidWorklist_.begin(),
+            liquidWorklist_.end());
+    } else {
+        // Direct painting, destruction, reactions, or streamed-in terrain can
+        // introduce liquid outside the persistent frontier. Retain the full
+        // awake-microtile discovery path for those topology-changing ticks.
+        for (int seedY = bounds.minY;
+             seedY < bounds.maxY; ++seedY) {
+            const int chunkY = seedY / chunkSize;
+            for (int chunkX = firstChunkX;
+                 chunkX < finalChunkX; ++chunkX) {
+                if (!materialChunkActive(
+                        chunkX * chunkSize,
+                        chunkY * chunkSize,
+                        liquidActivity)) {
                     continue;
                 }
-                for (int seedX = beginX; seedX < endX; ++seedX) {
+                const int chunkOriginX =
+                    chunkX * chunkSize;
+                for (int microtileX = 0;
+                     microtileX <
+                         materialMicrotilesPerAxis;
+                     ++microtileX) {
+                    const int tileOriginX =
+                        chunkOriginX +
+                        microtileX *
+                            materialMicrotileSize;
+                    const int beginX = std::max(
+                        bounds.minX, tileOriginX);
+                    const int endX = std::min(
+                        bounds.maxX,
+                        tileOriginX +
+                            materialMicrotileSize);
+                    if (beginX >= endX ||
+                        !materialMicrotileActive(
+                            beginX, seedY,
+                            liquidActivity)) {
+                        continue;
+                    }
+                    for (int seedX = beginX;
+                         seedX < endX; ++seedX) {
+                        equalizationSeeds.push_back(
+                            indexOf(seedX, seedY));
+                    }
+                }
+            }
+        }
+    }
+
+    for (const std::size_t seed :
+         equalizationSeeds) {
                 if (currentLiquidEqualizationSeedVisits_ <
                     std::numeric_limits<std::uint32_t>::max()) {
                     ++currentLiquidEqualizationSeedVisits_;
                 }
-                const std::size_t seed = indexOf(seedX, seedY);
+                const int seedX = static_cast<int>(
+                    seed % static_cast<std::size_t>(width));
+                const int seedY = static_cast<int>(
+                    seed / static_cast<std::size_t>(width));
+                if (!insideBounds(seedX, seedY)) {
+                    continue;
+                }
                 const Material material = cells_[seed];
                 if (!isLiquid(material) ||
-                    liquidComponentStamp_[seed] == liquidComponentGeneration_) {
+                    liquidComponentStamp_[seed] ==
+                        liquidComponentGeneration_) {
                     continue;
                 }
                 if (liquidCellBelongsToSettledComponent(seed)) {
@@ -6348,9 +6385,6 @@ void World::prepareLiquidEqualization(const ActiveBounds& bounds) {
                     reserveCell(lowerSurface, reservation);
                     ++transfers;
                 }
-            }
-            }
-        }
     }
 }
 

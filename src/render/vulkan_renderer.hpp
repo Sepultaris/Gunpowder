@@ -100,6 +100,19 @@ struct GpuRayTimings {
     bool valid = false;
 };
 
+struct CpuRenderTimings {
+    float totalMs = 0.0F;
+    float synchronizeMs = 0.0F;
+    float frameWaitMs = 0.0F;
+    float directionalCacheMs = 0.0F;
+    float sceneBuildMs = 0.0F;
+    float materialTextureMs = 0.0F;
+    float occupancyMs = 0.0F;
+    float commandRecordMs = 0.0F;
+    float submitPresentMs = 0.0F;
+    bool valid = false;
+};
+
 class VulkanRenderer {
 public:
     explicit VulkanRenderer(SDL_Window* window);
@@ -124,6 +137,9 @@ public:
     }
     [[nodiscard]] const GpuRayTimings& gpuRayTimings() const {
         return gpuRayTimings_;
+    }
+    [[nodiscard]] const CpuRenderTimings& cpuRenderTimings() const {
+        return cpuRenderTimings_;
     }
 
 private:
@@ -417,6 +433,7 @@ private:
     bool imguiInitialized_ = false;
     float timestampPeriodNanoseconds_ = 1.0F;
     GpuRayTimings gpuRayTimings_{};
+    CpuRenderTimings cpuRenderTimings_{};
 };
 
 } // namespace gunpowder

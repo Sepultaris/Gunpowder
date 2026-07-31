@@ -503,6 +503,7 @@ void sliderFloatWithReset(const char* label, float* value, float minimum,
 bool drawDeveloperUi(bool* open,
                      gunpowder::RayTracingSettings& settings,
                      const gunpowder::GpuRayTimings& gpuTimings,
+                     const gunpowder::CpuRenderTimings& cpuRenderTimings,
                      const gunpowder::MaterialSimulationTimings&
                          materialTimings,
                      DisplaySettings& displaySettings,
@@ -533,6 +534,24 @@ bool drawDeveloperUi(bool* open,
             gpuTimings.denoisingMs);
     } else {
         ImGui::TextDisabled("GPU lighting timings: collecting...");
+    }
+    if (cpuRenderTimings.valid) {
+        ImGui::Text(
+            "CPU renderer: %.3f ms", cpuRenderTimings.totalMs);
+        ImGui::TextDisabled(
+            "Sync %.3f | Wait %.3f | Directional %.3f | Scene %.3f ms",
+            cpuRenderTimings.synchronizeMs,
+            cpuRenderTimings.frameWaitMs,
+            cpuRenderTimings.directionalCacheMs,
+            cpuRenderTimings.sceneBuildMs);
+        ImGui::TextDisabled(
+            "Pack %.3f | Occupancy %.3f | Commands %.3f | Present %.3f ms",
+            cpuRenderTimings.materialTextureMs,
+            cpuRenderTimings.occupancyMs,
+            cpuRenderTimings.commandRecordMs,
+            cpuRenderTimings.submitPresentMs);
+    } else {
+        ImGui::TextDisabled("CPU renderer timings: collecting...");
     }
     if (materialTimings.valid) {
         ImGui::Text(
@@ -1297,6 +1316,7 @@ int main(int, char**) {
                 applyDisplay = drawDeveloperUi(
                     &developerUiOpen, renderer.rayTracingSettings(),
                     renderer.gpuRayTimings(),
+                    renderer.cpuRenderTimings(),
                     world.materialSimulationTimings(),
                     displaySettings, renderProfiles,
                     displayError,

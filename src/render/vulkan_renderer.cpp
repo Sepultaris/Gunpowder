@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <filesystem>
@@ -4320,9 +4321,12 @@ void VulkanRenderer::recordCommands(VkCommandBuffer commandBuffer,
 }
 
 void VulkanRenderer::draw(World& world) {
+    using RenderClock = std::chrono::steady_clock;
+    const auto drawBegin = RenderClock::now();
     // Material state is persistent on the CPU-facing world grid. Consume the
     // previous compute result before uploading the next active region.
     synchronizeMaterialSimulation(world);
+    const auto synchronizeEnd = RenderClock::now();
     FrameResources& frame = frames_[currentFrame_];
     check(vkWaitForFences(device_, 1, &frame.inFlight, VK_TRUE, UINT64_MAX),
           "vkWaitForFences");
@@ -4393,6 +4397,7 @@ void VulkanRenderer::draw(World& world) {
     if (acquireResult != VK_SUCCESS && acquireResult != VK_SUBOPTIMAL_KHR) {
         check(acquireResult, "vkAcquireNextImageKHR");
     }
+    const auto frameWaitEnd = RenderClock::now();
 
     const std::uint64_t particleTicks = SDL_GetTicks64();
     if (lastDayCycleTicks_ != 0 &&
@@ -4593,6 +4598,7 @@ void VulkanRenderer::draw(World& world) {
             0.0F, 0.05F);
     }
     lastParticleTicks_ = particleTicks;
+    const auto directionalCacheEnd = RenderClock::now();
     uploadParticleSpawns(frame, world);
     prepareMaterialSimulation(world);
 
@@ -4677,6 +4683,7 @@ void VulkanRenderer::draw(World& world) {
           "vkMapMemory");
     std::memcpy(mapped, vertices.data(), static_cast<std::size_t>(byteCount));
     vkUnmapMemory(device_, frame.vertexMemory);
+    const auto sceneBuildEnd = RenderClock::now();
 
     const VkDeviceSize textureBytes =
         static_cast<VkDeviceSize>(textureWidth) *
@@ -4974,6 +4981,7 @@ void VulkanRenderer::draw(World& world) {
         }
     }
     vkUnmapMemory(device_, frame.textureStagingMemory);
+    const auto materialTextureEnd = RenderClock::now();
     for (std::uint32_t largeY = 0;
          largeY < occupancyLargeRows; ++largeY) {
         for (std::uint32_t largeX = 0;
@@ -5023,11 +5031,13 @@ void VulkanRenderer::draw(World& world) {
     std::memcpy(occupancyMapped, &occupancy,
                 sizeof(occupancy));
     vkUnmapMemory(device_, frame.occupancyMemory);
+    const auto occupancyEnd = RenderClock::now();
 
     check(vkResetFences(device_, 1, &frame.inFlight), "vkResetFences");
     check(vkResetCommandBuffer(frame.commandBuffer, 0), "vkResetCommandBuffer");
     recordCommands(frame.commandBuffer, imageIndex,
                    static_cast<std::uint32_t>(vertices.size()), world);
+    const auto commandRecordEnd = RenderClock::now();
 
     constexpr VkPipelineStageFlags waitStage =
         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
@@ -5066,6 +5076,57 @@ void VulkanRenderer::draw(World& world) {
         recreateSwapchain();
     } else {
         check(presentResult, "vkQueuePresentKHR");
+    }
+    const auto presentEnd = RenderClock::now();
+    const auto milliseconds = [](auto begin, auto end) {
+        return std::chrono::duration<float, std::milli>(
+                   end - begin)
+            .count();
+    };
+    const CpuRenderTimings sample{
+        .totalMs = milliseconds(drawBegin, presentEnd),
+        .synchronizeMs =
+            milliseconds(drawBegin, synchronizeEnd),
+        .frameWaitMs =
+            milliseconds(synchronizeEnd, frameWaitEnd),
+        .directionalCacheMs =
+            milliseconds(frameWaitEnd, directionalCacheEnd),
+        .sceneBuildMs =
+            milliseconds(directionalCacheEnd, sceneBuildEnd),
+        .materialTextureMs =
+            milliseconds(sceneBuildEnd, materialTextureEnd),
+        .occupancyMs =
+            milliseconds(materialTextureEnd, occupancyEnd),
+        .commandRecordMs =
+            milliseconds(occupancyEnd, commandRecordEnd),
+        .submitPresentMs =
+            milliseconds(commandRecordEnd, presentEnd),
+        .valid = true,
+    };
+    constexpr float cpuTimingBlend = 0.10F;
+    if (!cpuRenderTimings_.valid) {
+        cpuRenderTimings_ = sample;
+    } else {
+        const auto blend = [&](float& value, float next) {
+            value += (next - value) * cpuTimingBlend;
+        };
+        blend(cpuRenderTimings_.totalMs, sample.totalMs);
+        blend(cpuRenderTimings_.synchronizeMs,
+              sample.synchronizeMs);
+        blend(cpuRenderTimings_.frameWaitMs,
+              sample.frameWaitMs);
+        blend(cpuRenderTimings_.directionalCacheMs,
+              sample.directionalCacheMs);
+        blend(cpuRenderTimings_.sceneBuildMs,
+              sample.sceneBuildMs);
+        blend(cpuRenderTimings_.materialTextureMs,
+              sample.materialTextureMs);
+        blend(cpuRenderTimings_.occupancyMs,
+              sample.occupancyMs);
+        blend(cpuRenderTimings_.commandRecordMs,
+              sample.commandRecordMs);
+        blend(cpuRenderTimings_.submitPresentMs,
+              sample.submitPresentMs);
     }
     currentFrame_ = (currentFrame_ + 1) % framesInFlight;
 }

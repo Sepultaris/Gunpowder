@@ -873,6 +873,11 @@ void World::setCell(int x, int y, Material material) {
                 }
             }
         }
+        if ((activityMask & liquidActivity) != 0) {
+            // Direct edits, reactions, and topology changes can introduce a
+            // liquid edge outside the persistent transport frontier.
+            rebuildLiquidWorklist_ = true;
+        }
         markMaterialActive(x, y, activityMask);
     }
     if (material != previous || material != Material::wood) {
@@ -2798,7 +2803,6 @@ void World::updateMaterials() {
     currentLiquidLateralConflicts_ = 0;
     currentParallelLiquidColumnVisits_ = 0;
     currentParallelLiquidVerticalMoves_ = 0;
-    rebuildLiquidWorklist_ = true;
     constexpr int chunkColumns =
         (width + chunkSize - 1) / chunkSize;
     const int firstChunkX = bounds.minX / chunkSize;
@@ -3243,6 +3247,11 @@ void World::updateMaterials() {
             const int destinationY = static_cast<int>(
                 accepted.destination /
                 static_cast<std::size_t>(width));
+            if (isLiquid(cells_[accepted.destination])) {
+                // Granular displacement can disturb a settled pool whose
+                // persistent liquid frontier is currently empty.
+                rebuildLiquidWorklist_ = true;
+            }
             swapCells(
                 sourceX, sourceY,
                 destinationX, destinationY);
@@ -6585,6 +6594,9 @@ void World::displaceLiquid(Vec2 center, Vec2 halfSize, Vec2 motion,
             ++movedCells;
             break;
         }
+    }
+    if (movedCells > 0) {
+        rebuildLiquidWorklist_ = true;
     }
 }
 

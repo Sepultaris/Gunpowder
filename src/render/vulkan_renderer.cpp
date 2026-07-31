@@ -4611,7 +4611,8 @@ void VulkanRenderer::draw(World& world) {
                         } + receiverMargin,
                         incrementalSunRebuild
                             ? &pendingSunSolidDirty_
-                            : nullptr);
+                            : nullptr,
+                        true);
                     sunHorizonBuildMs =
                         std::chrono::duration<float, std::milli>(
                             RenderClock::now() - horizonBegin)

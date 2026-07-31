@@ -240,7 +240,8 @@ public:
             static_cast<float>(width),
             static_cast<float>(height),
         },
-        const SolidDirtyRegion* dirtyRegion = nullptr) const;
+        const SolidDirtyRegion* dirtyRegion = nullptr,
+        bool parallelBuild = false) const;
 #ifdef GUNPOWDER_TEST_SCALE
     void setCellForTest(int x, int y, Material material) {
         setCell(x, y, material);
@@ -334,6 +335,9 @@ private:
     void markMaterialActive(
         int x, int y,
         std::uint8_t activityMask = allMaterialActivity);
+    void invalidateSettledLiquidNear(int x, int y);
+    [[nodiscard]] bool
+    liquidCellBelongsToSettledComponent(std::size_t index) const;
     [[nodiscard]] bool materialChunkActive(
         int x, int y,
         std::uint8_t activityMask = allMaterialActivity) const;
@@ -407,11 +411,14 @@ private:
     SparseGrid<std::uint8_t> moved_;
     SparseGrid<std::uint32_t> liquidFrontierStamp_;
     SparseGrid<std::uint32_t> liquidComponentStamp_;
+    SparseGrid<std::uint32_t> liquidSettledComponent_;
     std::vector<std::size_t> liquidWorklist_;
     std::vector<std::size_t> liquidNextWorklist_;
     std::vector<std::size_t> thermalWorklist_;
     std::uint32_t liquidFrontierGeneration_ = 0;
     std::uint32_t liquidComponentGeneration_ = 0;
+    std::uint32_t nextSettledLiquidComponent_ = 1;
+    std::vector<std::uint8_t> settledLiquidComponentValid_{0};
     bool rebuildLiquidWorklist_ = true;
     std::vector<std::size_t> liquidComponentQueue_;
     std::vector<std::size_t> liquidHighSurfaces_;

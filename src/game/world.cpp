@@ -182,6 +182,9 @@ void World::regenerate() {
     pendingGpuMaterialSteps_ = 0;
     materialScanRight_ = true;
     materialStep_ = 0;
+    materialPassSystems_ = allMaterialActivity;
+    materialPassExclusion_ = {0, 0, 0, 0};
+    materialPassExclusionValid_ = false;
     previousMaterialBounds_ = {0, 0, 0, 0};
     previousMaterialBoundsValid_ = false;
     grapple_ = Grapple{};
@@ -617,12 +620,59 @@ void World::update(float dt, const InputState& input) {
     while (materialAccumulator_ >= materialTimeStep) {
         // The local full-cell material simulation remains authoritative.
         // Legacy GPU pressure jobs stay disabled in the Noita-style mode.
+        ++materialStep_;
+        const ActiveBounds foregroundBounds = activeBounds();
+        wakeMaterialChunksEntering(foregroundBounds);
+
+        float backgroundMilliseconds =
+            materialSimulationTimings_.backgroundSimulationMs;
+        std::uint32_t backgroundActiveChunks =
+            materialSimulationTimings_.backgroundActiveChunks;
+        constexpr std::uint64_t backgroundPeriod = 4;
+        if ((materialStep_ % backgroundPeriod) == 0) {
+            const ActiveBounds backgroundBounds{
+                std::max(
+                    0,
+                    foregroundBounds.minX - 3 * chunkSize),
+                std::min(
+                    width,
+                    foregroundBounds.maxX + 3 * chunkSize),
+                std::max(
+                    0,
+                    foregroundBounds.minY - 3 * chunkSize),
+                std::min(
+                    height,
+                    foregroundBounds.maxY + 3 * chunkSize),
+            };
+            const MaterialSimulationTimings foregroundTimings =
+                materialSimulationTimings_;
+            materialPassSystems_ =
+                granularActivity | gasActivity | thermalActivity;
+            materialPassExclusion_ = foregroundBounds;
+            materialPassExclusionValid_ = true;
+            const auto backgroundBegin =
+                std::chrono::steady_clock::now();
+            updateMaterials(backgroundBounds);
+            updateHeat(backgroundBounds);
+            const float backgroundSample = elapsedMilliseconds(
+                backgroundBegin,
+                std::chrono::steady_clock::now());
+            backgroundActiveChunks =
+                materialSimulationTimings_.activeChunks;
+            materialSimulationTimings_ = foregroundTimings;
+            smoothTiming(
+                backgroundMilliseconds,
+                backgroundSample);
+        }
+
+        materialPassSystems_ = allMaterialActivity;
+        materialPassExclusionValid_ = false;
         const auto simulationBegin =
             std::chrono::steady_clock::now();
-        updateMaterials();
+        updateMaterials(foregroundBounds);
         const auto heatBegin =
             std::chrono::steady_clock::now();
-        updateHeat();
+        updateHeat(foregroundBounds);
         const auto simulationEnd =
             std::chrono::steady_clock::now();
         smoothTiming(
@@ -631,6 +681,10 @@ void World::update(float dt, const InputState& input) {
         smoothTiming(
             materialSimulationTimings_.totalMs,
             elapsedMilliseconds(simulationBegin, simulationEnd));
+        materialSimulationTimings_.backgroundSimulationMs =
+            backgroundMilliseconds;
+        materialSimulationTimings_.backgroundActiveChunks =
+            backgroundActiveChunks;
         materialSimulationTimings_.valid = true;
         if (gpuMaterialSimulationEnabled_) {
             ++pendingGpuMaterialSteps_;
@@ -1381,6 +1435,11 @@ bool World::materialChunkActive(
     if (x < 0 || x >= width || y < 0 || y >= height) {
         return false;
     }
+    activityMask &= materialPassSystems_;
+    if (activityMask == 0 ||
+        !materialChunkIncludedInCurrentPass(x, y)) {
+        return false;
+    }
     const std::size_t chunkIndex = static_cast<std::size_t>(
         (y / chunkSize) * chunkColumns + x / chunkSize);
     const auto& activity = materialChunkActivity_[chunkIndex];
@@ -1401,6 +1460,11 @@ bool World::materialMicrotileActive(
     constexpr int chunkColumns =
         (width + chunkSize - 1) / chunkSize;
     if (x < 0 || x >= width || y < 0 || y >= height) {
+        return false;
+    }
+    activityMask &= materialPassSystems_;
+    if (activityMask == 0 ||
+        !materialChunkIncludedInCurrentPass(x, y)) {
         return false;
     }
     const int chunkX = x / chunkSize;
@@ -1433,11 +1497,44 @@ bool World::materialMicrotileActive(
     return false;
 }
 
-void World::ageMaterialChunks() {
-    for (MaterialChunkActivity& activity :
-         materialChunkActivity_) {
+bool World::materialChunkIncludedInCurrentPass(
+    int x, int y) const {
+    return !materialPassExclusionValid_ ||
+           x < materialPassExclusion_.minX ||
+           x >= materialPassExclusion_.maxX ||
+           y < materialPassExclusion_.minY ||
+           y >= materialPassExclusion_.maxY;
+}
+
+void World::ageMaterialChunks(const ActiveBounds& bounds) {
+    constexpr int chunkColumns =
+        (width + chunkSize - 1) / chunkSize;
+    const int firstChunkX = bounds.minX / chunkSize;
+    const int finalChunkX =
+        (bounds.maxX + chunkSize - 1) / chunkSize;
+    const int firstChunkY = bounds.minY / chunkSize;
+    const int finalChunkY =
+        (bounds.maxY + chunkSize - 1) / chunkSize;
+    for (int chunkY = firstChunkY;
+         chunkY < finalChunkY; ++chunkY) {
+        for (int chunkX = firstChunkX;
+             chunkX < finalChunkX; ++chunkX) {
+            const int originX = chunkX * chunkSize;
+            const int originY = chunkY * chunkSize;
+            if (!materialChunkIncludedInCurrentPass(
+                    originX, originY)) {
+                continue;
+            }
+            MaterialChunkActivity& activity =
+                materialChunkActivity_[static_cast<std::size_t>(
+                    chunkY * chunkColumns + chunkX)];
         for (std::size_t system = 0;
              system < materialActivitySystemCount; ++system) {
+            const std::uint8_t systemMask =
+                static_cast<std::uint8_t>(1U << system);
+            if ((materialPassSystems_ & systemMask) == 0) {
+                continue;
+            }
             std::uint8_t& lifetime =
                 activity.lifetime[system];
             if (lifetime > 0) {
@@ -1446,6 +1543,7 @@ void World::ageMaterialChunks() {
                     activity.microtiles[system] = 0;
                 }
             }
+        }
         }
     }
 }
@@ -3183,11 +3281,9 @@ void World::updateGrenades(float dt) {
     });
 }
 
-void World::updateMaterials() {
+void World::updateMaterials(const ActiveBounds& bounds) {
     const auto granularBegin =
         std::chrono::steady_clock::now();
-    const ActiveBounds bounds = activeBounds();
-    wakeMaterialChunksEntering(bounds);
     currentLiquidSelectionMs_ = 0.0F;
     currentLiquidGravityMs_ = 0.0F;
     currentLiquidLateralMs_ = 0.0F;
@@ -3336,7 +3432,6 @@ void World::updateMaterials() {
         }
     }
     materialScanRight_ = !materialScanRight_;
-    ++materialStep_;
     std::uniform_int_distribution<int> percent(0, 99);
 
     struct GranularTransfer {
@@ -3728,12 +3823,14 @@ void World::updateMaterials() {
     // higher viscosity.
     const auto granularEnd =
         std::chrono::steady_clock::now();
+    const bool simulatesLiquids =
+        (materialPassSystems_ & liquidActivity) != 0;
     const bool hasActiveLiquidChunks =
-        activeLiquidChunkCount != 0;
+        simulatesLiquids && activeLiquidChunkCount != 0;
     if (hasActiveLiquidChunks) {
         cacheLiquidColumnHeads(bounds);
         prepareLiquidEqualization(bounds);
-    } else {
+    } else if (simulatesLiquids) {
         liquidWorklist_.clear();
         liquidNextWorklist_.clear();
         liquidEqualizationMoves_.clear();
@@ -6726,8 +6823,7 @@ void World::applyLiquidEqualizationPhase(
         equalizationBegin, std::chrono::steady_clock::now());
 }
 
-void World::updateHeat() {
-    const ActiveBounds bounds = activeBounds();
+void World::updateHeat(const ActiveBounds& bounds) {
     constexpr int chunkColumns =
         (width + chunkSize - 1) / chunkSize;
     const int firstChunkX = bounds.minX / chunkSize;
@@ -7049,7 +7145,7 @@ void World::updateHeat() {
             index / static_cast<std::size_t>(width));
         updateCombustion(x, y, index);
     }
-    ageMaterialChunks();
+    ageMaterialChunks(bounds);
 }
 
 World::ActiveBounds World::activeBounds() const {
@@ -7075,14 +7171,15 @@ World::ActiveBounds World::activeBounds() const {
 
 void World::releaseEmptySimulationPages() {
     const ActiveBounds bounds = activeBounds();
+    constexpr int retainedBackgroundMargin = 3 * chunkSize;
     const int firstCellX =
-        std::max(0, bounds.minX - chunkSize);
+        std::max(0, bounds.minX - retainedBackgroundMargin);
     const int firstCellY =
-        std::max(0, bounds.minY - chunkSize);
+        std::max(0, bounds.minY - retainedBackgroundMargin);
     const int lastCellX =
-        std::min(width, bounds.maxX + chunkSize);
+        std::min(width, bounds.maxX + retainedBackgroundMargin);
     const int lastCellY =
-        std::min(height, bounds.maxY + chunkSize);
+        std::min(height, bounds.maxY + retainedBackgroundMargin);
     const auto release = [&](auto& grid) {
         grid.releaseDefaultPagesOutside(
             firstCellX, firstCellY, lastCellX, lastCellY);

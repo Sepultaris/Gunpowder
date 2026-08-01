@@ -337,6 +337,53 @@ int main() {
         return 1;
     }
 
+    gunpowder::World backgroundWorld;
+    gunpowder::InputState backgroundInput;
+    backgroundWorld.setPlayerForTest({512.0F, 288.0F});
+    backgroundWorld.setCameraForTest({512.0F, 288.0F});
+    constexpr int backgroundSmokeX = 800;
+    constexpr int backgroundSmokeY = 220;
+    for (int y = backgroundSmokeY - 8;
+         y < backgroundSmokeY + 16; ++y) {
+        for (int x = backgroundSmokeX - 8;
+             x < backgroundSmokeX + 16; ++x) {
+            backgroundWorld.setCellForTest(
+                x, y, gunpowder::Material::air);
+        }
+    }
+    for (int y = backgroundSmokeY;
+         y < backgroundSmokeY + 8; ++y) {
+        for (int x = backgroundSmokeX;
+             x < backgroundSmokeX + 8; ++x) {
+            backgroundWorld.setCellForTest(
+                x, y, gunpowder::Material::smoke);
+        }
+    }
+    for (int tick = 0; tick < 4; ++tick) {
+        backgroundWorld.update(
+            1.0F / 30.0F, backgroundInput);
+    }
+    const auto& backgroundTimings =
+        backgroundWorld.materialSimulationTimings();
+    bool backgroundSmokeMoved = false;
+    for (int y = backgroundSmokeY - 8;
+         y < backgroundSmokeY; ++y) {
+        for (int x = backgroundSmokeX - 8;
+             x < backgroundSmokeX + 16; ++x) {
+            backgroundSmokeMoved =
+                backgroundSmokeMoved ||
+                backgroundWorld.cell(x, y) ==
+                    gunpowder::Material::smoke;
+        }
+    }
+    if (backgroundTimings.backgroundActiveChunks == 0 ||
+        backgroundTimings.backgroundSimulationMs <= 0.0F ||
+        !backgroundSmokeMoved) {
+        std::cerr
+            << "Reduced-rate background gas simulation did not advance\n";
+        return 1;
+    }
+
     gunpowder::World chunkHeadWorld;
     constexpr int headColumnX = 100;
     constexpr int headBottomY = 71;

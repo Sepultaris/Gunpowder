@@ -63,6 +63,8 @@ struct MaterialSimulationTimings {
     std::uint32_t liquidCandidateVisits = 0;
     std::uint32_t equalizedComponents = 0;
     std::uint32_t equalizedCells = 0;
+    float backgroundSimulationMs = 0.0F;
+    std::uint32_t backgroundActiveChunks = 0;
     bool valid = false;
 };
 
@@ -369,7 +371,9 @@ private:
     [[nodiscard]] bool materialMicrotileActive(
         int x, int y,
         std::uint8_t activityMask = allMaterialActivity) const;
-    void ageMaterialChunks();
+    [[nodiscard]] bool materialChunkIncludedInCurrentPass(
+        int x, int y) const;
+    void ageMaterialChunks(const ActiveBounds& bounds);
     void markSolidDirty(int minX, int minY, int maxX, int maxY);
     void rebuildDirtySkyColumns();
     void captureInteriorBackdrop();
@@ -394,7 +398,7 @@ private:
                                  const Exposure& exposure);
     void updateBullets(float dt);
     void updateGrenades(float dt);
-    void updateMaterials();
+    void updateMaterials(const ActiveBounds& bounds);
     void releaseEmptySimulationPages();
     void cacheLiquidColumnHeads(const ActiveBounds& bounds);
     void updateLiquids(const ActiveBounds& bounds,
@@ -402,7 +406,7 @@ private:
     void prepareLiquidEqualization(const ActiveBounds& bounds);
     void applyLiquidEqualizationPhase(const ActiveBounds& bounds,
                                       int phase);
-    void updateHeat();
+    void updateHeat(const ActiveBounds& bounds);
     void updateCamera(float dt);
     void updateParticles(float dt);
     void emitParticle(Particle particle);
@@ -484,6 +488,9 @@ private:
     mutable std::mutex directionalOccluderMutex_;
     ActiveBounds previousMaterialBounds_{0, 0, 0, 0};
     bool previousMaterialBoundsValid_ = false;
+    ActiveBounds materialPassExclusion_{0, 0, 0, 0};
+    bool materialPassExclusionValid_ = false;
+    std::uint8_t materialPassSystems_ = allMaterialActivity;
     std::vector<int> skyOccluderY_;
     std::vector<std::uint8_t> skyColumnDirty_;
     SparseGrid<std::uint8_t> interiorBackdrop_;

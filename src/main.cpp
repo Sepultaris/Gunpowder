@@ -561,6 +561,10 @@ bool drawDeveloperUi(bool* open,
         ImGui::Text(
             "CPU materials: %.3f ms", materialTimings.totalMs);
         ImGui::TextDisabled(
+            "Background ring %.3f ms / 4 ticks | %u active chunks",
+            materialTimings.backgroundSimulationMs,
+            materialTimings.backgroundActiveChunks);
+        ImGui::TextDisabled(
             "Granular %.3f | Prepare %.3f | Flow %.3f | "
             "Gas %.3f | Heat %.3f ms",
             materialTimings.granularMs,

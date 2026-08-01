@@ -65,6 +65,9 @@ struct MaterialSimulationTimings {
     std::uint32_t equalizedCells = 0;
     float backgroundSimulationMs = 0.0F;
     std::uint32_t backgroundActiveChunks = 0;
+    float backgroundLiquidSimulationMs = 0.0F;
+    std::uint32_t backgroundLiquidCandidates = 0;
+    std::uint32_t backgroundLiquidDeferredCandidates = 0;
     bool valid = false;
 };
 
@@ -160,23 +163,27 @@ struct Grapple {
 class World {
 public:
 #ifdef GUNPOWDER_TEST_SCALE
-    static constexpr int simulationScale = 1;
-    static constexpr int width = 1024;
-    static constexpr int height = 576;
+    inline static float simulationScale = 1.0F;
+    inline static int width = 1024;
+    inline static int height = 576;
+    inline static int viewWidth = 320;
+    inline static int viewHeight = 180;
 #else
     // 960x540 material pixels at the default 1920x1080 display. This keeps
     // the Noita-style discrete cells visually small while the active-chunk
     // work continues toward affordable 1:1 simulation.
-    static constexpr int simulationScale = 3;
+    inline static float simulationScale = 3.0F;
     // The camera sees 960x540 simulation cells. This provides roughly
     // 34 screens of horizontal travel and 30 screens from the upper sky to
     // the bedrock, while lazy pages keep untouched material state unallocated.
-    static constexpr int width = 32768;
-    static constexpr int height = 16384;
+    inline static int width = 32768;
+    inline static int height = 16384;
+    inline static int viewWidth = 960;
+    inline static int viewHeight = 540;
 #endif
-    static constexpr int viewWidth = 320 * simulationScale;
-    static constexpr int viewHeight = 180 * simulationScale;
     static constexpr int chunkSize = 64;
+
+    static void configureMaterialGridScale(float normalizedScale);
 
     World();
 
@@ -446,12 +453,15 @@ private:
     SparseGrid<std::uint32_t> liquidSettledComponent_;
     std::vector<std::size_t> liquidWorklist_;
     std::vector<std::size_t> liquidNextWorklist_;
+    std::vector<std::size_t> backgroundLiquidWorklist_;
+    std::vector<std::size_t> backgroundLiquidNextWorklist_;
     std::vector<std::size_t> thermalWorklist_;
     std::uint32_t liquidFrontierGeneration_ = 0;
     std::uint32_t liquidComponentGeneration_ = 0;
     std::uint32_t nextSettledLiquidComponent_ = 1;
     std::vector<std::uint8_t> settledLiquidComponentValid_{0};
     bool rebuildLiquidWorklist_ = true;
+    bool rebuildBackgroundLiquidWorklist_ = true;
     std::vector<std::size_t> liquidComponentQueue_;
     std::vector<std::size_t> liquidHighSurfaces_;
     std::vector<std::size_t> liquidLowSurfaces_;
@@ -464,6 +474,7 @@ private:
     float currentLiquidFrontierMs_ = 0.0F;
     float currentLiquidEqualizationMs_ = 0.0F;
     std::uint32_t currentLiquidCandidateVisits_ = 0;
+    std::uint32_t currentLiquidDeferredCandidates_ = 0;
     std::uint32_t currentLiquidPreparationCellVisits_ = 0;
     std::uint32_t currentLiquidHeadSummaryHits_ = 0;
     std::uint32_t currentLiquidEqualizationSeedVisits_ = 0;
@@ -491,6 +502,15 @@ private:
     ActiveBounds materialPassExclusion_{0, 0, 0, 0};
     bool materialPassExclusionValid_ = false;
     std::uint8_t materialPassSystems_ = allMaterialActivity;
+    std::size_t materialPassLiquidCandidateBudget_ =
+        std::numeric_limits<std::size_t>::max();
+    std::size_t materialPassLiquidBudgetCursor_ = 0;
+    int materialPassLiquidSubsteps_ = 4;
+    int materialPassAdditionalWaterSubsteps_ = 2;
+    bool materialPassLiquidEqualizationEnabled_ = true;
+    bool liquidCrossedPassExclusion_ = false;
+    ActiveBounds backgroundLiquidBounds_{0, 0, 0, 0};
+    bool backgroundLiquidBoundsValid_ = false;
     std::vector<int> skyOccluderY_;
     std::vector<std::uint8_t> skyColumnDirty_;
     SparseGrid<std::uint8_t> interiorBackdrop_;

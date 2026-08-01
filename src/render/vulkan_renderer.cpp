@@ -36,7 +36,7 @@ constexpr std::uint32_t denoiseTimingEnd = 7;
 constexpr std::uint32_t rayTimingStart = 8;
 constexpr std::uint32_t rayTimingEnd = 9;
 constexpr std::uint32_t rayTimingQueryCount = 10;
-constexpr float renderScale = static_cast<float>(World::simulationScale);
+float renderScale() { return World::simulationScale; }
 constexpr float tau = 6.28318530718F;
 constexpr float sunHorizonSamplesPerCell = 4.0F;
 constexpr float skyHorizonSamplesPerCell = 2.0F;
@@ -230,6 +230,7 @@ std::array<float, 3> materialColor(Material material, int x, int y) {
 } // namespace
 
 VulkanRenderer::VulkanRenderer(SDL_Window* window) : window_(window) {
+    configureGridDimensions();
     loadPlayerSprite();
     createInstance();
     createSurface();
@@ -1626,7 +1627,7 @@ void VulkanRenderer::createCommands() {
 }
 
 void VulkanRenderer::createFrameResources() {
-    constexpr VkDeviceSize textureBytes =
+    const VkDeviceSize textureBytes =
         static_cast<VkDeviceSize>(textureWidth) *
         static_cast<VkDeviceSize>(textureHeight) * 4U;
     constexpr VkDeviceSize particleBytes =
@@ -1796,7 +1797,7 @@ void VulkanRenderer::createFrameResources() {
                 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
             frame.lightTileBuffer, frame.lightTileMemory);
         createBuffer(
-            sizeof(GpuOccupancyHierarchy),
+            occupancyHierarchyBytes(),
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
@@ -2159,7 +2160,7 @@ void VulkanRenderer::createFrameResources() {
         const VkDescriptorBufferInfo occupancyInfo{
             .buffer = frame.occupancyBuffer,
             .offset = 0,
-            .range = sizeof(GpuOccupancyHierarchy),
+            .range = occupancyHierarchyBytes(),
         };
         const std::array descriptorWrites{
             VkWriteDescriptorSet{
@@ -2703,24 +2704,24 @@ std::vector<Vertex> VulkanRenderer::buildVertices(const World& world) const {
         if (grapple.attached && grapple.points.size() >= 2) {
             for (std::size_t index = 1; index < grapple.points.size(); ++index) {
                 addWorldLine(grapple.points[index - 1], grapple.points[index],
-                             0.42F * renderScale,
+                             0.42F * renderScale(),
                              {0.58F, 0.61F, 0.66F},
                              1.0F, 1.025F);
             }
         } else {
             addWorldLine(world.player().position, grapple.hookPosition,
-                         0.32F * renderScale,
+                         0.32F * renderScale(),
                          {0.50F, 0.53F, 0.58F}, 1.0F, 1.025F);
         }
         addWorldQuad(grapple.hookPosition.x, grapple.hookPosition.y,
-                     1.15F * renderScale, 1.15F * renderScale,
+                     1.15F * renderScale(), 1.15F * renderScale(),
                      {0.95F, 0.70F, 0.22F}, 1.0F, 1.035F);
     }
 
     const Player& player = world.player();
-    constexpr float playerSpriteWidth = 6.0F * renderScale;
-    constexpr float playerSpriteHeight = 12.0F * renderScale;
-    constexpr float playerCollisionHalfHeight = 4.2F * renderScale;
+    const float playerSpriteWidth = 6.0F * renderScale();
+    const float playerSpriteHeight = 12.0F * renderScale();
+    const float playerCollisionHalfHeight = 4.2F * renderScale();
     const float pixelWidth =
         playerSpriteWidth / static_cast<float>(playerSpriteWidth_);
     const float pixelHeight =
@@ -2754,12 +2755,12 @@ std::vector<Vertex> VulkanRenderer::buildVertices(const World& world) const {
     }
     for (const Projectile& bullet : world.bullets()) {
         addWorldQuad(bullet.position.x, bullet.position.y,
-                     0.7F * renderScale, 0.7F * renderScale,
+                     0.7F * renderScale(), 0.7F * renderScale(),
                      {1.0F, 0.91F, 0.45F}, 1.0F, 0.0F);
     }
     for (const Projectile& grenade : world.grenades()) {
         addWorldQuad(grenade.position.x, grenade.position.y,
-                     1.5F * renderScale, 1.5F * renderScale,
+                     1.5F * renderScale(), 1.5F * renderScale(),
                      {0.35F, 0.86F, 0.30F}, 1.0F, 0.0F);
     }
     for (const Particle& particle : world.particles()) {
@@ -2785,15 +2786,15 @@ std::vector<Vertex> VulkanRenderer::buildVertices(const World& world) const {
         const Material material = palette[index];
         const float x = camera.x +
                         (7.0F + static_cast<float>(index) * 8.0F) *
-                            renderScale;
-        const float y = camera.y + 7.0F * renderScale;
+                            renderScale();
+        const float y = camera.y + 7.0F * renderScale();
         const std::array<float, 3> border =
             material == world.selectedMaterial()
                 ? std::array<float, 3>{0.96F, 0.98F, 1.0F}
                 : std::array<float, 3>{0.10F, 0.12F, 0.16F};
-        addWorldQuad(x, y, 3.5F * renderScale, 3.5F * renderScale,
+        addWorldQuad(x, y, 3.5F * renderScale(), 3.5F * renderScale(),
                      border, 1.0F, 0.0F);
-        addWorldQuad(x, y, 2.7F * renderScale, 2.7F * renderScale,
+        addWorldQuad(x, y, 2.7F * renderScale(), 2.7F * renderScale(),
                      materialColor(material, static_cast<int>(index), 0),
                      1.0F, 0.0F);
     }
@@ -2801,15 +2802,15 @@ std::vector<Vertex> VulkanRenderer::buildVertices(const World& world) const {
     const auto addHudBar = [&](float screenX, float screenY, float barWidth,
                                float barHeight, float value,
                                std::array<float, 3> color) {
-        screenX *= renderScale;
-        screenY *= renderScale;
-        barWidth *= renderScale;
-        barHeight *= renderScale;
+        screenX *= renderScale();
+        screenY *= renderScale();
+        barWidth *= renderScale();
+        barHeight *= renderScale();
         const float clamped = std::clamp(value, 0.0F, 1.0F);
         addWorldQuad(camera.x + screenX + barWidth * 0.5F,
                      camera.y + screenY + barHeight * 0.5F,
-                     barWidth * 0.5F + 0.8F * renderScale,
-                     barHeight * 0.5F + 0.8F * renderScale,
+                     barWidth * 0.5F + 0.8F * renderScale(),
+                     barHeight * 0.5F + 0.8F * renderScale(),
                      {0.08F, 0.09F, 0.12F}, 0.92F, 0.0F);
         if (clamped > 0.0F) {
             const float filledWidth = barWidth * clamped;
@@ -4864,7 +4865,8 @@ void VulkanRenderer::draw(World& world) {
     GpuOccupancyHierarchy occupancy{};
     const int originX = static_cast<int>(std::floor(camera.x));
     const int originY = static_cast<int>(std::floor(camera.y));
-    std::array<int, textureWidth + 2U> visibleSkyOccluders{};
+    std::vector<int> visibleSkyOccluders(
+        static_cast<std::size_t>(textureWidth) + 2U, 0);
     for (std::size_t index = 0;
          index < visibleSkyOccluders.size(); ++index) {
         visibleSkyOccluders[index] =
@@ -5211,11 +5213,21 @@ void VulkanRenderer::draw(World& world) {
         }
     }
     void* occupancyMapped = nullptr;
+    const VkDeviceSize occupancyBytes =
+        occupancyHierarchyBytes();
     check(vkMapMemory(device_, frame.occupancyMemory, 0,
-                      sizeof(occupancy), 0, &occupancyMapped),
+                      occupancyBytes, 0, &occupancyMapped),
           "vkMapMemory occupancy hierarchy");
-    std::memcpy(occupancyMapped, &occupancy,
-                sizeof(occupancy));
+    auto* occupancyWords =
+        static_cast<std::uint32_t*>(occupancyMapped);
+    std::copy(
+        occupancy.dimensions.begin(),
+        occupancy.dimensions.end(),
+        occupancyWords);
+    std::copy(
+        occupancy.occupied.begin(),
+        occupancy.occupied.end(),
+        occupancyWords + occupancy.dimensions.size());
     vkUnmapMemory(device_, frame.occupancyMemory);
     const auto occupancyEnd = RenderClock::now();
 
@@ -5321,6 +5333,45 @@ void VulkanRenderer::draw(World& world) {
               sample.submitPresentMs);
     }
     currentFrame_ = (currentFrame_ + 1) % framesInFlight;
+}
+
+void VulkanRenderer::configureGridDimensions() {
+    textureWidth =
+        static_cast<std::uint32_t>(World::viewWidth + 2);
+    textureHeight =
+        static_cast<std::uint32_t>(World::viewHeight + 2);
+    lightingWidth =
+        (textureWidth + lightingResolutionScale - 1) /
+        lightingResolutionScale;
+    lightingHeight =
+        (textureHeight + lightingResolutionScale - 1) /
+        lightingResolutionScale;
+    lightTileColumns =
+        (lightingWidth + lightTileSize - 1) / lightTileSize;
+    lightTileRows =
+        (lightingHeight + lightTileSize - 1) / lightTileSize;
+    lightTileCount = lightTileColumns * lightTileRows;
+    occupancyColumns =
+        (textureWidth + occupancyBlockSize - 1) /
+        occupancyBlockSize;
+    occupancyRows =
+        (textureHeight + occupancyBlockSize - 1) /
+        occupancyBlockSize;
+    occupancyLargeColumns =
+        (textureWidth + occupancyLargeBlockSize - 1) /
+        occupancyLargeBlockSize;
+    occupancyLargeRows =
+        (textureHeight + occupancyLargeBlockSize - 1) /
+        occupancyLargeBlockSize;
+    occupancyBlockCount = occupancyColumns * occupancyRows;
+    occupancyLargeBlockCount =
+        occupancyLargeColumns * occupancyLargeRows;
+}
+
+VkDeviceSize VulkanRenderer::occupancyHierarchyBytes() {
+    return static_cast<VkDeviceSize>(sizeof(std::uint32_t)) *
+           (4U + static_cast<VkDeviceSize>(occupancyBlockCount) +
+            static_cast<VkDeviceSize>(occupancyLargeBlockCount));
 }
 
 void VulkanRenderer::destroySwapchain() {

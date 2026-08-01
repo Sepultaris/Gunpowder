@@ -148,44 +148,27 @@ public:
 private:
     static constexpr std::size_t framesInFlight = 2;
     static constexpr VkDeviceSize vertexBufferBytes = 16U * 1024U * 1024U;
-    static constexpr std::uint32_t textureWidth = World::viewWidth + 2;
-    static constexpr std::uint32_t textureHeight = World::viewHeight + 2;
+    inline static std::uint32_t textureWidth = 962;
+    inline static std::uint32_t textureHeight = 542;
     // Lighting matches the material grid exactly. Display resolution remains
     // independent and can upscale both fields together.
     static constexpr std::uint32_t lightingResolutionScale = 1;
-    static constexpr std::uint32_t lightingWidth =
-        (textureWidth + lightingResolutionScale - 1) /
-        lightingResolutionScale;
-    static constexpr std::uint32_t lightingHeight =
-        (textureHeight + lightingResolutionScale - 1) /
-        lightingResolutionScale;
+    inline static std::uint32_t lightingWidth = 962;
+    inline static std::uint32_t lightingHeight = 542;
     static constexpr std::uint32_t maximumGpuParticles = 16'384;
     static constexpr std::size_t maximumFireLights = 64;
     static constexpr std::uint32_t lightTileSize = 8;
-    static constexpr std::uint32_t lightTileColumns =
-        (lightingWidth + lightTileSize - 1) / lightTileSize;
-    static constexpr std::uint32_t lightTileRows =
-        (lightingHeight + lightTileSize - 1) / lightTileSize;
-    static constexpr std::uint32_t lightTileCount =
-        lightTileColumns * lightTileRows;
+    inline static std::uint32_t lightTileColumns = 121;
+    inline static std::uint32_t lightTileRows = 68;
+    inline static std::uint32_t lightTileCount = 8228;
     static constexpr std::uint32_t occupancyBlockSize = 8;
     static constexpr std::uint32_t occupancyLargeBlockSize = 32;
-    static constexpr std::uint32_t occupancyColumns =
-        (textureWidth + occupancyBlockSize - 1) /
-        occupancyBlockSize;
-    static constexpr std::uint32_t occupancyRows =
-        (textureHeight + occupancyBlockSize - 1) /
-        occupancyBlockSize;
-    static constexpr std::uint32_t occupancyLargeColumns =
-        (textureWidth + occupancyLargeBlockSize - 1) /
-        occupancyLargeBlockSize;
-    static constexpr std::uint32_t occupancyLargeRows =
-        (textureHeight + occupancyLargeBlockSize - 1) /
-        occupancyLargeBlockSize;
-    static constexpr std::uint32_t occupancyBlockCount =
-        occupancyColumns * occupancyRows;
-    static constexpr std::uint32_t occupancyLargeBlockCount =
-        occupancyLargeColumns * occupancyLargeRows;
+    inline static std::uint32_t occupancyColumns = 121;
+    inline static std::uint32_t occupancyRows = 68;
+    inline static std::uint32_t occupancyLargeColumns = 31;
+    inline static std::uint32_t occupancyLargeRows = 17;
+    inline static std::uint32_t occupancyBlockCount = 8228;
+    inline static std::uint32_t occupancyLargeBlockCount = 527;
     // Legacy pressure-wave compute storage. The authoritative Noita-style
     // material solver is CPU cellular and does not use this allocation.
     static constexpr std::uint32_t maximumSimulationWidth = 768;
@@ -289,11 +272,15 @@ private:
             occupancyLargeColumns,
             occupancyLargeRows,
         };
-        std::array<std::uint32_t,
-                   occupancyBlockCount +
-                       occupancyLargeBlockCount>
-            occupied{};
+        std::vector<std::uint32_t> occupied =
+            std::vector<std::uint32_t>(
+                static_cast<std::size_t>(occupancyBlockCount) +
+                static_cast<std::size_t>(occupancyLargeBlockCount),
+                0U);
     };
+
+    static void configureGridDimensions();
+    [[nodiscard]] static VkDeviceSize occupancyHierarchyBytes();
 
     void createInstance();
     void createSurface();

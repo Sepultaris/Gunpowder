@@ -12,20 +12,21 @@
 namespace gunpowder {
 namespace {
 
-constexpr float spatialScale = static_cast<float>(World::simulationScale);
-constexpr float scaled(float value) { return value * spatialScale; }
-constexpr int scaledCell(int value) {
-    return value * World::simulationScale;
+float spatialScale() { return World::simulationScale; }
+float scaled(float value) { return value * spatialScale(); }
+int scaledCell(int value) {
+    return static_cast<int>(std::lround(
+        static_cast<float>(value) * spatialScale()));
 }
 
-constexpr Vec2 playerHalfSize{scaled(2.2F), scaled(4.2F)};
-constexpr float gravity = scaled(95.0F);
-constexpr float terminalFallSpeed = scaled(90.0F);
+Vec2 playerHalfSize{scaled(2.2F), scaled(4.2F)};
+float gravity = scaled(95.0F);
+float terminalFallSpeed = scaled(90.0F);
 constexpr float materialTimeStep = 1.0F / 30.0F;
-constexpr float maximumRunSpeed = scaled(46.0F);
-constexpr float playerStepHeight = scaled(1.35F);
-constexpr float playerGroundSnapDistance = scaled(1.45F);
-constexpr float playerGroundProbeIncrement = scaled(0.125F);
+float maximumRunSpeed = scaled(46.0F);
+float playerStepHeight = scaled(1.35F);
+float playerGroundSnapDistance = scaled(1.45F);
+float playerGroundProbeIncrement = scaled(0.125F);
 constexpr std::uint16_t maximumLiquidMass = 255;
 
 float elapsedMilliseconds(
@@ -64,6 +65,36 @@ ParallelExecutor& materialExecutor() {
 }
 
 } // namespace
+
+void World::configureMaterialGridScale(float normalizedScale) {
+#ifdef GUNPOWDER_TEST_SCALE
+    (void)normalizedScale;
+#else
+    const float clampedScale =
+        std::clamp(normalizedScale, 0.10F, 1.0F);
+    viewWidth = std::max(
+        1, static_cast<int>(std::lround(1920.0F * clampedScale)));
+    viewHeight = std::max(
+        1, static_cast<int>(std::lround(1080.0F * clampedScale)));
+    simulationScale =
+        static_cast<float>(viewWidth) / 320.0F;
+    width = std::max(
+        viewWidth,
+        static_cast<int>(std::lround(
+            (32768.0F / 3.0F) * simulationScale)));
+    height = std::max(
+        viewHeight,
+        static_cast<int>(std::lround(
+            (16384.0F / 3.0F) * simulationScale)));
+    playerHalfSize = {scaled(2.2F), scaled(4.2F)};
+    gravity = scaled(95.0F);
+    terminalFallSpeed = scaled(90.0F);
+    maximumRunSpeed = scaled(46.0F);
+    playerStepHeight = scaled(1.35F);
+    playerGroundSnapDistance = scaled(1.45F);
+    playerGroundProbeIncrement = scaled(0.125F);
+#endif
+}
 
 World::World()
     : cells_(width, height, Material::air),
@@ -143,6 +174,10 @@ void World::regenerate() {
     settledLiquidComponentValid_.assign(1, 0);
     liquidWorklist_.clear();
     liquidNextWorklist_.clear();
+    backgroundLiquidWorklist_.clear();
+    backgroundLiquidNextWorklist_.clear();
+    rebuildLiquidWorklist_ = true;
+    rebuildBackgroundLiquidWorklist_ = true;
     thermalWorklist_.clear();
     liquidReservedCells_.clear();
     for (auto& summary : liquidChunkColumnSummaries_) {
@@ -185,6 +220,15 @@ void World::regenerate() {
     materialPassSystems_ = allMaterialActivity;
     materialPassExclusion_ = {0, 0, 0, 0};
     materialPassExclusionValid_ = false;
+    materialPassLiquidCandidateBudget_ =
+        std::numeric_limits<std::size_t>::max();
+    materialPassLiquidBudgetCursor_ = 0;
+    materialPassLiquidSubsteps_ = 4;
+    materialPassAdditionalWaterSubsteps_ = 2;
+    materialPassLiquidEqualizationEnabled_ = true;
+    liquidCrossedPassExclusion_ = false;
+    backgroundLiquidBounds_ = {0, 0, 0, 0};
+    backgroundLiquidBoundsValid_ = false;
     previousMaterialBounds_ = {0, 0, 0, 0};
     previousMaterialBoundsValid_ = false;
     grapple_ = Grapple{};
@@ -207,7 +251,7 @@ void World::regenerate() {
                                                  scaled(4.0F));
     for (int x = 0; x < generationWidth; ++x) {
         const float logicalX =
-            static_cast<float>(x) / spatialScale;
+            static_cast<float>(x) / spatialScale();
         const float wave = std::sin(logicalX * 0.055F) * scaled(9.0F);
         const int surface =
             scaledCell(112) + static_cast<int>(wave + noise(random_));
@@ -628,6 +672,15 @@ void World::update(float dt, const InputState& input) {
             materialSimulationTimings_.backgroundSimulationMs;
         std::uint32_t backgroundActiveChunks =
             materialSimulationTimings_.backgroundActiveChunks;
+        float backgroundLiquidMilliseconds =
+            materialSimulationTimings_
+                .backgroundLiquidSimulationMs;
+        std::uint32_t backgroundLiquidCandidates =
+            materialSimulationTimings_
+                .backgroundLiquidCandidates;
+        std::uint32_t backgroundLiquidDeferredCandidates =
+            materialSimulationTimings_
+                .backgroundLiquidDeferredCandidates;
         constexpr std::uint64_t backgroundPeriod = 4;
         if ((materialStep_ % backgroundPeriod) == 0) {
             const ActiveBounds backgroundBounds{
@@ -663,10 +716,78 @@ void World::update(float dt, const InputState& input) {
             smoothTiming(
                 backgroundMilliseconds,
                 backgroundSample);
+
+            const bool backgroundBoundsChanged =
+                !backgroundLiquidBoundsValid_ ||
+                backgroundLiquidBounds_.minX !=
+                    backgroundBounds.minX ||
+                backgroundLiquidBounds_.maxX !=
+                    backgroundBounds.maxX ||
+                backgroundLiquidBounds_.minY !=
+                    backgroundBounds.minY ||
+                backgroundLiquidBounds_.maxY !=
+                    backgroundBounds.maxY;
+            if (backgroundBoundsChanged) {
+                rebuildBackgroundLiquidWorklist_ = true;
+                backgroundLiquidBounds_ = backgroundBounds;
+                backgroundLiquidBoundsValid_ = true;
+            }
+
+            std::swap(
+                liquidWorklist_,
+                backgroundLiquidWorklist_);
+            std::swap(
+                liquidNextWorklist_,
+                backgroundLiquidNextWorklist_);
+            std::swap(
+                rebuildLiquidWorklist_,
+                rebuildBackgroundLiquidWorklist_);
+            materialPassSystems_ = liquidActivity;
+            materialPassLiquidCandidateBudget_ = 2048;
+            materialPassLiquidSubsteps_ = 2;
+            materialPassAdditionalWaterSubsteps_ = 0;
+            materialPassLiquidEqualizationEnabled_ = false;
+            liquidCrossedPassExclusion_ = false;
+            const auto backgroundLiquidBegin =
+                std::chrono::steady_clock::now();
+            updateMaterials(backgroundBounds);
+            const float backgroundLiquidSample =
+                elapsedMilliseconds(
+                    backgroundLiquidBegin,
+                    std::chrono::steady_clock::now());
+            backgroundLiquidCandidates =
+                materialSimulationTimings_
+                    .liquidCandidateVisits;
+            backgroundLiquidDeferredCandidates =
+                currentLiquidDeferredCandidates_;
+            const bool crossedIntoForeground =
+                liquidCrossedPassExclusion_;
+            std::swap(
+                liquidWorklist_,
+                backgroundLiquidWorklist_);
+            std::swap(
+                liquidNextWorklist_,
+                backgroundLiquidNextWorklist_);
+            std::swap(
+                rebuildLiquidWorklist_,
+                rebuildBackgroundLiquidWorklist_);
+            if (crossedIntoForeground) {
+                rebuildLiquidWorklist_ = true;
+            }
+            materialSimulationTimings_ = foregroundTimings;
+            smoothTiming(
+                backgroundLiquidMilliseconds,
+                backgroundLiquidSample);
         }
 
         materialPassSystems_ = allMaterialActivity;
         materialPassExclusionValid_ = false;
+        materialPassLiquidCandidateBudget_ =
+            std::numeric_limits<std::size_t>::max();
+        materialPassLiquidSubsteps_ = 4;
+        materialPassAdditionalWaterSubsteps_ = 2;
+        materialPassLiquidEqualizationEnabled_ = true;
+        liquidCrossedPassExclusion_ = false;
         const auto simulationBegin =
             std::chrono::steady_clock::now();
         updateMaterials(foregroundBounds);
@@ -685,6 +806,15 @@ void World::update(float dt, const InputState& input) {
             backgroundMilliseconds;
         materialSimulationTimings_.backgroundActiveChunks =
             backgroundActiveChunks;
+        materialSimulationTimings_
+            .backgroundLiquidSimulationMs =
+            backgroundLiquidMilliseconds;
+        materialSimulationTimings_
+            .backgroundLiquidCandidates =
+            backgroundLiquidCandidates;
+        materialSimulationTimings_
+            .backgroundLiquidDeferredCandidates =
+            backgroundLiquidDeferredCandidates;
         materialSimulationTimings_.valid = true;
         if (gpuMaterialSimulationEnabled_) {
             ++pendingGpuMaterialSteps_;
@@ -742,7 +872,7 @@ bool World::isSolid(int x, int y) const {
 
 int World::proceduralSurfaceY(int x) const {
     const float logicalX =
-        static_cast<float>(x) / spatialScale;
+        static_cast<float>(x) / spatialScale();
     const float broad =
         std::sin(logicalX * 0.011F) * scaled(18.0F);
     const float detail =
@@ -758,11 +888,11 @@ Material World::proceduralMaterial(int x, int y) const {
     const int surface = proceduralSurfaceY(x);
     if (y < surface) {
         const float logicalX =
-            static_cast<float>(x) / spatialScale;
+            static_cast<float>(x) / spatialScale();
         const float logicalY =
-            static_cast<float>(y) / spatialScale;
+            static_cast<float>(y) / spatialScale();
         const float altitude =
-            static_cast<float>(surface - y) / spatialScale;
+            static_cast<float>(surface - y) / spatialScale();
         const float islandField =
             std::sin(logicalX * 0.031F) +
             std::sin((logicalX + logicalY) * 0.019F) +
@@ -786,9 +916,9 @@ Material World::proceduralMaterial(int x, int y) const {
     }
 
     const float logicalX =
-        static_cast<float>(x) / spatialScale;
+        static_cast<float>(x) / spatialScale();
     const float logicalY =
-        static_cast<float>(y) / spatialScale;
+        static_cast<float>(y) / spatialScale();
     const float caveField =
         std::sin(logicalX * 0.024F) +
         std::sin((logicalX + logicalY) * 0.014F + 0.8F) +
@@ -873,7 +1003,7 @@ bool World::overlapsTerrain(Vec2 center, Vec2 halfSize) const {
     const int right = static_cast<int>(std::floor(center.x + halfSize.x));
     const int top = static_cast<int>(std::floor(center.y - halfSize.y));
     const int bottom = static_cast<int>(std::floor(center.y + halfSize.y));
-    constexpr float cornerRadius = scaled(0.68F);
+    const float cornerRadius = scaled(0.68F);
     const Vec2 innerHalfSize{
         std::max(0.0F, halfSize.x - cornerRadius),
         std::max(0.0F, halfSize.y - cornerRadius),
@@ -961,6 +1091,7 @@ void World::setCell(int x, int y, Material material) {
             // Direct edits, reactions, and topology changes can introduce a
             // liquid edge outside the persistent transport frontier.
             rebuildLiquidWorklist_ = true;
+            rebuildBackgroundLiquidWorklist_ = true;
             invalidateSettledLiquidNear(x, y);
             invalidateLiquidPreparationAt(x, y);
         }
@@ -1099,7 +1230,7 @@ void World::markSolidDirty(
     if (minX > maxX || minY > maxY) {
         return;
     }
-    constexpr int chunkColumns =
+    const int chunkColumns =
         (width + chunkSize - 1) / chunkSize;
     const int firstChunkX =
         std::max(0, minX - 1) / chunkSize;
@@ -1197,7 +1328,7 @@ void World::invalidateLiquidPreparationAt(int x, int y) {
     if (x < 0 || x >= width || y < 0 || y >= height) {
         return;
     }
-    constexpr int chunkColumns =
+    const int chunkColumns =
         (width + chunkSize - 1) / chunkSize;
     const int chunkX = x / chunkSize;
     const int chunkY = y / chunkSize;
@@ -1249,7 +1380,7 @@ void World::markMaterialActive(
     if (activityMask == 0) {
         return;
     }
-    constexpr int chunkColumns =
+    const int chunkColumns =
         (width + chunkSize - 1) / chunkSize;
     // Wake the touched microtile and a one-tile halo. Sampling one tile away
     // naturally crosses a chunk boundary only when the source is close
@@ -1299,7 +1430,7 @@ void World::markMaterialActive(
 
 void World::wakeMaterialChunksEntering(
     const ActiveBounds& bounds) {
-    constexpr int chunksWide =
+    const int chunksWide =
         (width + chunkSize - 1) / chunkSize;
     const int firstChunkX =
         bounds.minX / chunkSize;
@@ -1423,6 +1554,7 @@ void World::wakeMaterialChunksEntering(
         // The persistent frontier only describes the window that was
         // simulated most recently. Rebuild it after streamed liquid returns.
         rebuildLiquidWorklist_ = true;
+        rebuildBackgroundLiquidWorklist_ = true;
     }
     previousMaterialBounds_ = bounds;
     previousMaterialBoundsValid_ = true;
@@ -1430,7 +1562,7 @@ void World::wakeMaterialChunksEntering(
 
 bool World::materialChunkActive(
     int x, int y, std::uint8_t activityMask) const {
-    constexpr int chunkColumns =
+    const int chunkColumns =
         (width + chunkSize - 1) / chunkSize;
     if (x < 0 || x >= width || y < 0 || y >= height) {
         return false;
@@ -1457,7 +1589,7 @@ bool World::materialChunkActive(
 
 bool World::materialMicrotileActive(
     int x, int y, std::uint8_t activityMask) const {
-    constexpr int chunkColumns =
+    const int chunkColumns =
         (width + chunkSize - 1) / chunkSize;
     if (x < 0 || x >= width || y < 0 || y >= height) {
         return false;
@@ -1507,7 +1639,7 @@ bool World::materialChunkIncludedInCurrentPass(
 }
 
 void World::ageMaterialChunks(const ActiveBounds& bounds) {
-    constexpr int chunkColumns =
+    const int chunkColumns =
         (width + chunkSize - 1) / chunkSize;
     const int firstChunkX = bounds.minX / chunkSize;
     const int finalChunkX =
@@ -1792,7 +1924,7 @@ void World::buildDirectionalSunHorizon(
         std::lock_guard lock(directionalOccluderMutex_);
         auto& directionLists =
             directionalOccluderLists_[directionKey];
-        constexpr int chunksWide =
+        const int chunksWide =
             (width + chunkSize - 1) / chunkSize;
         cells_.forEachAllocatedChunk(
             [&](int chunkX, int chunkY,
@@ -1978,7 +2110,7 @@ void World::buildDirectionalSunHorizon(
             }
     };
 
-    constexpr int chunksWide =
+    const int chunksWide =
         (width + chunkSize - 1) / chunkSize;
     const auto& directionLists =
         directionalOccluderLists_[directionKey];
@@ -2667,8 +2799,8 @@ void World::updatePlayerEnvironment(float dt, const InputState&,
 }
 
 void World::updateGrapple(float dt, const InputState& input) {
-    constexpr float hookSpeed = scaled(235.0F);
-    constexpr float maximumRange = scaled(280.0F);
+    const float hookSpeed = scaled(235.0F);
+    const float maximumRange = scaled(280.0F);
 
     if (input.grappleToggle) {
         if (grapple_.active) {
@@ -2763,7 +2895,7 @@ void World::updateGrapple(float dt, const InputState& input) {
     // Reeling cannot pull an already wrapped portion of the rope through
     // terrain. Once the player rounds that corner and it unwraps, reeling can
     // continue normally.
-    constexpr float minimumFreeSegment = scaled(3.0F);
+    const float minimumFreeSegment = scaled(3.0F);
     grapple_.ropeLength =
         std::max(grapple_.ropeLength, fixedPathLength + minimumFreeSegment);
     const float freeSegmentLength =
@@ -2899,7 +3031,7 @@ bool World::ropeLineClear(Vec2 from, Vec2 to) const {
 
     const int steps =
         std::max(2, static_cast<int>(
-                        std::ceil(distance * 4.0F / spatialScale)));
+                        std::ceil(distance * 4.0F / spatialScale())));
     for (int step = 1; step < steps; ++step) {
         const float t =
             static_cast<float>(step) / static_cast<float>(steps);
@@ -2929,7 +3061,7 @@ bool World::findRopeWrapPoint(Vec2 from, Vec2 to, Vec2& wrapPoint) const {
     bool foundHit = false;
     const int steps =
         std::max(2, static_cast<int>(
-                        std::ceil(distance * 5.0F / spatialScale)));
+                        std::ceil(distance * 5.0F / spatialScale())));
     for (int step = 1; step < steps; ++step) {
         const float t =
             static_cast<float>(step) / static_cast<float>(steps);
@@ -3290,6 +3422,7 @@ void World::updateMaterials(const ActiveBounds& bounds) {
     currentLiquidFrontierMs_ = 0.0F;
     currentLiquidEqualizationMs_ = 0.0F;
     currentLiquidCandidateVisits_ = 0;
+    currentLiquidDeferredCandidates_ = 0;
     currentLiquidPreparationCellVisits_ = 0;
     currentLiquidHeadSummaryHits_ = 0;
     currentLiquidEqualizationSeedVisits_ = 0;
@@ -3302,7 +3435,7 @@ void World::updateMaterials(const ActiveBounds& bounds) {
     currentLiquidLateralConflicts_ = 0;
     currentParallelLiquidColumnVisits_ = 0;
     currentParallelLiquidVerticalMoves_ = 0;
-    constexpr int chunkColumns =
+    const int chunkColumns =
         (width + chunkSize - 1) / chunkSize;
     const int firstChunkX = bounds.minX / chunkSize;
     const int finalChunkX =
@@ -3749,6 +3882,7 @@ void World::updateMaterials(const ActiveBounds& bounds) {
                 // Granular displacement can disturb a settled pool whose
                 // persistent liquid frontier is currently empty.
                 rebuildLiquidWorklist_ = true;
+                rebuildBackgroundLiquidWorklist_ = true;
             }
             swapCells(
                 sourceX, sourceY,
@@ -3829,7 +3963,11 @@ void World::updateMaterials(const ActiveBounds& bounds) {
         simulatesLiquids && activeLiquidChunkCount != 0;
     if (hasActiveLiquidChunks) {
         cacheLiquidColumnHeads(bounds);
-        prepareLiquidEqualization(bounds);
+        if (materialPassLiquidEqualizationEnabled_) {
+            prepareLiquidEqualization(bounds);
+        } else {
+            liquidEqualizationMoves_.clear();
+        }
     } else if (simulatesLiquids) {
         liquidWorklist_.clear();
         liquidNextWorklist_.clear();
@@ -3837,17 +3975,23 @@ void World::updateMaterials(const ActiveBounds& bounds) {
     }
     const auto liquidPreparationEnd =
         std::chrono::steady_clock::now();
-    constexpr int liquidSubsteps = 4;
-    constexpr int additionalWaterSubsteps = 2;
     if (hasActiveLiquidChunks) {
-        for (int step = 0; step < liquidSubsteps; ++step) {
+        for (int step = 0;
+             step < materialPassLiquidSubsteps_; ++step) {
             updateLiquids(bounds);
-            applyLiquidEqualizationPhase(bounds, step);
+            if (materialPassLiquidEqualizationEnabled_) {
+                applyLiquidEqualizationPhase(bounds, step);
+            }
         }
-        for (int step = 0; step < additionalWaterSubsteps; ++step) {
+        for (int step = 0;
+             step < materialPassAdditionalWaterSubsteps_;
+             ++step) {
             updateLiquids(bounds, true);
-            applyLiquidEqualizationPhase(
-                bounds, liquidSubsteps + step);
+            if (materialPassLiquidEqualizationEnabled_) {
+                applyLiquidEqualizationPhase(
+                    bounds,
+                    materialPassLiquidSubsteps_ + step);
+            }
         }
     }
     const auto liquidTransportEnd =
@@ -4460,7 +4604,7 @@ void World::updateMaterials(const ActiveBounds& bounds) {
 }
 
 void World::cacheLiquidColumnHeads(const ActiveBounds& bounds) {
-    constexpr int chunkColumns =
+    const int chunkColumns =
         (width + chunkSize - 1) / chunkSize;
     const int firstChunkX = bounds.minX / chunkSize;
     const int finalChunkX =
@@ -4500,7 +4644,10 @@ void World::cacheLiquidColumnHeads(const ActiveBounds& bounds) {
                     chunkY * chunkColumns + chunkX);
             const MaterialChunkActivity& activity =
                 materialChunkActivity_[chunkIndex];
-            if (activity.lifetime[liquidSystemIndex] == 0) {
+            if (!materialChunkActive(
+                    chunkOriginX,
+                    chunkOriginY,
+                    liquidActivity)) {
                 continue;
             }
             auto& chunkSummary =
@@ -4996,6 +5143,45 @@ void World::updateLiquids(const ActiveBounds& bounds, bool waterOnly) {
         }
     }
 
+    // Foreground liquid remains unlimited. Reduced-rate background passes
+    // process a rotating slice and carry the remainder into the next
+    // persistent frontier, guaranteeing bounded transport work without
+    // starving a large off-screen spill.
+    std::vector<std::size_t> deferredLiquidWorklist;
+    if (materialPassLiquidCandidateBudget_ <
+            liquidWorklist_.size()) {
+        const std::size_t candidateCount =
+            liquidWorklist_.size();
+        const std::size_t selectedCount =
+            materialPassLiquidCandidateBudget_;
+        const std::size_t firstCandidate =
+            materialPassLiquidBudgetCursor_ % candidateCount;
+        std::vector<std::size_t> selectedLiquidWorklist;
+        selectedLiquidWorklist.reserve(selectedCount);
+        deferredLiquidWorklist.reserve(
+            candidateCount - selectedCount);
+        for (std::size_t offset = 0;
+             offset < candidateCount; ++offset) {
+            const std::size_t candidate =
+                liquidWorklist_[
+                    (firstCandidate + offset) % candidateCount];
+            if (offset < selectedCount) {
+                selectedLiquidWorklist.push_back(candidate);
+            } else {
+                deferredLiquidWorklist.push_back(candidate);
+            }
+        }
+        materialPassLiquidBudgetCursor_ =
+            (firstCandidate + selectedCount) % candidateCount;
+        currentLiquidDeferredCandidates_ +=
+            static_cast<std::uint32_t>(
+                std::min<std::size_t>(
+                    deferredLiquidWorklist.size(),
+                    std::numeric_limits<std::uint32_t>::max() -
+                        currentLiquidDeferredCandidates_));
+        liquidWorklist_.swap(selectedLiquidWorklist);
+    }
+
     // Downstream gravity needs rows in top-to-bottom order, but x order is
     // deliberately randomized. A counting pass over the small active row
     // range is linear and avoids comparison-sorting tens of thousands of
@@ -5076,6 +5262,13 @@ void World::updateLiquids(const ActiveBounds& bounds, bool waterOnly) {
             liquidFrontierGeneration_;
         liquidNextWorklist_.push_back(index);
     };
+    for (std::size_t deferred : deferredLiquidWorklist) {
+        enqueueNext(
+            static_cast<int>(
+                deferred % static_cast<std::size_t>(width)),
+            static_cast<int>(
+                deferred / static_cast<std::size_t>(width)));
+    }
     const auto canFallInto = [&](int x, int y) {
         if (!targetInBounds(x, y)) {
             return false;
@@ -5122,6 +5315,10 @@ void World::updateLiquids(const ActiveBounds& bounds, bool waterOnly) {
             accumulateLiquidMomentum(previousFlowY, flowY));
         moved_[from] = toY > fromY ? 2 : 1;
         moved_[to] = 1;
+        if (materialPassExclusionValid_ &&
+            !materialChunkIncludedInCurrentPass(toX, toY)) {
+            liquidCrossedPassExclusion_ = true;
+        }
         for (int offsetY = -1; offsetY <= 1; ++offsetY) {
             for (int offsetX = -1; offsetX <= 1; ++offsetX) {
                 enqueueNext(
@@ -5445,9 +5642,9 @@ void World::updateLiquids(const ActiveBounds& bounds, bool waterOnly) {
         }
 
         if (verticalJobCount > 1) {
-            constexpr int chunkColumns =
+            const int chunkColumns =
                 (width + chunkSize - 1) / chunkSize;
-            constexpr int chunkRows =
+            const int chunkRows =
                 (height + chunkSize - 1) / chunkSize;
             const auto ensureLiquidStorage =
                 [&](int chunkX, int chunkY) {
@@ -6824,7 +7021,7 @@ void World::applyLiquidEqualizationPhase(
 }
 
 void World::updateHeat(const ActiveBounds& bounds) {
-    constexpr int chunkColumns =
+    const int chunkColumns =
         (width + chunkSize - 1) / chunkSize;
     const int firstChunkX = bounds.minX / chunkSize;
     const int finalChunkX =
@@ -7435,6 +7632,7 @@ void World::displaceLiquid(Vec2 center, Vec2 halfSize, Vec2 motion,
     }
     if (movedCells > 0) {
         rebuildLiquidWorklist_ = true;
+        rebuildBackgroundLiquidWorklist_ = true;
     }
 }
 

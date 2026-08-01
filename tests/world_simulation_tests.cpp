@@ -384,6 +384,83 @@ int main() {
         return 1;
     }
 
+    gunpowder::World backgroundLiquidWorld;
+    gunpowder::InputState backgroundLiquidInput;
+    backgroundLiquidWorld.setPlayerForTest({512.0F, 288.0F});
+    backgroundLiquidWorld.setCameraForTest({512.0F, 288.0F});
+    constexpr int backgroundWaterX = 800;
+    constexpr int backgroundWaterY = 210;
+    for (int y = backgroundWaterY - 8;
+         y < backgroundWaterY + 32; ++y) {
+        for (int x = backgroundWaterX - 8;
+             x < backgroundWaterX + 16; ++x) {
+            backgroundLiquidWorld.setCellForTest(
+                x, y, gunpowder::Material::air);
+        }
+    }
+    for (int y = backgroundWaterY;
+         y < backgroundWaterY + 8; ++y) {
+        for (int x = backgroundWaterX;
+             x < backgroundWaterX + 8; ++x) {
+            backgroundLiquidWorld.setCellForTest(
+                x, y, gunpowder::Material::water);
+        }
+    }
+    for (int tick = 0; tick < 4; ++tick) {
+        backgroundLiquidWorld.update(
+            1.0F / 30.0F, backgroundLiquidInput);
+    }
+    const auto& backgroundLiquidTimings =
+        backgroundLiquidWorld.materialSimulationTimings();
+    bool backgroundWaterMoved = false;
+    for (int y = backgroundWaterY + 8;
+         y < backgroundWaterY + 24; ++y) {
+        for (int x = backgroundWaterX - 8;
+             x < backgroundWaterX + 16; ++x) {
+            backgroundWaterMoved =
+                backgroundWaterMoved ||
+                backgroundLiquidWorld.cell(x, y) ==
+                    gunpowder::Material::water;
+        }
+    }
+    if (backgroundLiquidTimings
+                .backgroundLiquidSimulationMs <= 0.0F ||
+        backgroundLiquidTimings.backgroundLiquidCandidates == 0 ||
+        backgroundLiquidTimings.backgroundLiquidCandidates > 4096 ||
+        !backgroundWaterMoved) {
+        std::cerr
+            << "Budgeted background liquid frontier did not advance\n";
+        return 1;
+    }
+
+    gunpowder::World backgroundLiquidBudgetWorld;
+    gunpowder::InputState backgroundLiquidBudgetInput;
+    backgroundLiquidBudgetWorld.setPlayerForTest({512.0F, 288.0F});
+    backgroundLiquidBudgetWorld.setCameraForTest({512.0F, 288.0F});
+    for (int y = 32; y < 96; ++y) {
+        for (int x = 128; x < 320; ++x) {
+            if (((x + y) & 1) == 0) {
+                backgroundLiquidBudgetWorld.setCellForTest(
+                    x, y, gunpowder::Material::water);
+            }
+        }
+    }
+    for (int tick = 0; tick < 4; ++tick) {
+        backgroundLiquidBudgetWorld.update(
+            1.0F / 30.0F,
+            backgroundLiquidBudgetInput);
+    }
+    const auto& backgroundLiquidBudgetTimings =
+        backgroundLiquidBudgetWorld.materialSimulationTimings();
+    if (backgroundLiquidBudgetTimings
+                .backgroundLiquidCandidates > 4096 ||
+        backgroundLiquidBudgetTimings
+                .backgroundLiquidDeferredCandidates == 0) {
+        std::cerr
+            << "Background liquid frontier exceeded or bypassed its budget\n";
+        return 1;
+    }
+
     gunpowder::World chunkHeadWorld;
     constexpr int headColumnX = 100;
     constexpr int headBottomY = 71;
@@ -463,7 +540,7 @@ int main() {
     }
 
     gunpowder::World skyWorld;
-    constexpr int skyTestX = gunpowder::World::width / 2;
+    const int skyTestX = gunpowder::World::width / 2;
     constexpr int skyTestRoofY = 20;
     for (int y = 0; y <= skyTestRoofY; ++y) {
         skyWorld.setCellForTest(

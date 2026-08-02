@@ -26,6 +26,13 @@
 #include <utility>
 #include <vector>
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 namespace {
 
 class SdlContext {
@@ -69,6 +76,7 @@ enum class WindowMode : int {
 struct DisplaySettings {
     int resolutionIndex = 2;
     int windowMode = static_cast<int>(WindowMode::borderlessWindow);
+    float materialGridScale = 0.50F;
 };
 
 #define GUNPOWDER_RENDER_PROFILE_FIELDS(X)                                  \
@@ -101,6 +109,7 @@ struct DisplaySettings {
     X(sunShadowSoftness)                                                    \
     X(skyIntensity)                                                         \
     X(skyLightIntensity)                                                    \
+    X(skyRays)                                                              \
     X(ambientIntensity)                                                     \
     X(daylightAmbientIntensity)                                             \
     X(baseHaze)                                                             \
@@ -123,8 +132,7 @@ struct DisplaySettings {
     X(liquidMetaballNormalStrength)                                         \
     X(liquidReflectionStrength)                                             \
     X(liquidSubsurfaceStrength)                                             \
-    X(liquidCausticStrength)                                                \
-    X(liquidDispersionStrength)
+    X(liquidCausticStrength)
 
 struct RenderProfileUi {
     std::filesystem::path directory;
@@ -149,6 +157,82 @@ std::filesystem::path renderProfileDirectory() {
     std::filesystem::path result(preferencePath);
     SDL_free(preferencePath);
     return result / "render-profiles";
+}
+
+std::filesystem::path applicationSettingsPath() {
+    char* preferencePath = SDL_GetPrefPath("Sepul", "Gunpowder");
+    if (preferencePath == nullptr) {
+        return std::filesystem::current_path() / "settings.ini";
+    }
+    std::filesystem::path result(preferencePath);
+    SDL_free(preferencePath);
+    return result / "settings.ini";
+}
+
+float loadMaterialGridScale() {
+    std::ifstream input(applicationSettingsPath());
+    std::string key;
+    float value = 0.50F;
+    while (input >> key >> value) {
+        if (key == "material_grid_scale") {
+            return std::clamp(value, 0.10F, 1.0F);
+        }
+    }
+    return 0.50F;
+}
+
+bool saveMaterialGridScale(float value, std::string& error) {
+    const std::filesystem::path path = applicationSettingsPath();
+    std::error_code filesystemError;
+    std::filesystem::create_directories(
+        path.parent_path(), filesystemError);
+    if (filesystemError) {
+        error = filesystemError.message();
+        return false;
+    }
+    std::ofstream output(path, std::ios::trunc);
+    if (!output) {
+        error = "Could not open " + path.string();
+        return false;
+    }
+    output << "material_grid_scale "
+           << std::fixed << std::setprecision(3)
+           << std::clamp(value, 0.10F, 1.0F) << '\n';
+    if (!output) {
+        error = "Could not write " + path.string();
+        return false;
+    }
+    return true;
+}
+
+bool launchRestartedApplication(std::string& error) {
+#ifdef _WIN32
+    std::vector<wchar_t> executablePath(32768, L'\0');
+    const DWORD length = GetModuleFileNameW(
+        nullptr, executablePath.data(),
+        static_cast<DWORD>(executablePath.size()));
+    if (length == 0 || length >= executablePath.size()) {
+        error = "Could not find the running executable";
+        return false;
+    }
+    std::wstring commandLine =
+        L"\"" + std::wstring(executablePath.data(), length) + L"\"";
+    STARTUPINFOW startupInfo{};
+    startupInfo.cb = sizeof(startupInfo);
+    PROCESS_INFORMATION processInfo{};
+    if (CreateProcessW(
+            executablePath.data(), commandLine.data(), nullptr, nullptr,
+            FALSE, 0, nullptr, nullptr, &startupInfo, &processInfo) == FALSE) {
+        error = "Could not restart the application";
+        return false;
+    }
+    CloseHandle(processInfo.hThread);
+    CloseHandle(processInfo.hProcess);
+    return true;
+#else
+    error = "Automatic restart is not supported on this platform";
+    return false;
+#endif
 }
 
 std::string cleanProfileName(std::string_view rawName) {
@@ -503,11 +587,13 @@ void sliderFloatWithReset(const char* label, float* value, float minimum,
 bool drawDeveloperUi(bool* open,
                      gunpowder::RayTracingSettings& settings,
                      const gunpowder::GpuRayTimings& gpuTimings,
+                     const gunpowder::CpuRenderTimings& cpuRenderTimings,
                      const gunpowder::MaterialSimulationTimings&
                          materialTimings,
                      DisplaySettings& displaySettings,
                      RenderProfileUi& profiles,
                      const std::string& displayError,
+                     bool& applyGridAndRestart,
                      float framesPerSecond) {
     const gunpowder::RayTracingSettings defaults{};
     ImGui::SetNextWindowSizeConstraints(
@@ -534,9 +620,40 @@ bool drawDeveloperUi(bool* open,
     } else {
         ImGui::TextDisabled("GPU lighting timings: collecting...");
     }
+    if (cpuRenderTimings.valid) {
+        ImGui::Text(
+            "CPU renderer: %.3f ms", cpuRenderTimings.totalMs);
+        ImGui::TextDisabled(
+            "Sync %.3f | Wait %.3f | Directional %.3f | Scene %.3f ms",
+            cpuRenderTimings.synchronizeMs,
+            cpuRenderTimings.frameWaitMs,
+            cpuRenderTimings.directionalCacheMs,
+            cpuRenderTimings.sceneBuildMs);
+        ImGui::TextDisabled(
+            "Sun field %.3f | Sky field %.3f ms",
+            cpuRenderTimings.sunHorizonMs,
+            cpuRenderTimings.skyHorizonMs);
+        ImGui::TextDisabled(
+            "Pack %.3f | Occupancy %.3f | Commands %.3f | Present %.3f ms",
+            cpuRenderTimings.materialTextureMs,
+            cpuRenderTimings.occupancyMs,
+            cpuRenderTimings.commandRecordMs,
+            cpuRenderTimings.submitPresentMs);
+    } else {
+        ImGui::TextDisabled("CPU renderer timings: collecting...");
+    }
     if (materialTimings.valid) {
         ImGui::Text(
             "CPU materials: %.3f ms", materialTimings.totalMs);
+        ImGui::TextDisabled(
+            "Background ring %.3f ms / 4 ticks | %u active chunks",
+            materialTimings.backgroundSimulationMs,
+            materialTimings.backgroundActiveChunks);
+        ImGui::TextDisabled(
+            "Background liquid %.3f ms | %u candidates | %u deferred",
+            materialTimings.backgroundLiquidSimulationMs,
+            materialTimings.backgroundLiquidCandidates,
+            materialTimings.backgroundLiquidDeferredCandidates);
         ImGui::TextDisabled(
             "Granular %.3f | Prepare %.3f | Flow %.3f | "
             "Gas %.3f | Heat %.3f ms",
@@ -560,6 +677,54 @@ bool drawDeveloperUi(bool* open,
             materialTimings.liquidCandidateVisits,
             materialTimings.equalizedComponents,
             materialTimings.equalizedCells);
+        ImGui::TextDisabled(
+            "Awake: granular %u | liquid %u | gas %u | thermal %u",
+            materialTimings.activeGranularChunks,
+            materialTimings.activeLiquidChunks,
+            materialTimings.activeGasChunks,
+            materialTimings.activeThermalChunks);
+        ImGui::TextDisabled(
+            "Microtiles: granular %u | liquid %u | gas %u | thermal %u",
+            materialTimings.activeGranularMicrotiles,
+            materialTimings.activeLiquidMicrotiles,
+            materialTimings.activeGasMicrotiles,
+            materialTimings.activeThermalMicrotiles);
+        ImGui::TextDisabled(
+            "Parallel scheduler: %u threads | granular %u | liquid %u | "
+            "gas %u | thermal %u chunks",
+            materialTimings.materialWorkerThreads,
+            materialTimings.parallelGranularChunks,
+            materialTimings.parallelLiquidChunks,
+            materialTimings.parallelGasChunks,
+            materialTimings.parallelThermalChunks);
+        ImGui::TextDisabled(
+            "Sand transfers: %u proposed | %u accepted | %u conflicts",
+            materialTimings.granularMoveProposals,
+            materialTimings.granularMovesAccepted,
+            materialTimings.granularMoveConflicts);
+        ImGui::TextDisabled(
+            "Gas transfers: %u proposed | %u accepted | %u conflicts",
+            materialTimings.gasMoveProposals,
+            materialTimings.gasMovesAccepted,
+            materialTimings.gasMoveConflicts);
+        ImGui::TextDisabled(
+            "Liquid transfers: %u proposed | %u accepted | %u conflicts "
+            "(gravity %u / lateral %u)",
+            materialTimings.liquidMoveProposals,
+            materialTimings.liquidMovesAccepted,
+            materialTimings.liquidMoveConflicts,
+            materialTimings.liquidGravityConflicts,
+            materialTimings.liquidLateralConflicts);
+        ImGui::TextDisabled(
+            "Liquid vertical phase: %u column passes | %u parallel moves",
+            materialTimings.parallelLiquidColumnVisits,
+            materialTimings.parallelLiquidVerticalMoves);
+        ImGui::TextDisabled(
+            "Liquid prep %u cells | Edge cache %u columns | "
+            "Equalization seeds %u cells",
+            materialTimings.liquidPreparationCellVisits,
+            materialTimings.liquidHeadSummaryHits,
+            materialTimings.liquidEqualizationSeedVisits);
     } else {
         ImGui::TextDisabled("CPU material timings: collecting...");
     }
@@ -599,9 +764,22 @@ bool drawDeveloperUi(bool* open,
         ImGui::Combo("Window mode", &displaySettings.windowMode,
                      modeNames.data(),
                      static_cast<int>(modeNames.size()));
-        ImGui::Text("Material grid: %d x %d",
+        ImGui::Text("Current material grid: %d x %d",
                     gunpowder::World::viewWidth,
                     gunpowder::World::viewHeight);
+        sliderFloatWithReset(
+            "Material grid scale",
+            &displaySettings.materialGridScale,
+            0.10F, 1.0F, "%.2f", 0.50F);
+        const int requestedGridWidth =
+            static_cast<int>(std::lround(
+                1920.0F * displaySettings.materialGridScale));
+        const int requestedGridHeight =
+            static_cast<int>(std::lround(
+                1080.0F * displaySettings.materialGridScale));
+        ImGui::TextDisabled(
+            "Requested grid: %d x %d (1.00 = 1920 x 1080)",
+            requestedGridWidth, requestedGridHeight);
         if (displaySettings.windowMode ==
             static_cast<int>(WindowMode::borderlessFullscreen)) {
             ImGui::TextDisabled(
@@ -609,6 +787,10 @@ bool drawDeveloperUi(bool* open,
         }
         if (ImGui::Button("Apply display settings")) {
             applyDisplay = true;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Apply and Restart")) {
+            applyGridAndRestart = true;
         }
         if (!displayError.empty()) {
             ImGui::TextColored(ImVec4(1.0F, 0.35F, 0.30F, 1.0F),
@@ -852,11 +1034,6 @@ bool drawDeveloperUi(bool* open,
                 &settings.liquidCausticStrength,
                 0.0F, 3.0F, "%.2f",
                 defaults.liquidCausticStrength);
-            sliderFloatWithReset(
-                "Spectral dispersion",
-                &settings.liquidDispersionStrength,
-                0.0F, 2.0F, "%.2f",
-                defaults.liquidDispersionStrength);
             ImGui::TextDisabled(
                 "Density joins forms; radius changes reach; softness "
                 "controls the transition.");
@@ -1012,6 +1189,11 @@ bool drawDeveloperUi(bool* open,
         sliderFloatWithReset(
             "Sky light intensity", &settings.skyLightIntensity,
             0.0F, 1.0F, "%.2f", defaults.skyLightIntensity);
+        sliderIntWithReset(
+            "Sky rays", &settings.skyRays, 1, 9,
+            defaults.skyRays);
+        ImGui::TextDisabled(
+            "Sky rays sample the upper hemisphere from horizon to horizon.");
         if (settings.sunRays > 4) {
             ImGui::TextColored(
                 ImVec4(1.0F, 0.72F, 0.25F, 1.0F),
@@ -1056,6 +1238,10 @@ int main(int, char**) {
     try {
         SdlContext sdl;
         DisplaySettings displaySettings;
+        displaySettings.materialGridScale =
+            loadMaterialGridScale();
+        gunpowder::World::configureMaterialGridScale(
+            displaySettings.materialGridScale);
         const DisplayResolution& defaultResolution =
             displayResolutions[static_cast<std::size_t>(
                 displaySettings.resolutionIndex)];
@@ -1095,6 +1281,7 @@ int main(int, char**) {
         bool developerUiOpen = false;
         gunpowder::Material paintMaterial = gunpowder::Material::water;
         bool liquidDebug = false;
+        bool restartRequested = false;
         float displayedFramesPerSecond = 0.0F;
 
         while (running) {
@@ -1249,12 +1436,27 @@ int main(int, char**) {
                 applyDisplay = drawDeveloperUi(
                     &developerUiOpen, renderer.rayTracingSettings(),
                     renderer.gpuRayTimings(),
+                    renderer.cpuRenderTimings(),
                     world.materialSimulationTimings(),
                     displaySettings, renderProfiles,
                     displayError,
+                    restartRequested,
                     displayedFramesPerSecond);
             }
             ImGui::Render();
+            if (restartRequested) {
+                std::string restartError;
+                if (!saveMaterialGridScale(
+                        displaySettings.materialGridScale,
+                        restartError) ||
+                    !launchRestartedApplication(restartError)) {
+                    displayError = restartError;
+                    restartRequested = false;
+                } else {
+                    running = false;
+                    continue;
+                }
+            }
             if (applyDisplay) {
                 renderer.waitIdle();
                 displayError =

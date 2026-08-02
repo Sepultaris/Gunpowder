@@ -1,7 +1,9 @@
+#include "game/parallel_executor.hpp"
 #include "game/world.hpp"
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <deque>
@@ -97,6 +99,427 @@ float averageLiquidSurface(const gunpowder::World& world,
 } // namespace
 
 int main() {
+    {
+        gunpowder::ParallelExecutor executor(4);
+        std::array<std::atomic<std::uint32_t>, 257> visits{};
+        executor.run(visits.size(), [&](std::size_t index) {
+            visits[index].fetch_add(1, std::memory_order_relaxed);
+        });
+        for (const auto& visitCount : visits) {
+            if (visitCount.load(std::memory_order_relaxed) != 1) {
+                std::cerr
+                    << "Parallel executor skipped or repeated a job\n";
+                return 1;
+            }
+        }
+    }
+
+    gunpowder::ChunkGrid<std::uint8_t> spatialChunks(
+        130, 130, 0);
+    spatialChunks.set(63, 63, 11);
+    spatialChunks.set(64, 64, 22);
+    spatialChunks.set(129, 129, 33);
+    spatialChunks.set(128, 0, 0);
+    if (!spatialChunks.hasChunk(0, 0) ||
+        !spatialChunks.hasChunk(1, 1) ||
+        !spatialChunks.hasChunk(2, 2) ||
+        spatialChunks.hasChunk(2, 0) ||
+        spatialChunks.allocatedChunkCount() != 3) {
+        std::cerr << "Spatial chunk allocation crossed a chunk boundary\n";
+        return 1;
+    }
+    if (spatialChunks.get(63, 63) != 11 ||
+        spatialChunks.get(64, 64) != 22 ||
+        spatialChunks.get(129, 129) != 33 ||
+        spatialChunks.get(0, 129) != 0) {
+        std::cerr << "Spatial chunk address mapping is incorrect\n";
+        return 1;
+    }
+
+    std::array<bool, 9> visitedChunks{};
+    spatialChunks.forEachAllocatedChunk(
+        [&](int chunkX, int chunkY, const auto&) {
+            visitedChunks[static_cast<std::size_t>(
+                chunkY * spatialChunks.chunksWide() + chunkX)] = true;
+        });
+    if (!visitedChunks[0] || !visitedChunks[4] ||
+        !visitedChunks[8]) {
+        std::cerr << "Allocated chunk traversal lost spatial coordinates\n";
+        return 1;
+    }
+
+    spatialChunks.set(129, 129, 0);
+    spatialChunks.releaseDefaultChunksOutside(0, 0, 64, 64);
+    if (spatialChunks.hasChunk(2, 2) ||
+        !spatialChunks.hasChunk(0, 0) ||
+        spatialChunks.get(64, 64) != 22) {
+        std::cerr << "Default chunk reclamation removed persistent state\n";
+        return 1;
+    }
+
+    const auto copiedSpatialChunks = spatialChunks;
+    spatialChunks.reset(7);
+    if (copiedSpatialChunks.get(64, 64) != 22 ||
+        spatialChunks.get(64, 64) != 7 ||
+        spatialChunks.allocatedChunkCount() != 0) {
+        std::cerr << "Spatial chunk copy/reset was not isolated\n";
+        return 1;
+    }
+
+    gunpowder::World activityWorld;
+    constexpr int activityX = 100;
+    constexpr int activityY = 10;
+    activityWorld.clearMaterialActivityForTest();
+    activityWorld.setCellForTest(
+        activityX, activityY, gunpowder::Material::water);
+    const auto waterActivity =
+        activityWorld.materialActivityForTest(
+            activityX, activityY);
+    if (waterActivity[0] || !waterActivity[1] ||
+        waterActivity[2] || !waterActivity[3]) {
+        std::cerr << "Water woke unrelated material systems\n";
+        return 1;
+    }
+    const auto waterMicrotile =
+        activityWorld.materialMicrotileActivityForTest(
+            activityX, activityY);
+    const auto distantMicrotile =
+        activityWorld.materialMicrotileActivityForTest(
+            activityX + 24, activityY);
+    if (waterMicrotile[0] || !waterMicrotile[1] ||
+        waterMicrotile[2] || !waterMicrotile[3] ||
+        distantMicrotile[0] || distantMicrotile[1] ||
+        distantMicrotile[2] || distantMicrotile[3]) {
+        std::cerr << "Material wake escaped its microtile halo\n";
+        return 1;
+    }
+
+    constexpr int microtileBoundaryX = 64;
+    activityWorld.clearMaterialActivityForTest();
+    activityWorld.setCellForTest(
+        microtileBoundaryX, activityY,
+        gunpowder::Material::water);
+    if (!activityWorld.materialMicrotileActivityForTest(
+             microtileBoundaryX - 8, activityY)[1] ||
+        !activityWorld.materialMicrotileActivityForTest(
+             microtileBoundaryX, activityY)[1] ||
+        !activityWorld.materialMicrotileActivityForTest(
+             microtileBoundaryX + 8, activityY)[1] ||
+        activityWorld.materialMicrotileActivityForTest(
+            microtileBoundaryX + 24, activityY)[1]) {
+        std::cerr << "Microtile halo did not cross a chunk boundary\n";
+        return 1;
+    }
+
+    activityWorld.setCellForTest(
+        activityX, activityY, gunpowder::Material::air);
+    activityWorld.clearMaterialActivityForTest();
+    activityWorld.setCellForTest(
+        activityX, activityY, gunpowder::Material::smoke);
+    const auto smokeActivity =
+        activityWorld.materialActivityForTest(
+            activityX, activityY);
+    if (smokeActivity[0] || smokeActivity[1] ||
+        !smokeActivity[2] || !smokeActivity[3]) {
+        std::cerr << "Smoke woke unrelated material systems\n";
+        return 1;
+    }
+    const auto smokeMicrotile =
+        activityWorld.materialMicrotileActivityForTest(
+            activityX, activityY);
+    const auto distantSmokeMicrotile =
+        activityWorld.materialMicrotileActivityForTest(
+            activityX + 24, activityY);
+    if (smokeMicrotile[0] || smokeMicrotile[1] ||
+        !smokeMicrotile[2] || !smokeMicrotile[3] ||
+        distantSmokeMicrotile[2] ||
+        distantSmokeMicrotile[3]) {
+        std::cerr << "Smoke wake escaped its microtile halo\n";
+        return 1;
+    }
+
+    activityWorld.setCellForTest(
+        activityX, activityY, gunpowder::Material::air);
+    activityWorld.clearMaterialActivityForTest();
+    activityWorld.setCellForTest(
+        activityX, activityY, gunpowder::Material::sand);
+    const auto topologyActivity =
+        activityWorld.materialActivityForTest(
+            activityX, activityY);
+    if (!topologyActivity[0] || topologyActivity[1] ||
+        topologyActivity[2] || topologyActivity[3]) {
+        std::cerr << "A dry solid boundary woke unrelated systems\n";
+        return 1;
+    }
+    const auto sandMicrotile =
+        activityWorld.materialMicrotileActivityForTest(
+            activityX, activityY);
+    const auto distantSandMicrotile =
+        activityWorld.materialMicrotileActivityForTest(
+            activityX + 24, activityY);
+    if (!sandMicrotile[0] || sandMicrotile[1] ||
+        sandMicrotile[2] || sandMicrotile[3] ||
+        distantSandMicrotile[0] ||
+        distantSandMicrotile[1] ||
+        distantSandMicrotile[2] ||
+        distantSandMicrotile[3]) {
+        std::cerr << "Solid-boundary wake escaped its microtile halo\n";
+        return 1;
+    }
+
+    activityWorld.setCellForTest(
+        activityX, activityY, gunpowder::Material::air);
+    activityWorld.setCellForTest(
+        activityX + 1, activityY, gunpowder::Material::water);
+    activityWorld.clearMaterialActivityForTest();
+    activityWorld.setCellForTest(
+        activityX, activityY, gunpowder::Material::sand);
+    const auto wetTopologyActivity =
+        activityWorld.materialActivityForTest(
+            activityX, activityY);
+    if (!wetTopologyActivity[0] ||
+        !wetTopologyActivity[1] ||
+        wetTopologyActivity[2] ||
+        !wetTopologyActivity[3]) {
+        std::cerr << "A nearby liquid did not wake for a topology edit\n";
+        return 1;
+    }
+
+    gunpowder::World streamedLiquidWorld;
+    constexpr int streamedLiquidX = 512;
+    constexpr int streamedLiquidY = 80;
+    gunpowder::InputState streamedLiquidInput;
+    streamedLiquidWorld.setPlayerForTest(
+        {static_cast<float>(streamedLiquidX), 100.0F});
+    streamedLiquidWorld.setCameraForTest(
+        {static_cast<float>(streamedLiquidX), 100.0F});
+    streamedLiquidWorld.update(
+        1.0F / 30.0F, streamedLiquidInput);
+    for (int x = streamedLiquidX - 10;
+         x <= streamedLiquidX + 10; ++x) {
+        streamedLiquidWorld.setCellForTest(
+            x, streamedLiquidY,
+            gunpowder::Material::water);
+        for (int y = streamedLiquidY + 1;
+             y <= streamedLiquidY + 12; ++y) {
+            streamedLiquidWorld.setCellForTest(
+                x, y,
+                gunpowder::Material::air);
+        }
+    }
+    streamedLiquidWorld.clearMaterialActivityForTest();
+    streamedLiquidWorld.setPlayerForTest(
+        {static_cast<float>(streamedLiquidX), 480.0F});
+    streamedLiquidWorld.setCameraForTest(
+        {static_cast<float>(streamedLiquidX), 480.0F});
+    streamedLiquidWorld.update(
+        1.0F / 30.0F, streamedLiquidInput);
+    streamedLiquidWorld.setPlayerForTest(
+        {static_cast<float>(streamedLiquidX), 100.0F});
+    streamedLiquidWorld.setCameraForTest(
+        {static_cast<float>(streamedLiquidX), 100.0F});
+    streamedLiquidWorld.update(
+        1.0F / 30.0F, streamedLiquidInput);
+    bool streamedLiquidResumed = false;
+    for (int y = streamedLiquidY + 1;
+         y <= streamedLiquidY + 12; ++y) {
+        for (int x = streamedLiquidX - 10;
+             x <= streamedLiquidX + 10; ++x) {
+            streamedLiquidResumed =
+                streamedLiquidResumed ||
+                streamedLiquidWorld.cell(x, y) ==
+                    gunpowder::Material::water;
+        }
+    }
+    if (!streamedLiquidResumed) {
+        std::cerr
+            << "Liquid did not resume after re-entering the camera window\n";
+        return 1;
+    }
+
+    gunpowder::World backgroundWorld;
+    gunpowder::InputState backgroundInput;
+    backgroundWorld.setPlayerForTest({512.0F, 288.0F});
+    backgroundWorld.setCameraForTest({512.0F, 288.0F});
+    constexpr int backgroundSmokeX = 800;
+    constexpr int backgroundSmokeY = 220;
+    for (int y = backgroundSmokeY - 8;
+         y < backgroundSmokeY + 16; ++y) {
+        for (int x = backgroundSmokeX - 8;
+             x < backgroundSmokeX + 16; ++x) {
+            backgroundWorld.setCellForTest(
+                x, y, gunpowder::Material::air);
+        }
+    }
+    for (int y = backgroundSmokeY;
+         y < backgroundSmokeY + 8; ++y) {
+        for (int x = backgroundSmokeX;
+             x < backgroundSmokeX + 8; ++x) {
+            backgroundWorld.setCellForTest(
+                x, y, gunpowder::Material::smoke);
+        }
+    }
+    for (int tick = 0; tick < 4; ++tick) {
+        backgroundWorld.update(
+            1.0F / 30.0F, backgroundInput);
+    }
+    const auto& backgroundTimings =
+        backgroundWorld.materialSimulationTimings();
+    bool backgroundSmokeMoved = false;
+    for (int y = backgroundSmokeY - 8;
+         y < backgroundSmokeY; ++y) {
+        for (int x = backgroundSmokeX - 8;
+             x < backgroundSmokeX + 16; ++x) {
+            backgroundSmokeMoved =
+                backgroundSmokeMoved ||
+                backgroundWorld.cell(x, y) ==
+                    gunpowder::Material::smoke;
+        }
+    }
+    if (backgroundTimings.backgroundActiveChunks == 0 ||
+        backgroundTimings.backgroundSimulationMs <= 0.0F ||
+        !backgroundSmokeMoved) {
+        std::cerr
+            << "Reduced-rate background gas simulation did not advance\n";
+        return 1;
+    }
+
+    gunpowder::World backgroundLiquidWorld;
+    gunpowder::InputState backgroundLiquidInput;
+    backgroundLiquidWorld.setPlayerForTest({512.0F, 288.0F});
+    backgroundLiquidWorld.setCameraForTest({512.0F, 288.0F});
+    constexpr int backgroundWaterX = 800;
+    constexpr int backgroundWaterY = 210;
+    for (int y = backgroundWaterY - 8;
+         y < backgroundWaterY + 32; ++y) {
+        for (int x = backgroundWaterX - 8;
+             x < backgroundWaterX + 16; ++x) {
+            backgroundLiquidWorld.setCellForTest(
+                x, y, gunpowder::Material::air);
+        }
+    }
+    for (int y = backgroundWaterY;
+         y < backgroundWaterY + 8; ++y) {
+        for (int x = backgroundWaterX;
+             x < backgroundWaterX + 8; ++x) {
+            backgroundLiquidWorld.setCellForTest(
+                x, y, gunpowder::Material::water);
+        }
+    }
+    for (int tick = 0; tick < 4; ++tick) {
+        backgroundLiquidWorld.update(
+            1.0F / 30.0F, backgroundLiquidInput);
+    }
+    const auto& backgroundLiquidTimings =
+        backgroundLiquidWorld.materialSimulationTimings();
+    bool backgroundWaterMoved = false;
+    for (int y = backgroundWaterY + 8;
+         y < backgroundWaterY + 24; ++y) {
+        for (int x = backgroundWaterX - 8;
+             x < backgroundWaterX + 16; ++x) {
+            backgroundWaterMoved =
+                backgroundWaterMoved ||
+                backgroundLiquidWorld.cell(x, y) ==
+                    gunpowder::Material::water;
+        }
+    }
+    if (backgroundLiquidTimings
+                .backgroundLiquidSimulationMs <= 0.0F ||
+        backgroundLiquidTimings.backgroundLiquidCandidates == 0 ||
+        backgroundLiquidTimings.backgroundLiquidCandidates > 4096 ||
+        !backgroundWaterMoved) {
+        std::cerr
+            << "Budgeted background liquid frontier did not advance\n";
+        return 1;
+    }
+
+    gunpowder::World backgroundLiquidBudgetWorld;
+    gunpowder::InputState backgroundLiquidBudgetInput;
+    backgroundLiquidBudgetWorld.setPlayerForTest({512.0F, 288.0F});
+    backgroundLiquidBudgetWorld.setCameraForTest({512.0F, 288.0F});
+    for (int y = 32; y < 96; ++y) {
+        for (int x = 128; x < 320; ++x) {
+            if (((x + y) & 1) == 0) {
+                backgroundLiquidBudgetWorld.setCellForTest(
+                    x, y, gunpowder::Material::water);
+            }
+        }
+    }
+    for (int tick = 0; tick < 4; ++tick) {
+        backgroundLiquidBudgetWorld.update(
+            1.0F / 30.0F,
+            backgroundLiquidBudgetInput);
+    }
+    const auto& backgroundLiquidBudgetTimings =
+        backgroundLiquidBudgetWorld.materialSimulationTimings();
+    if (backgroundLiquidBudgetTimings
+                .backgroundLiquidCandidates > 4096 ||
+        backgroundLiquidBudgetTimings
+                .backgroundLiquidDeferredCandidates == 0) {
+        std::cerr
+            << "Background liquid frontier exceeded or bypassed its budget\n";
+        return 1;
+    }
+
+    gunpowder::World chunkHeadWorld;
+    constexpr int headColumnX = 100;
+    constexpr int headBottomY = 71;
+    chunkHeadWorld.setPlayerForTest(
+        {static_cast<float>(headColumnX), 48.0F});
+    for (int y = 0; y <= headBottomY; ++y) {
+        chunkHeadWorld.setCellForTest(
+            headColumnX - 1, y, gunpowder::Material::stone);
+        chunkHeadWorld.setCellForTest(
+            headColumnX + 1, y, gunpowder::Material::stone);
+    }
+    chunkHeadWorld.setCellForTest(
+        headColumnX, headBottomY, gunpowder::Material::stone);
+    for (int y = 0; y < headBottomY; ++y) {
+        chunkHeadWorld.setCellForTest(
+            headColumnX, y, gunpowder::Material::water);
+    }
+    chunkHeadWorld.setCellForTest(
+        headColumnX, 0, gunpowder::Material::air);
+    chunkHeadWorld.setCellForTest(
+        headColumnX, 64, gunpowder::Material::air);
+    chunkHeadWorld.clearMaterialActivityForTest();
+    chunkHeadWorld.setCellForTest(
+        headColumnX, 0, gunpowder::Material::water);
+    chunkHeadWorld.setCellForTest(
+        headColumnX, 64, gunpowder::Material::water);
+    gunpowder::InputState chunkHeadInput;
+    chunkHeadWorld.update(1.0F / 30.0F, chunkHeadInput);
+    if (chunkHeadWorld.liquidHeadDepthForTest(
+            headColumnX, 63) != 64 ||
+        chunkHeadWorld.liquidHeadDepthForTest(
+            headColumnX, 64) != 65 ||
+        chunkHeadWorld.liquidHeadDepthForTest(
+            headColumnX, 70) != 71) {
+        std::cerr << "Liquid head depth broke across a chunk boundary\n";
+        return 1;
+    }
+    const auto& chunkHeadTimings =
+        chunkHeadWorld.materialSimulationTimings();
+    const std::uint32_t visibleCellCount =
+        static_cast<std::uint32_t>(
+            gunpowder::World::viewWidth *
+            gunpowder::World::viewHeight);
+    if (chunkHeadTimings.liquidPreparationCellVisits == 0 ||
+        chunkHeadTimings.liquidPreparationCellVisits >=
+            visibleCellCount ||
+        chunkHeadTimings.liquidHeadSummaryHits == 0 ||
+        chunkHeadTimings.liquidEqualizationSeedVisits == 0 ||
+        chunkHeadTimings.liquidEqualizationSeedVisits >=
+            visibleCellCount) {
+        std::cerr
+            << "Liquid preparation fell back to a camera-wide scan: prep "
+            << chunkHeadTimings.liquidPreparationCellVisits
+            << ", seeds "
+            << chunkHeadTimings.liquidEqualizationSeedVisits
+            << ", visible " << visibleCellCount << '\n';
+        return 1;
+    }
+
     gunpowder::SparseGrid<std::uint8_t> streamedState(
         4096, 2048, 0);
     const std::size_t distantState =
@@ -117,7 +540,7 @@ int main() {
     }
 
     gunpowder::World skyWorld;
-    constexpr int skyTestX = gunpowder::World::width / 2;
+    const int skyTestX = gunpowder::World::width / 2;
     constexpr int skyTestRoofY = 20;
     for (int y = 0; y <= skyTestRoofY; ++y) {
         skyWorld.setCellForTest(
@@ -314,6 +737,57 @@ int main() {
             std::cerr << "Shallow sun produced gaps beneath a solid roof\n";
             return 1;
         }
+    }
+
+    gunpowder::World incrementalHorizonWorld;
+    for (int y = 0; y <= 60; ++y) {
+        for (int x = 0; x <= 100; ++x) {
+            incrementalHorizonWorld.setCellForTest(
+                x, y, gunpowder::Material::air);
+        }
+    }
+    for (int x = 20; x <= 70; ++x) {
+        incrementalHorizonWorld.setCellForTest(
+            x, 28, gunpowder::Material::stone);
+    }
+    std::vector<float> incrementalDepths;
+    std::vector<std::int32_t> incrementalBlockers;
+    float incrementalMinimum = 0.0F;
+    const gunpowder::Vec2 incrementalDirection{
+        0.62F, -0.7846018F};
+    const gunpowder::Vec2 incrementalReceiverMinimum{
+        0.0F, 0.0F};
+    const gunpowder::Vec2 incrementalReceiverMaximum{
+        100.0F, 60.0F};
+    incrementalHorizonWorld.buildDirectionalSunHorizon(
+        incrementalDirection, horizonSamplesPerCell,
+        incrementalDepths, incrementalBlockers,
+        incrementalMinimum, incrementalReceiverMinimum,
+        incrementalReceiverMaximum);
+    static_cast<void>(
+        incrementalHorizonWorld.consumeSolidDirtyRegion());
+    incrementalHorizonWorld.setCellForTest(
+        44, 28, gunpowder::Material::air);
+    const gunpowder::SolidDirtyRegion removedRoofRegion =
+        incrementalHorizonWorld.consumeSolidDirtyRegion();
+    incrementalHorizonWorld.buildDirectionalSunHorizon(
+        incrementalDirection, horizonSamplesPerCell,
+        incrementalDepths, incrementalBlockers,
+        incrementalMinimum, incrementalReceiverMinimum,
+        incrementalReceiverMaximum, &removedRoofRegion);
+    std::vector<float> rebuiltDepths;
+    std::vector<std::int32_t> rebuiltBlockers;
+    float rebuiltMinimum = 0.0F;
+    incrementalHorizonWorld.buildDirectionalSunHorizon(
+        incrementalDirection, horizonSamplesPerCell,
+        rebuiltDepths, rebuiltBlockers, rebuiltMinimum,
+        incrementalReceiverMinimum,
+        incrementalReceiverMaximum);
+    if (incrementalMinimum != rebuiltMinimum ||
+        incrementalDepths != rebuiltDepths ||
+        incrementalBlockers != rebuiltBlockers) {
+        std::cerr << "Incremental sun horizon differed from a full rebuild\n";
+        return 1;
     }
 
     gunpowder::World world;
@@ -575,6 +1049,190 @@ int main() {
         return 1;
     }
 
+    gunpowder::World firstParallelLiquidWorld;
+    gunpowder::World secondParallelLiquidWorld;
+    for (int y = 28; y <= 150; ++y) {
+        for (int x = 48; x <= 90; ++x) {
+            const bool boundary =
+                x == 48 || x == 90 ||
+                y == 150;
+            const gunpowder::Material material =
+                boundary
+                    ? gunpowder::Material::stone
+                    : gunpowder::Material::air;
+            firstParallelLiquidWorld.setCellForTest(
+                x, y, material);
+            secondParallelLiquidWorld.setCellForTest(
+                x, y, material);
+        }
+    }
+    for (int y = 48; y <= 63; ++y) {
+        for (int x = 60; x <= 67; ++x) {
+            firstParallelLiquidWorld.setCellForTest(
+                x, y, gunpowder::Material::water);
+            secondParallelLiquidWorld.setCellForTest(
+                x, y, gunpowder::Material::water);
+        }
+    }
+    for (int y = 64; y <= 79; ++y) {
+        for (int x = 60; x <= 67; ++x) {
+            firstParallelLiquidWorld.setCellForTest(
+                x, y, gunpowder::Material::oil);
+            secondParallelLiquidWorld.setCellForTest(
+                x, y, gunpowder::Material::oil);
+        }
+    }
+    const std::uint64_t parallelWaterMass =
+        massOf(firstParallelLiquidWorld,
+               gunpowder::Material::water);
+    const std::uint64_t parallelOilMass =
+        massOf(firstParallelLiquidWorld,
+               gunpowder::Material::oil);
+    bool usedParallelLiquidScheduler = false;
+    bool acceptedLiquidTransfer = false;
+    std::uint64_t acceptedLiquidTransferTotal = 0;
+    std::uint64_t conflictedLiquidTransferTotal = 0;
+    gunpowder::InputState parallelLiquidInput;
+    for (int tick = 0; tick < 120; ++tick) {
+        firstParallelLiquidWorld.update(
+            1.0F / 30.0F, parallelLiquidInput);
+        secondParallelLiquidWorld.update(
+            1.0F / 30.0F, parallelLiquidInput);
+        const auto& timings =
+            firstParallelLiquidWorld
+                .materialSimulationTimings();
+        usedParallelLiquidScheduler =
+            usedParallelLiquidScheduler ||
+            timings.parallelLiquidChunks >= 2;
+        acceptedLiquidTransfer =
+            acceptedLiquidTransfer ||
+            timings.liquidMovesAccepted > 0;
+        acceptedLiquidTransferTotal +=
+            timings.liquidMovesAccepted;
+        conflictedLiquidTransferTotal +=
+            timings.liquidMoveConflicts;
+    }
+    if (massOf(firstParallelLiquidWorld,
+               gunpowder::Material::water) !=
+            parallelWaterMass ||
+        massOf(firstParallelLiquidWorld,
+               gunpowder::Material::oil) !=
+            parallelOilMass) {
+        std::cerr
+            << "Parallel liquid transfers changed water or oil mass\n";
+        return 1;
+    }
+    float waterYTotal = 0.0F;
+    float oilYTotal = 0.0F;
+    int waterCells = 0;
+    int oilCells = 0;
+    for (int y = 29; y < 150; ++y) {
+        for (int x = 49; x < 90; ++x) {
+            const gunpowder::Material material =
+                firstParallelLiquidWorld.cell(x, y);
+            if (material ==
+                gunpowder::Material::water) {
+                waterYTotal += static_cast<float>(y);
+                ++waterCells;
+            } else if (
+                material ==
+                gunpowder::Material::oil) {
+                oilYTotal += static_cast<float>(y);
+                ++oilCells;
+            }
+        }
+    }
+    const float averageWaterY =
+        waterYTotal /
+        static_cast<float>(std::max(1, waterCells));
+    const float averageOilY =
+        oilYTotal /
+        static_cast<float>(std::max(1, oilCells));
+    if (waterCells == 0 || oilCells == 0 ||
+        averageOilY >= averageWaterY ||
+        !usedParallelLiquidScheduler ||
+        !acceptedLiquidTransfer) {
+        std::cerr
+            << "Parallel liquid transport did not preserve density "
+               "separation across chunk seams (oil "
+            << averageOilY << ", water "
+            << averageWaterY << ")\n";
+        return 1;
+    }
+    if (conflictedLiquidTransferTotal >=
+        acceptedLiquidTransferTotal) {
+        std::cerr
+            << "Parallel liquid flow became conflict-dominated ("
+            << acceptedLiquidTransferTotal
+            << " accepted, "
+            << conflictedLiquidTransferTotal
+            << " conflicted)\n";
+        return 1;
+    }
+    if (!std::equal(
+            firstParallelLiquidWorld.materials().begin(),
+            firstParallelLiquidWorld.materials().end(),
+            secondParallelLiquidWorld.materials().begin()) ||
+        !std::equal(
+            firstParallelLiquidWorld.liquidFlowX().begin(),
+            firstParallelLiquidWorld.liquidFlowX().end(),
+            secondParallelLiquidWorld.liquidFlowX().begin()) ||
+        !std::equal(
+            firstParallelLiquidWorld.liquidFlowY().begin(),
+            firstParallelLiquidWorld.liquidFlowY().end(),
+            secondParallelLiquidWorld.liquidFlowY().begin())) {
+        std::cerr
+            << "Parallel liquid transfers are not deterministic\n";
+        return 1;
+    }
+
+    gunpowder::World firstThermalWorld;
+    gunpowder::World secondThermalWorld;
+    constexpr std::array<std::pair<int, int>, 4> heatSources{{
+        {96, 80},
+        {160, 80},
+        {96, 144},
+        {160, 144},
+    }};
+    for (const auto& [x, y] : heatSources) {
+        firstThermalWorld.setCellForTest(
+            x, y, gunpowder::Material::fire);
+        secondThermalWorld.setCellForTest(
+            x, y, gunpowder::Material::fire);
+    }
+    gunpowder::InputState thermalInput;
+    for (int tick = 0; tick < 12; ++tick) {
+        firstThermalWorld.update(1.0F / 30.0F, thermalInput);
+        secondThermalWorld.update(1.0F / 30.0F, thermalInput);
+    }
+    for (std::size_t index = 0;
+         index < firstThermalWorld.materials().size(); ++index) {
+        if (firstThermalWorld.materials()[index] !=
+            secondThermalWorld.materials()[index]) {
+            std::cerr
+                << "Parallel thermal scheduling changed material at "
+                << index << '\n';
+            return 1;
+        }
+        if (firstThermalWorld.heat()[index] !=
+            secondThermalWorld.heat()[index]) {
+            std::cerr
+                << "Parallel thermal scheduling changed heat at "
+                << index << " ("
+                << firstThermalWorld.heat()[index] << " versus "
+                << secondThermalWorld.heat()[index] << ")\n";
+            return 1;
+        }
+    }
+    const auto& thermalTimings =
+        firstThermalWorld.materialSimulationTimings();
+    if (thermalTimings.parallelThermalChunks < 2 ||
+        thermalTimings.materialWorkerThreads < 1) {
+        std::cerr
+            << "Thermal work did not reach the parallel chunk scheduler\n";
+        return 1;
+    }
+
     gunpowder::World burnWorld;
     gunpowder::InputState burnInput;
     burnInput.paint = true;
@@ -654,6 +1312,81 @@ int main() {
     if (finalSmokeMaxX - finalSmokeMinX <=
         initialSmokeMaxX - initialSmokeMinX + 4) {
         std::cerr << "Smoke did not spread horizontally\n";
+        return 1;
+    }
+
+    gunpowder::World firstParallelGasWorld;
+    gunpowder::World secondParallelGasWorld;
+    for (int y = 30; y <= 100; ++y) {
+        for (int x = 44; x <= 84; ++x) {
+            firstParallelGasWorld.setCellForTest(
+                x, y, gunpowder::Material::air);
+            secondParallelGasWorld.setCellForTest(
+                x, y, gunpowder::Material::air);
+        }
+    }
+    for (int y = 66; y <= 73; ++y) {
+        for (int x = 60; x <= 67; ++x) {
+            firstParallelGasWorld.setCellForTest(
+                x, y, gunpowder::Material::smoke);
+            secondParallelGasWorld.setCellForTest(
+                x, y, gunpowder::Material::smoke);
+        }
+    }
+    const std::size_t initialParallelSmoke =
+        countOf(firstParallelGasWorld,
+                gunpowder::Material::smoke);
+    bool usedParallelGasScheduler = false;
+    bool acceptedGasTransfer = false;
+    for (int tick = 0; tick < 30; ++tick) {
+        firstParallelGasWorld.update(
+            1.0F / 30.0F, smokeInput);
+        secondParallelGasWorld.update(
+            1.0F / 30.0F, smokeInput);
+        const auto& timings =
+            firstParallelGasWorld
+                .materialSimulationTimings();
+        usedParallelGasScheduler =
+            usedParallelGasScheduler ||
+            timings.parallelGasChunks >= 2;
+        acceptedGasTransfer =
+            acceptedGasTransfer ||
+            timings.gasMovesAccepted > 0;
+    }
+    if (countOf(firstParallelGasWorld,
+                gunpowder::Material::smoke) !=
+        initialParallelSmoke) {
+        std::cerr
+            << "Parallel gas transfers changed smoke mass "
+               "before its lifetime expired\n";
+        return 1;
+    }
+    bool crossedGasChunkBoundary = false;
+    for (int y = 30; y < 64; ++y) {
+        for (int x = 44; x <= 84; ++x) {
+            crossedGasChunkBoundary =
+                crossedGasChunkBoundary ||
+                firstParallelGasWorld.cell(x, y) ==
+                    gunpowder::Material::smoke;
+        }
+    }
+    if (!crossedGasChunkBoundary ||
+        !usedParallelGasScheduler ||
+        !acceptedGasTransfer) {
+        std::cerr
+            << "Smoke did not use parallel cross-chunk transfers\n";
+        return 1;
+    }
+    if (!std::equal(
+            firstParallelGasWorld.materials().begin(),
+            firstParallelGasWorld.materials().end(),
+            secondParallelGasWorld.materials().begin()) ||
+        !std::equal(
+            firstParallelGasWorld.heat().begin(),
+            firstParallelGasWorld.heat().end(),
+            secondParallelGasWorld.heat().begin())) {
+        std::cerr
+            << "Parallel gas transfers are not deterministic\n";
         return 1;
     }
 
@@ -882,6 +1615,80 @@ int main() {
         std::cerr << "Sand and player gravity diverged: sand="
                   << sandFallDistance << ", player="
                   << playerFallDistance << '\n';
+        return 1;
+    }
+
+    gunpowder::World firstParallelSandWorld;
+    gunpowder::World secondParallelSandWorld;
+    for (int y = 30; y <= 150; ++y) {
+        for (int x = 52; x <= 76; ++x) {
+            const gunpowder::Material material =
+                y == 150
+                    ? gunpowder::Material::stone
+                    : gunpowder::Material::air;
+            firstParallelSandWorld.setCellForTest(
+                x, y, material);
+            secondParallelSandWorld.setCellForTest(
+                x, y, material);
+        }
+    }
+    for (int y = 48; y <= 62; ++y) {
+        for (int x = 60; x <= 67; ++x) {
+            firstParallelSandWorld.setCellForTest(
+                x, y, gunpowder::Material::sand);
+            secondParallelSandWorld.setCellForTest(
+                x, y, gunpowder::Material::sand);
+        }
+    }
+    const std::size_t initialParallelSand =
+        countOf(firstParallelSandWorld,
+                gunpowder::Material::sand);
+    bool usedParallelGranularScheduler = false;
+    bool acceptedGranularTransfer = false;
+    for (int tick = 0; tick < 60; ++tick) {
+        firstParallelSandWorld.update(
+            1.0F / 30.0F, gravityInput);
+        secondParallelSandWorld.update(
+            1.0F / 30.0F, gravityInput);
+        const auto& timings =
+            firstParallelSandWorld
+                .materialSimulationTimings();
+        usedParallelGranularScheduler =
+            usedParallelGranularScheduler ||
+            timings.parallelGranularChunks >= 2;
+        acceptedGranularTransfer =
+            acceptedGranularTransfer ||
+            timings.granularMovesAccepted > 0;
+    }
+    if (countOf(firstParallelSandWorld,
+                gunpowder::Material::sand) !=
+        initialParallelSand) {
+        std::cerr
+            << "Parallel granular transfers changed sand mass\n";
+        return 1;
+    }
+    bool crossedVerticalChunkBoundary = false;
+    for (int y = 64; y < 150; ++y) {
+        for (int x = 52; x <= 76; ++x) {
+            crossedVerticalChunkBoundary =
+                crossedVerticalChunkBoundary ||
+                firstParallelSandWorld.cell(x, y) ==
+                    gunpowder::Material::sand;
+        }
+    }
+    if (!crossedVerticalChunkBoundary ||
+        !usedParallelGranularScheduler ||
+        !acceptedGranularTransfer) {
+        std::cerr
+            << "Sand did not use parallel cross-chunk transfers\n";
+        return 1;
+    }
+    if (!std::equal(
+            firstParallelSandWorld.materials().begin(),
+            firstParallelSandWorld.materials().end(),
+            secondParallelSandWorld.materials().begin())) {
+        std::cerr
+            << "Parallel granular transfers are not deterministic\n";
         return 1;
     }
 

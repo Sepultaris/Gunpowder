@@ -106,11 +106,11 @@ void finishDerivedFields(ivec2 cell, ivec2 extent) {
     uvec4 materialData = texelFetch(materialTexture, cell, 0);
     bool liquid = materialData.r == 4u || materialData.r == 5u;
     uint skyExposure =
-        (materialData.a & 0x80u) != 0u ? 255u : 0u;
-    uint worldSunVisibility =
         liquid
-            ? (materialData.a & 0x0fu) * 17u
-            : ((materialData.a & 0x7fu) * 255u + 63u) / 127u;
+            ? (materialData.a >> 4u) * 17u
+            : ((materialData.a >> 1u) * 255u + 63u) / 127u;
+    uint worldSunVisibility =
+        (materialData.a & 0x01u) * 255u;
     imageStore(
         derivedImage, cell,
         uvec4(round(haze * 255.0),
@@ -245,11 +245,11 @@ void finishDerivedFieldsShared(ivec2 cell, ivec2 extent) {
     uvec4 materialData = texelFetch(materialTexture, cell, 0);
     bool liquid = materialData.r == 4u || materialData.r == 5u;
     uint skyExposure =
-        (materialData.a & 0x80u) != 0u ? 255u : 0u;
-    uint worldSunVisibility =
         liquid
-            ? (materialData.a & 0x0fu) * 17u
-            : ((materialData.a & 0x7fu) * 255u + 63u) / 127u;
+            ? (materialData.a >> 4u) * 17u
+            : ((materialData.a >> 1u) * 255u + 63u) / 127u;
+    uint worldSunVisibility =
+        (materialData.a & 0x01u) * 255u;
     imageStore(
         derivedImage, cell,
         uvec4(round(haze * 255.0),

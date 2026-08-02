@@ -13,8 +13,8 @@ The current milestone includes:
 - compact diffuse/specular/metallic material shading with GGX highlights and
   thickness-aware marble subsurface scattering
 - flow-aware metaball skins for water and oil, with gradient-derived normals,
-  Fresnel reflections, depth absorption, subsurface color, caustics, and
-  spectral dispersion
+  Fresnel reflections, depth absorption, subsurface color, and caustics;
+  lighting transmits straight through liquids without refracting ray paths
 - named, human-readable rendering profiles for lighting and material looks
 - visible-region texture uploads instead of full-world transfers
 - fixed-timestep gameplay
@@ -89,17 +89,20 @@ sunlight also contributes to haze and global illumination.
 
 The developer settings can pause the cycle and scrub the time of day, change
 the day length, sky display and sky-light intensity, sun intensity, shadow
-softness, and sun-ray count. Ambient light interpolates from a configurable
-night floor to a brighter daytime value along the daylight curve. The sky is
-also a cool diffuse light source for vertically exposed air, roof surfaces,
-outside walls, and open liquid surfaces; unlike the directional sun, it does
-not create a second hard shadow. The default cycle lasts four minutes and uses
-one sun ray per cell; extra rays soften the directional shadows at an
-additional rendering cost. Sky exposure is cached across the full world and
-refreshed when terrain changes, so roofs continue to block the sky even when
-they are outside the current view. Tomb interiors also retain a separate
-persistent backdrop: destroying a wall or roof can admit ray-cast sunlight
-and diffuse skylight without replacing the room itself with the outdoor sky.
+softness, sun-ray count, and sky-ray count. Ambient light interpolates from a
+configurable night floor to a brighter daytime value along the daylight curve.
+The sky is a cool hemispherical area light: its default five-ray fan samples
+world-space directions from the far upper-left through vertical to the far
+upper-right. Averaging the unblocked rays gives openings and overhangs partial,
+soft skylight instead of a binary glow or a second hard sun shadow. One to nine
+sky rays can be selected. Their directional horizons are cached against the
+full world and refreshed when terrain changes or the receiver region moves, so
+off-screen roofs remain valid blockers and the result does not follow the
+camera. The default cycle lasts four minutes and uses one sun ray per cell;
+extra sun rays soften directional shadows at an additional rendering cost.
+Tomb interiors retain a separate persistent backdrop: destroying a wall or
+roof can admit ray-cast sunlight and diffuse skylight without replacing the
+room itself with the outdoor sky.
 Directional sun blockers are projected into a four-samples-per-
 cell horizon spanning the complete material world. Rasterizing each solid's
 full projected footprint prevents diagonal grid gaps. Each quantized horizon
@@ -145,12 +148,12 @@ normal rendering, water and oil receive a separate 3x3 implicit metaball skin.
 Resting fields spread horizontally, moving fields stretch with flow, and the
 analytic field gradient supplies a smooth reflection normal. The developer
 window exposes density, radius, edge softness, flow stretching, pool
-flattening, normal strength, reflection, subsurface scattering, caustics, and
-spectral dispersion; the cellular simulation and conserved volume remain
-unchanged. The same controls expose polished-marble scattering strength and
-distance. Marble estimates local thickness from nearby samples, while liquids
-estimate depth for wavelength-dependent absorption. These optical effects
-reuse the existing direct, sky, and GI results and add no ray-tracing passes.
+flattening, normal strength, reflection, subsurface scattering, and caustics;
+the cellular simulation and conserved volume remain unchanged. The same
+controls expose polished-marble scattering strength and distance. Marble
+estimates local thickness from nearby samples, while liquids estimate depth
+for wavelength-dependent absorption. These optical effects reuse the existing
+direct, sky, and GI results and add no ray-tracing passes.
 Smoke, steam, fire, and sand use corresponding local movement and reaction
 rules.
 

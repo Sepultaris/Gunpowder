@@ -1,13 +1,15 @@
 #pragma once
 
+#include "game/chunk_grid.hpp"
 #include "game/math.hpp"
 
 #include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include <iterator>
+#include <limits>
 #include <memory>
+#include <mutex>
 #include <random>
 #include <utility>
 #include <vector>
@@ -29,227 +31,55 @@ struct MaterialSimulationTimings {
     float gasAndReactionMs = 0.0F;
     float heatMs = 0.0F;
     std::uint32_t activeChunks = 0;
+    std::uint32_t activeGranularChunks = 0;
+    std::uint32_t activeLiquidChunks = 0;
+    std::uint32_t activeGasChunks = 0;
+    std::uint32_t activeThermalChunks = 0;
+    std::uint32_t activeGranularMicrotiles = 0;
+    std::uint32_t activeLiquidMicrotiles = 0;
+    std::uint32_t activeGasMicrotiles = 0;
+    std::uint32_t activeThermalMicrotiles = 0;
+    std::uint32_t materialWorkerThreads = 1;
+    std::uint32_t parallelGranularChunks = 0;
+    std::uint32_t parallelLiquidChunks = 0;
+    std::uint32_t parallelGasChunks = 0;
+    std::uint32_t parallelThermalChunks = 0;
+    std::uint32_t granularMoveProposals = 0;
+    std::uint32_t granularMovesAccepted = 0;
+    std::uint32_t granularMoveConflicts = 0;
+    std::uint32_t gasMoveProposals = 0;
+    std::uint32_t gasMovesAccepted = 0;
+    std::uint32_t gasMoveConflicts = 0;
+    std::uint32_t liquidMoveProposals = 0;
+    std::uint32_t liquidMovesAccepted = 0;
+    std::uint32_t liquidMoveConflicts = 0;
+    std::uint32_t liquidGravityConflicts = 0;
+    std::uint32_t liquidLateralConflicts = 0;
+    std::uint32_t parallelLiquidColumnVisits = 0;
+    std::uint32_t parallelLiquidVerticalMoves = 0;
+    std::uint32_t liquidPreparationCellVisits = 0;
+    std::uint32_t liquidHeadSummaryHits = 0;
+    std::uint32_t liquidEqualizationSeedVisits = 0;
     std::uint32_t liquidCandidateVisits = 0;
     std::uint32_t equalizedComponents = 0;
     std::uint32_t equalizedCells = 0;
+    float backgroundSimulationMs = 0.0F;
+    std::uint32_t backgroundActiveChunks = 0;
+    float backgroundLiquidSimulationMs = 0.0F;
+    std::uint32_t backgroundLiquidCandidates = 0;
+    std::uint32_t backgroundLiquidDeferredCandidates = 0;
     bool valid = false;
 };
 
-template <typename T, int PageSize = 64>
-class SparseGrid {
-public:
-    static constexpr int pageSize = PageSize;
-    static constexpr int pageCellCount = PageSize * PageSize;
-    using Page = std::array<T, pageCellCount>;
+struct SolidDirtyRegion {
+    int minX = 0;
+    int minY = 0;
+    int maxX = -1;
+    int maxY = -1;
 
-    SparseGrid() = default;
-    SparseGrid(int width, int height, T defaultValue = {})
-        : width_(width),
-          height_(height),
-          defaultValue_(defaultValue),
-          pages_(static_cast<std::size_t>(
-              (static_cast<std::size_t>(width) *
-                   static_cast<std::size_t>(height) +
-               pageCellCount - 1) /
-              pageCellCount)) {}
-
-    SparseGrid(const SparseGrid& other)
-        : width_(other.width_),
-          height_(other.height_),
-          defaultValue_(other.defaultValue_),
-          pages_(other.pages_.size()) {
-        for (std::size_t key = 0; key < other.pages_.size(); ++key) {
-            if (other.pages_[key]) {
-                pages_[key] =
-                    std::make_unique<Page>(*other.pages_[key]);
-            }
-        }
+    [[nodiscard]] bool valid() const {
+        return minX <= maxX && minY <= maxY;
     }
-    SparseGrid& operator=(const SparseGrid& other) {
-        if (this == &other) {
-            return *this;
-        }
-        SparseGrid copy(other);
-        *this = std::move(copy);
-        return *this;
-    }
-    SparseGrid(SparseGrid&&) noexcept = default;
-    SparseGrid& operator=(SparseGrid&&) noexcept = default;
-
-    [[nodiscard]] std::size_t size() const {
-        return static_cast<std::size_t>(width_) *
-               static_cast<std::size_t>(height_);
-    }
-    [[nodiscard]] bool empty() const { return size() == 0; }
-
-    [[nodiscard]] const T& operator[](std::size_t index) const {
-        const auto [key, offset] = pageAddress(index);
-        return pages_[key] ? (*pages_[key])[offset] : defaultValue_;
-    }
-    T& operator[](std::size_t index) {
-        const auto [key, offset] = pageAddress(index);
-        auto& page = pages_[key];
-        if (!page) {
-            page = std::make_unique<Page>();
-            page->fill(defaultValue_);
-        }
-        return (*page)[offset];
-    }
-
-    void set(std::size_t index, const T& value) {
-        const auto [key, offset] = pageAddress(index);
-        if (!pages_[key]) {
-            if (value == defaultValue_) {
-                return;
-            }
-            auto page = std::make_unique<Page>();
-            page->fill(defaultValue_);
-            (*page)[offset] = value;
-            pages_[key] = std::move(page);
-            return;
-        }
-        (*pages_[key])[offset] = value;
-    }
-
-    void reset(T defaultValue = {}) {
-        for (auto& page : pages_) {
-            page.reset();
-        }
-        defaultValue_ = defaultValue;
-    }
-
-    [[nodiscard]] bool hasPage(int pageX, int pageY) const {
-        const std::size_t firstIndex =
-            static_cast<std::size_t>(pageY * PageSize) *
-                static_cast<std::size_t>(width_) +
-            static_cast<std::size_t>(pageX * PageSize);
-        const std::size_t key =
-            firstIndex / static_cast<std::size_t>(pageCellCount);
-        return key < pages_.size() && pages_[key] != nullptr;
-    }
-
-    template <typename Function>
-    void forEachAllocatedPage(Function&& function) const {
-        for (std::size_t key = 0; key < pages_.size(); ++key) {
-            if (!pages_[key]) {
-                continue;
-            }
-            function(key * static_cast<std::size_t>(pageCellCount),
-                     *pages_[key]);
-        }
-    }
-
-    void releaseDefaultPagesOutside(int firstCellX, int firstCellY,
-                                    int lastCellX, int lastCellY) {
-        for (std::size_t key = 0; key < pages_.size(); ++key) {
-            auto& page = pages_[key];
-            if (!page) {
-                continue;
-            }
-            const std::size_t pageBegin =
-                key * static_cast<std::size_t>(pageCellCount);
-            const std::size_t pageEnd =
-                std::min(size(), pageBegin +
-                                     static_cast<std::size_t>(
-                                         pageCellCount));
-            bool intersectsKeptArea = false;
-            std::size_t cursor = pageBegin;
-            while (cursor < pageEnd) {
-                const int y = static_cast<int>(
-                    cursor / static_cast<std::size_t>(width_));
-                const int x = static_cast<int>(
-                    cursor % static_cast<std::size_t>(width_));
-                const int rowCells = std::min(
-                    width_ - x,
-                    static_cast<int>(pageEnd - cursor));
-                if (y >= firstCellY && y < lastCellY &&
-                    x < lastCellX &&
-                    x + rowCells > firstCellX) {
-                    intersectsKeptArea = true;
-                    break;
-                }
-                cursor += static_cast<std::size_t>(rowCells);
-            }
-            if (intersectsKeptArea) {
-                continue;
-            }
-            if (std::all_of(
-                    page->begin(), page->end(),
-                    [&](const T& value) {
-                        return value == defaultValue_;
-                    })) {
-                page.reset();
-            }
-        }
-    }
-
-    class const_iterator {
-    public:
-        using iterator_category = std::forward_iterator_tag;
-        using value_type = T;
-        using difference_type = std::ptrdiff_t;
-        using pointer = const T*;
-        using reference = const T&;
-
-        const_iterator() = default;
-        const_iterator(const SparseGrid* grid, std::size_t index)
-            : grid_(grid), index_(index) {}
-        reference operator*() const { return (*grid_)[index_]; }
-        pointer operator->() const { return &(*grid_)[index_]; }
-        const_iterator& operator++() {
-            ++index_;
-            return *this;
-        }
-        const_iterator operator++(int) {
-            const_iterator result = *this;
-            ++(*this);
-            return result;
-        }
-        friend bool operator==(const const_iterator& first,
-                               const const_iterator& second) {
-            return first.grid_ == second.grid_ &&
-                   first.index_ == second.index_;
-        }
-
-    private:
-        const SparseGrid* grid_ = nullptr;
-        std::size_t index_ = 0;
-    };
-
-    [[nodiscard]] const_iterator begin() const {
-        return const_iterator(this, 0);
-    }
-    [[nodiscard]] const_iterator end() const {
-        return const_iterator(this, size());
-    }
-
-    friend bool operator==(const SparseGrid& first,
-                           const SparseGrid& second) {
-        if (first.width_ != second.width_ ||
-            first.height_ != second.height_) {
-            return false;
-        }
-        for (std::size_t index = 0; index < first.size(); ++index) {
-            if (first[index] != second[index]) {
-                return false;
-            }
-        }
-        return true;
-    }
-
-private:
-    [[nodiscard]] std::pair<std::size_t, std::size_t>
-    pageAddress(std::size_t index) const {
-        return {
-            index / static_cast<std::size_t>(pageCellCount),
-            index % static_cast<std::size_t>(pageCellCount),
-        };
-    }
-
-    int width_ = 0;
-    int height_ = 0;
-    T defaultValue_{};
-    std::vector<std::unique_ptr<Page>> pages_;
 };
 
 enum class Material : std::uint8_t {
@@ -333,23 +163,27 @@ struct Grapple {
 class World {
 public:
 #ifdef GUNPOWDER_TEST_SCALE
-    static constexpr int simulationScale = 1;
-    static constexpr int width = 1024;
-    static constexpr int height = 576;
+    inline static float simulationScale = 1.0F;
+    inline static int width = 1024;
+    inline static int height = 576;
+    inline static int viewWidth = 320;
+    inline static int viewHeight = 180;
 #else
     // 960x540 material pixels at the default 1920x1080 display. This keeps
     // the Noita-style discrete cells visually small while the active-chunk
     // work continues toward affordable 1:1 simulation.
-    static constexpr int simulationScale = 3;
+    inline static float simulationScale = 3.0F;
     // The camera sees 960x540 simulation cells. This provides roughly
     // 34 screens of horizontal travel and 30 screens from the upper sky to
     // the bedrock, while lazy pages keep untouched material state unallocated.
-    static constexpr int width = 32768;
-    static constexpr int height = 16384;
+    inline static int width = 32768;
+    inline static int height = 16384;
+    inline static int viewWidth = 960;
+    inline static int viewHeight = 540;
 #endif
-    static constexpr int viewWidth = 320 * simulationScale;
-    static constexpr int viewHeight = 180 * simulationScale;
     static constexpr int chunkSize = 64;
+
+    static void configureMaterialGridScale(float normalizedScale);
 
     World();
 
@@ -406,6 +240,7 @@ public:
     [[nodiscard]] std::uint64_t solidRevision() const {
         return solidRevision_;
     }
+    [[nodiscard]] SolidDirtyRegion consumeSolidDirtyRegion();
     void buildDirectionalSunHorizon(
         Vec2 direction, float samplesPerCell,
         std::vector<float>& depths,
@@ -415,7 +250,9 @@ public:
         Vec2 receiverMaximum = {
             static_cast<float>(width),
             static_cast<float>(height),
-        }) const;
+        },
+        const SolidDirtyRegion* dirtyRegion = nullptr,
+        bool parallelBuild = false) const;
 #ifdef GUNPOWDER_TEST_SCALE
     void setCellForTest(int x, int y, Material material) {
         setCell(x, y, material);
@@ -425,6 +262,23 @@ public:
         player_.velocity = velocity;
         player_.onGround = false;
         releaseGrapple();
+    }
+    void setCameraForTest(Vec2 position) {
+        cameraCenter_ = position;
+        cameraShake_ = {};
+    }
+    void clearMaterialActivityForTest();
+    [[nodiscard]] std::array<bool, 4>
+    materialActivityForTest(int x, int y) const;
+    [[nodiscard]] std::array<bool, 4>
+    materialMicrotileActivityForTest(int x, int y) const;
+    [[nodiscard]] std::uint8_t
+    liquidHeadDepthForTest(int x, int y) const {
+        return x >= 0 && x < width &&
+                       y >= 0 && y < height
+                   ? liquidHeadDepth_[static_cast<std::size_t>(
+                         y * width + x)]
+                   : 0;
     }
 #endif
 
@@ -454,6 +308,49 @@ private:
         std::uint8_t phase = 0;
     };
 
+    static constexpr std::uint8_t granularActivity = 1U << 0U;
+    static constexpr std::uint8_t liquidActivity = 1U << 1U;
+    static constexpr std::uint8_t gasActivity = 1U << 2U;
+    static constexpr std::uint8_t thermalActivity = 1U << 3U;
+    static constexpr std::uint8_t allMaterialActivity =
+        granularActivity | liquidActivity |
+        gasActivity | thermalActivity;
+    static constexpr std::size_t materialActivitySystemCount = 4;
+    static constexpr int materialMicrotileSize = 8;
+    static constexpr int materialMicrotilesPerAxis =
+        chunkSize / materialMicrotileSize;
+    static constexpr int materialMicrotilesPerChunk =
+        materialMicrotilesPerAxis * materialMicrotilesPerAxis;
+    static_assert(chunkSize % materialMicrotileSize == 0);
+    static_assert(materialMicrotilesPerChunk == 64);
+
+    struct MaterialChunkActivity {
+        std::array<std::uint8_t,
+                   materialActivitySystemCount> lifetime{};
+        std::array<std::uint64_t,
+                   materialActivitySystemCount> microtiles{};
+    };
+
+    struct LiquidMicrotileColumnSummary {
+        std::array<Material, materialMicrotileSize> inputMaterial{};
+        std::array<std::uint8_t, materialMicrotileSize> inputDepth{};
+        std::array<Material, materialMicrotileSize> bottomMaterial{};
+        std::array<std::uint8_t, materialMicrotileSize> bottomDepth{};
+        bool valid = false;
+        bool hasFoam = false;
+    };
+
+    struct LiquidChunkColumnSummary {
+        std::array<LiquidMicrotileColumnSummary,
+                   materialMicrotilesPerChunk> microtiles{};
+    };
+
+    struct DirectionalOccluderList {
+        std::uint64_t revision =
+            std::numeric_limits<std::uint64_t>::max();
+        std::vector<std::uint16_t> offsets;
+    };
+
     [[nodiscard]] bool isSolid(int x, int y) const;
     [[nodiscard]] bool overlapsTerrain(Vec2 center, Vec2 halfSize) const;
     void ensureTerrainGenerated(const ActiveBounds& bounds);
@@ -462,9 +359,29 @@ private:
     [[nodiscard]] Material proceduralMaterial(int x, int y) const;
     void setCell(int x, int y, Material material);
     void swapCells(int firstX, int firstY, int secondX, int secondY);
-    void markMaterialActive(int x, int y);
-    [[nodiscard]] bool materialChunkActive(int x, int y) const;
-    void ageMaterialChunks();
+    [[nodiscard]] static std::uint8_t
+    materialActivityMask(Material material);
+    void markMaterialActive(
+        int x, int y,
+        std::uint8_t activityMask = allMaterialActivity);
+    void wakeMaterialChunksEntering(
+        const ActiveBounds& bounds);
+    void invalidateSettledLiquidNear(int x, int y);
+    void invalidateSettledLiquidVerticalMove(
+        int x, int sourceY, int destinationY);
+    void invalidateLiquidPreparationAt(int x, int y);
+    [[nodiscard]] bool
+    liquidCellBelongsToSettledComponent(std::size_t index) const;
+    [[nodiscard]] bool materialChunkActive(
+        int x, int y,
+        std::uint8_t activityMask = allMaterialActivity) const;
+    [[nodiscard]] bool materialMicrotileActive(
+        int x, int y,
+        std::uint8_t activityMask = allMaterialActivity) const;
+    [[nodiscard]] bool materialChunkIncludedInCurrentPass(
+        int x, int y) const;
+    void ageMaterialChunks(const ActiveBounds& bounds);
+    void markSolidDirty(int minX, int minY, int maxX, int maxY);
     void rebuildDirtySkyColumns();
     void captureInteriorBackdrop();
     void destroyCircle(Vec2 center, float radius);
@@ -488,7 +405,7 @@ private:
                                  const Exposure& exposure);
     void updateBullets(float dt);
     void updateGrenades(float dt);
-    void updateMaterials();
+    void updateMaterials(const ActiveBounds& bounds);
     void releaseEmptySimulationPages();
     void cacheLiquidColumnHeads(const ActiveBounds& bounds);
     void updateLiquids(const ActiveBounds& bounds,
@@ -496,7 +413,7 @@ private:
     void prepareLiquidEqualization(const ActiveBounds& bounds);
     void applyLiquidEqualizationPhase(const ActiveBounds& bounds,
                                       int phase);
-    void updateHeat();
+    void updateHeat(const ActiveBounds& bounds);
     void updateCamera(float dt);
     void updateParticles(float dt);
     void emitParticle(Particle particle);
@@ -529,12 +446,22 @@ private:
     SparseGrid<float> granularFallRemainder_;
     SparseGrid<std::uint8_t> moved_;
     SparseGrid<std::uint32_t> liquidFrontierStamp_;
-    SparseGrid<std::uint32_t> liquidComponentStamp_;
+    // Equalization traversal is confined to the active camera window. A
+    // dense local stamp avoids sparse-world address translation for every
+    // one of the eight connectivity probes made per liquid cell.
+    std::vector<std::uint32_t> liquidComponentStamp_;
+    SparseGrid<std::uint32_t> liquidSettledComponent_;
     std::vector<std::size_t> liquidWorklist_;
     std::vector<std::size_t> liquidNextWorklist_;
+    std::vector<std::size_t> backgroundLiquidWorklist_;
+    std::vector<std::size_t> backgroundLiquidNextWorklist_;
+    std::vector<std::size_t> thermalWorklist_;
     std::uint32_t liquidFrontierGeneration_ = 0;
     std::uint32_t liquidComponentGeneration_ = 0;
+    std::uint32_t nextSettledLiquidComponent_ = 1;
+    std::vector<std::uint8_t> settledLiquidComponentValid_{0};
     bool rebuildLiquidWorklist_ = true;
+    bool rebuildBackgroundLiquidWorklist_ = true;
     std::vector<std::size_t> liquidComponentQueue_;
     std::vector<std::size_t> liquidHighSurfaces_;
     std::vector<std::size_t> liquidLowSurfaces_;
@@ -547,11 +474,43 @@ private:
     float currentLiquidFrontierMs_ = 0.0F;
     float currentLiquidEqualizationMs_ = 0.0F;
     std::uint32_t currentLiquidCandidateVisits_ = 0;
+    std::uint32_t currentLiquidDeferredCandidates_ = 0;
+    std::uint32_t currentLiquidPreparationCellVisits_ = 0;
+    std::uint32_t currentLiquidHeadSummaryHits_ = 0;
+    std::uint32_t currentLiquidEqualizationSeedVisits_ = 0;
     std::uint32_t currentEqualizedComponents_ = 0;
     std::uint32_t currentEqualizedCells_ = 0;
-    std::vector<Material> columnHeadMaterial_;
-    std::vector<std::uint8_t> columnHeadDepth_;
-    std::vector<std::uint8_t> materialChunkActivity_;
+    std::uint32_t currentLiquidMoveProposals_ = 0;
+    std::uint32_t currentLiquidMovesAccepted_ = 0;
+    std::uint32_t currentLiquidMoveConflicts_ = 0;
+    std::uint32_t currentLiquidGravityConflicts_ = 0;
+    std::uint32_t currentLiquidLateralConflicts_ = 0;
+    std::uint32_t currentParallelLiquidColumnVisits_ = 0;
+    std::uint32_t currentParallelLiquidVerticalMoves_ = 0;
+    std::vector<MaterialChunkActivity> materialChunkActivity_;
+    std::vector<std::unique_ptr<LiquidChunkColumnSummary>>
+        liquidChunkColumnSummaries_;
+    std::vector<std::uint64_t>
+        liquidPreparationDirtyMicrotiles_;
+    std::vector<std::uint64_t> solidChunkRevisions_;
+    mutable std::array<
+        std::vector<std::unique_ptr<DirectionalOccluderList>>,
+        9> directionalOccluderLists_;
+    mutable std::mutex directionalOccluderMutex_;
+    ActiveBounds previousMaterialBounds_{0, 0, 0, 0};
+    bool previousMaterialBoundsValid_ = false;
+    ActiveBounds materialPassExclusion_{0, 0, 0, 0};
+    bool materialPassExclusionValid_ = false;
+    std::uint8_t materialPassSystems_ = allMaterialActivity;
+    std::size_t materialPassLiquidCandidateBudget_ =
+        std::numeric_limits<std::size_t>::max();
+    std::size_t materialPassLiquidBudgetCursor_ = 0;
+    int materialPassLiquidSubsteps_ = 4;
+    int materialPassAdditionalWaterSubsteps_ = 2;
+    bool materialPassLiquidEqualizationEnabled_ = true;
+    bool liquidCrossedPassExclusion_ = false;
+    ActiveBounds backgroundLiquidBounds_{0, 0, 0, 0};
+    bool backgroundLiquidBoundsValid_ = false;
     std::vector<int> skyOccluderY_;
     std::vector<std::uint8_t> skyColumnDirty_;
     SparseGrid<std::uint8_t> interiorBackdrop_;
@@ -571,6 +530,8 @@ private:
     float grenadeCooldown_ = 0.0F;
     float materialAccumulator_ = 0.0F;
     float sparseCleanupAccumulator_ = 0.0F;
+    bool materialScanRight_ = true;
+    std::uint64_t materialStep_ = 0;
     std::uint32_t pendingGpuMaterialSteps_ = 0;
     bool gpuMaterialSimulationEnabled_ = false;
     Material selectedMaterial_ = Material::water;
@@ -583,6 +544,7 @@ private:
     float playerLiquidDisplacementAccumulator_ = 0.0F;
     float statusParticleAccumulator_ = 0.0F;
     std::uint64_t solidRevision_ = 0;
+    SolidDirtyRegion solidDirtyRegion_{};
 };
 
 } // namespace gunpowder

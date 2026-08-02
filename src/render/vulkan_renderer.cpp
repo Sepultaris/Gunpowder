@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <filesystem>
@@ -35,9 +36,10 @@ constexpr std::uint32_t denoiseTimingEnd = 7;
 constexpr std::uint32_t rayTimingStart = 8;
 constexpr std::uint32_t rayTimingEnd = 9;
 constexpr std::uint32_t rayTimingQueryCount = 10;
-constexpr float renderScale = static_cast<float>(World::simulationScale);
+float renderScale() { return World::simulationScale; }
 constexpr float tau = 6.28318530718F;
 constexpr float sunHorizonSamplesPerCell = 4.0F;
+constexpr float skyHorizonSamplesPerCell = 2.0F;
 
 float packNormalizedPair(
     float first, float firstMaximum,
@@ -228,6 +230,7 @@ std::array<float, 3> materialColor(Material material, int x, int y) {
 } // namespace
 
 VulkanRenderer::VulkanRenderer(SDL_Window* window) : window_(window) {
+    configureGridDimensions();
     loadPlayerSprite();
     createInstance();
     createSurface();
@@ -373,6 +376,15 @@ VulkanRenderer::~VulkanRenderer() {
             }
             if (frame.giFinalMemory != VK_NULL_HANDLE) {
                 vkFreeMemory(device_, frame.giFinalMemory, nullptr);
+            }
+            if (frame.giScratchView != VK_NULL_HANDLE) {
+                vkDestroyImageView(device_, frame.giScratchView, nullptr);
+            }
+            if (frame.giScratchImage != VK_NULL_HANDLE) {
+                vkDestroyImage(device_, frame.giScratchImage, nullptr);
+            }
+            if (frame.giScratchMemory != VK_NULL_HANDLE) {
+                vkFreeMemory(device_, frame.giScratchMemory, nullptr);
             }
             if (frame.particleSpawnBuffer != VK_NULL_HANDLE) {
                 vkDestroyBuffer(device_, frame.particleSpawnBuffer, nullptr);
@@ -947,6 +959,13 @@ void VulkanRenderer::createTextureDescriptors() {
             .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
             .pImmutableSamplers = nullptr,
         },
+        VkDescriptorSetLayoutBinding{
+            .binding = 19,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+            .descriptorCount = 1,
+            .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+            .pImmutableSamplers = nullptr,
+        },
     };
     const VkDescriptorSetLayoutCreateInfo layoutInfo{
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
@@ -991,7 +1010,7 @@ void VulkanRenderer::createTextureDescriptors() {
         VkDescriptorPoolSize{
             .type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
             .descriptorCount =
-                static_cast<std::uint32_t>(framesInFlight * 6),
+                static_cast<std::uint32_t>(framesInFlight * 7),
         },
         VkDescriptorPoolSize{
             .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
@@ -1608,7 +1627,7 @@ void VulkanRenderer::createCommands() {
 }
 
 void VulkanRenderer::createFrameResources() {
-    constexpr VkDeviceSize textureBytes =
+    const VkDeviceSize textureBytes =
         static_cast<VkDeviceSize>(textureWidth) *
         static_cast<VkDeviceSize>(textureHeight) * 4U;
     constexpr VkDeviceSize particleBytes =
@@ -1778,7 +1797,7 @@ void VulkanRenderer::createFrameResources() {
                 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
             frame.lightTileBuffer, frame.lightTileMemory);
         createBuffer(
-            sizeof(GpuOccupancyHierarchy),
+            occupancyHierarchyBytes(),
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
@@ -2034,6 +2053,8 @@ void VulkanRenderer::createFrameResources() {
                       frame.giIntermediateView);
         createGiImage(frame.giFinalImage, frame.giFinalMemory,
                       frame.giFinalView);
+        createGiImage(frame.giScratchImage, frame.giScratchMemory,
+                      frame.giScratchView);
 
         const VkDescriptorSetAllocateInfo descriptorAllocateInfo{
             .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
@@ -2090,6 +2111,11 @@ void VulkanRenderer::createFrameResources() {
             .imageView = frame.giFinalView,
             .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
         };
+        const VkDescriptorImageInfo storageGiScratch{
+            .sampler = VK_NULL_HANDLE,
+            .imageView = frame.giScratchView,
+            .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+        };
         const VkDescriptorImageInfo storageSunTransmittance{
             .sampler = VK_NULL_HANDLE,
             .imageView = sunTransmittanceView_,
@@ -2134,7 +2160,7 @@ void VulkanRenderer::createFrameResources() {
         const VkDescriptorBufferInfo occupancyInfo{
             .buffer = frame.occupancyBuffer,
             .offset = 0,
-            .range = sizeof(GpuOccupancyHierarchy),
+            .range = occupancyHierarchyBytes(),
         };
         const std::array descriptorWrites{
             VkWriteDescriptorSet{
@@ -2354,6 +2380,18 @@ void VulkanRenderer::createFrameResources() {
                 .descriptorCount = 1,
                 .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                 .pImageInfo = &storageSunTransmittance,
+                .pBufferInfo = nullptr,
+                .pTexelBufferView = nullptr,
+            },
+            VkWriteDescriptorSet{
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .pNext = nullptr,
+                .dstSet = frame.textureDescriptor,
+                .dstBinding = 19,
+                .dstArrayElement = 0,
+                .descriptorCount = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                .pImageInfo = &storageGiScratch,
                 .pBufferInfo = nullptr,
                 .pTexelBufferView = nullptr,
             },
@@ -2666,24 +2704,24 @@ std::vector<Vertex> VulkanRenderer::buildVertices(const World& world) const {
         if (grapple.attached && grapple.points.size() >= 2) {
             for (std::size_t index = 1; index < grapple.points.size(); ++index) {
                 addWorldLine(grapple.points[index - 1], grapple.points[index],
-                             0.42F * renderScale,
+                             0.42F * renderScale(),
                              {0.58F, 0.61F, 0.66F},
                              1.0F, 1.025F);
             }
         } else {
             addWorldLine(world.player().position, grapple.hookPosition,
-                         0.32F * renderScale,
+                         0.32F * renderScale(),
                          {0.50F, 0.53F, 0.58F}, 1.0F, 1.025F);
         }
         addWorldQuad(grapple.hookPosition.x, grapple.hookPosition.y,
-                     1.15F * renderScale, 1.15F * renderScale,
+                     1.15F * renderScale(), 1.15F * renderScale(),
                      {0.95F, 0.70F, 0.22F}, 1.0F, 1.035F);
     }
 
     const Player& player = world.player();
-    constexpr float playerSpriteWidth = 6.0F * renderScale;
-    constexpr float playerSpriteHeight = 12.0F * renderScale;
-    constexpr float playerCollisionHalfHeight = 4.2F * renderScale;
+    const float playerSpriteWidth = 6.0F * renderScale();
+    const float playerSpriteHeight = 12.0F * renderScale();
+    const float playerCollisionHalfHeight = 4.2F * renderScale();
     const float pixelWidth =
         playerSpriteWidth / static_cast<float>(playerSpriteWidth_);
     const float pixelHeight =
@@ -2717,12 +2755,12 @@ std::vector<Vertex> VulkanRenderer::buildVertices(const World& world) const {
     }
     for (const Projectile& bullet : world.bullets()) {
         addWorldQuad(bullet.position.x, bullet.position.y,
-                     0.7F * renderScale, 0.7F * renderScale,
+                     0.7F * renderScale(), 0.7F * renderScale(),
                      {1.0F, 0.91F, 0.45F}, 1.0F, 0.0F);
     }
     for (const Projectile& grenade : world.grenades()) {
         addWorldQuad(grenade.position.x, grenade.position.y,
-                     1.5F * renderScale, 1.5F * renderScale,
+                     1.5F * renderScale(), 1.5F * renderScale(),
                      {0.35F, 0.86F, 0.30F}, 1.0F, 0.0F);
     }
     for (const Particle& particle : world.particles()) {
@@ -2748,15 +2786,15 @@ std::vector<Vertex> VulkanRenderer::buildVertices(const World& world) const {
         const Material material = palette[index];
         const float x = camera.x +
                         (7.0F + static_cast<float>(index) * 8.0F) *
-                            renderScale;
-        const float y = camera.y + 7.0F * renderScale;
+                            renderScale();
+        const float y = camera.y + 7.0F * renderScale();
         const std::array<float, 3> border =
             material == world.selectedMaterial()
                 ? std::array<float, 3>{0.96F, 0.98F, 1.0F}
                 : std::array<float, 3>{0.10F, 0.12F, 0.16F};
-        addWorldQuad(x, y, 3.5F * renderScale, 3.5F * renderScale,
+        addWorldQuad(x, y, 3.5F * renderScale(), 3.5F * renderScale(),
                      border, 1.0F, 0.0F);
-        addWorldQuad(x, y, 2.7F * renderScale, 2.7F * renderScale,
+        addWorldQuad(x, y, 2.7F * renderScale(), 2.7F * renderScale(),
                      materialColor(material, static_cast<int>(index), 0),
                      1.0F, 0.0F);
     }
@@ -2764,15 +2802,15 @@ std::vector<Vertex> VulkanRenderer::buildVertices(const World& world) const {
     const auto addHudBar = [&](float screenX, float screenY, float barWidth,
                                float barHeight, float value,
                                std::array<float, 3> color) {
-        screenX *= renderScale;
-        screenY *= renderScale;
-        barWidth *= renderScale;
-        barHeight *= renderScale;
+        screenX *= renderScale();
+        screenY *= renderScale();
+        barWidth *= renderScale();
+        barHeight *= renderScale();
         const float clamped = std::clamp(value, 0.0F, 1.0F);
         addWorldQuad(camera.x + screenX + barWidth * 0.5F,
                      camera.y + screenY + barHeight * 0.5F,
-                     barWidth * 0.5F + 0.8F * renderScale,
-                     barHeight * 0.5F + 0.8F * renderScale,
+                     barWidth * 0.5F + 0.8F * renderScale(),
+                     barHeight * 0.5F + 0.8F * renderScale(),
                      {0.08F, 0.09F, 0.12F}, 0.92F, 0.0F);
         if (clamped > 0.0F) {
             const float filledWidth = barWidth * clamped;
@@ -3645,6 +3683,17 @@ void VulkanRenderer::recordCommands(VkCommandBuffer commandBuffer,
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0,
         nullptr, 1, &giFinalToCompute);
 
+    VkImageMemoryBarrier giScratchToCompute =
+        visibilityToCompute;
+    giScratchToCompute.image = frame.giScratchImage;
+    vkCmdPipelineBarrier(
+        commandBuffer,
+        frame.textureInitialized
+            ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT
+            : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0,
+        nullptr, 1, &giScratchToCompute);
+
     VkImageMemoryBarrier derivedToCompute = visibilityToCompute;
     derivedToCompute.image = frame.derivedImage;
     derivedToCompute.srcAccessMask =
@@ -4084,11 +4133,47 @@ void VulkanRenderer::recordCommands(VkCommandBuffer commandBuffer,
         nullptr, static_cast<std::uint32_t>(giToFilter.size()),
         giToFilter.data());
 
-    TracePush filterPush = tracePush;
-    filterPush.originAndOptions[2] |= 2;
     vkCmdWriteTimestamp(commandBuffer,
                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                         frame.rayTimingQueryPool, denoiseTimingStart);
+    if (rayTracingSettings_.giRays < 6) {
+        TracePush prefilterPush = tracePush;
+        prefilterPush.originAndOptions[2] =
+            static_cast<std::int32_t>(
+                static_cast<std::uint32_t>(
+                    prefilterPush.originAndOptions[2]) |
+                0x80000000U);
+        vkCmdPushConstants(commandBuffer, computePipelineLayout_,
+                           VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                           sizeof(prefilterPush), &prefilterPush);
+        vkCmdDispatch(commandBuffer, (lightingWidth + 7U) / 8U,
+                      (lightingHeight + 7U) / 8U, 1);
+        const VkImageMemoryBarrier horizontalGiToVertical{
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .pNext = nullptr,
+            .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+            .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
+            .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = frame.giScratchImage,
+            .subresourceRange = {
+                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .baseMipLevel = 0,
+                .levelCount = 1,
+                .baseArrayLayer = 0,
+                .layerCount = 1,
+            },
+        };
+        vkCmdPipelineBarrier(
+            commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0,
+            nullptr, 1, &horizontalGiToVertical);
+    }
+
+    TracePush filterPush = tracePush;
+    filterPush.originAndOptions[2] |= 2;
     vkCmdPushConstants(commandBuffer, computePipelineLayout_,
                        VK_SHADER_STAGE_COMPUTE_BIT, 0,
                        sizeof(filterPush), &filterPush);
@@ -4273,7 +4358,7 @@ void VulkanRenderer::recordCommands(VkCommandBuffer commandBuffer,
             rayTracingSettings_.liquidMetaballNormalStrength,
             packNormalizedPair(
                 rayTracingSettings_.liquidCausticStrength, 3.0F,
-                rayTracingSettings_.liquidDispersionStrength, 2.0F),
+                0.0F, 1.0F),
         },
     };
     vkCmdPushConstants(commandBuffer, cellPipelineLayout_,
@@ -4319,9 +4404,12 @@ void VulkanRenderer::recordCommands(VkCommandBuffer commandBuffer,
 }
 
 void VulkanRenderer::draw(World& world) {
+    using RenderClock = std::chrono::steady_clock;
+    const auto drawBegin = RenderClock::now();
     // Material state is persistent on the CPU-facing world grid. Consume the
     // previous compute result before uploading the next active region.
     synchronizeMaterialSimulation(world);
+    const auto synchronizeEnd = RenderClock::now();
     FrameResources& frame = frames_[currentFrame_];
     check(vkWaitForFences(device_, 1, &frame.inFlight, VK_TRUE, UINT64_MAX),
           "vkWaitForFences");
@@ -4392,6 +4480,7 @@ void VulkanRenderer::draw(World& world) {
     if (acquireResult != VK_SUCCESS && acquireResult != VK_SUBOPTIMAL_KHR) {
         check(acquireResult, "vkAcquireNextImageKHR");
     }
+    const auto frameWaitEnd = RenderClock::now();
 
     const std::uint64_t particleTicks = SDL_GetTicks64();
     if (lastDayCycleTicks_ != 0 &&
@@ -4413,6 +4502,31 @@ void VulkanRenderer::draw(World& world) {
     const Vec2 camera = world.renderCameraTopLeft();
     const CelestialState currentCelestial =
         celestialState(rayTracingSettings_);
+    const auto mergeDirtyRegion =
+        [](SolidDirtyRegion& destination,
+           const SolidDirtyRegion& source) {
+            if (!source.valid()) {
+                return;
+            }
+            if (!destination.valid()) {
+                destination = source;
+                return;
+            }
+            destination.minX =
+                std::min(destination.minX, source.minX);
+            destination.minY =
+                std::min(destination.minY, source.minY);
+            destination.maxX =
+                std::max(destination.maxX, source.maxX);
+            destination.maxY =
+                std::max(destination.maxY, source.maxY);
+        };
+    const SolidDirtyRegion changedSolidRegion =
+        world.consumeSolidDirtyRegion();
+    mergeDirtyRegion(
+        pendingSunSolidDirty_, changedSolidRegion);
+    mergeDirtyRegion(
+        pendingSkySolidDirty_, changedSolidRegion);
     const std::int32_t currentLightingOriginX =
         static_cast<std::int32_t>(std::floor(camera.x));
     const std::int32_t currentLightingOriginY =
@@ -4495,30 +4609,157 @@ void VulkanRenderer::draw(World& world) {
     const bool sunCacheThrottleExpired =
         !sunVisibilityCacheValid_ ||
         particleTicks - lastSunOcclusionTicks_ >= 33;
-    if ((!sunVisibilityCacheValid_ ||
+    const bool incrementalSunRebuild =
+        sunVisibilityCacheValid_ &&
+        solidFieldChanged &&
+        !sunDirectionChanged &&
+        !sunReceiverMoved &&
+        pendingSunSolidDirty_.valid();
+    const bool rebuildSunHorizon =
+        (!sunVisibilityCacheValid_ ||
          sunDirectionChanged || solidFieldChanged ||
          sunReceiverMoved) &&
-        sunCacheThrottleExpired) {
+        sunCacheThrottleExpired;
+    const std::int32_t requestedSkyRayCount =
+        std::clamp(rayTracingSettings_.skyRays, 1, 9);
+    const bool skySolidFieldChanged =
+        cachedSkySolidRevision_ != world.solidRevision();
+    const bool skyReceiverMoved =
+        !skyVisibilityCacheValid_ ||
+        std::abs(camera.x - cachedSkyCamera_.x) >
+            static_cast<float>(World::viewWidth) * 0.25F ||
+        std::abs(camera.y - cachedSkyCamera_.y) >
+            static_cast<float>(World::viewHeight) * 0.25F;
+    const bool skyRayCountChanged =
+        cachedSkyRayCount_ != requestedSkyRayCount;
+    const bool skyCacheThrottleExpired =
+        !skyVisibilityCacheValid_ ||
+        particleTicks - lastSkyOcclusionTicks_ >= 100;
+    const bool incrementalSkyRebuild =
+        skyVisibilityCacheValid_ &&
+        skySolidFieldChanged &&
+        !skyReceiverMoved &&
+        !skyRayCountChanged &&
+        pendingSkySolidDirty_.valid();
+    const bool rebuildSkyHorizons =
+        rayTracingSettings_.skyLightIntensity > 0.0001F &&
+        (!skyVisibilityCacheValid_ ||
+         skySolidFieldChanged || skyReceiverMoved ||
+         skyRayCountChanged) &&
+        skyCacheThrottleExpired;
+    float sunHorizonBuildMs = 0.0F;
+    float skyHorizonBuildMs = 0.0F;
+    if (rebuildSunHorizon || rebuildSkyHorizons) {
         const Vec2 receiverMargin{
             static_cast<float>(World::viewWidth) * 0.5F,
             static_cast<float>(World::viewHeight) * 0.5F,
         };
-        world.buildDirectionalSunHorizon(
-            currentCelestial.sunDirection,
-            sunHorizonSamplesPerCell,
-            sunHorizonDepths_,
-            sunHorizonBlockers_,
-            sunHorizonMinimum_,
-            camera - receiverMargin,
-            camera + Vec2{
-                static_cast<float>(World::viewWidth),
-                static_cast<float>(World::viewHeight),
-            } + receiverMargin);
+        if (rebuildSkyHorizons) {
+            skyHorizons_.resize(
+                static_cast<std::size_t>(
+                    requestedSkyRayCount));
+        }
+        constexpr float maximumSkyAngle =
+            80.0F / 360.0F * tau;
+        const std::size_t sunTaskCount =
+            rebuildSunHorizon ? 1U : 0U;
+        const std::size_t skyTaskCount =
+            rebuildSkyHorizons
+                ? static_cast<std::size_t>(
+                      requestedSkyRayCount)
+                : 0U;
+        std::vector<float> skyRayBuildMilliseconds(
+            skyTaskCount, 0.0F);
+        // Solid edits invalidate both fields together. Submit the sun and all
+        // sky directions as one batch so a bullet impact pays the cost of the
+        // slowest horizon instead of the sum of two global rebuilds.
+        renderWorkerExecutor_.run(
+            sunTaskCount + skyTaskCount,
+            [&](std::size_t taskIndex) {
+                const auto horizonBegin =
+                    RenderClock::now();
+                if (rebuildSunHorizon && taskIndex == 0) {
+                    world.buildDirectionalSunHorizon(
+                        currentCelestial.sunDirection,
+                        sunHorizonSamplesPerCell,
+                        sunHorizonDepths_,
+                        sunHorizonBlockers_,
+                        sunHorizonMinimum_,
+                        camera - receiverMargin,
+                        camera + Vec2{
+                            static_cast<float>(
+                                World::viewWidth),
+                            static_cast<float>(
+                                World::viewHeight),
+                        } + receiverMargin,
+                        incrementalSunRebuild
+                            ? &pendingSunSolidDirty_
+                            : nullptr,
+                        true);
+                    sunHorizonBuildMs =
+                        std::chrono::duration<float, std::milli>(
+                            RenderClock::now() - horizonBegin)
+                            .count();
+                    return;
+                }
+                const std::size_t rayIndex =
+                    taskIndex - sunTaskCount;
+                const float sample =
+                    requestedSkyRayCount == 1
+                        ? 0.5F
+                        : static_cast<float>(rayIndex) /
+                              static_cast<float>(
+                                  requestedSkyRayCount - 1);
+                const float angle =
+                    -maximumSkyAngle +
+                    sample * maximumSkyAngle * 2.0F;
+                DirectionalHorizon& horizon =
+                    skyHorizons_[rayIndex];
+                horizon.direction = {
+                    std::sin(angle),
+                    -std::cos(angle),
+                };
+                world.buildDirectionalSunHorizon(
+                    horizon.direction,
+                    skyHorizonSamplesPerCell,
+                    horizon.depths,
+                    horizon.blockers,
+                    horizon.minimumPerpendicularCoordinate,
+                    camera - receiverMargin,
+                    camera + Vec2{
+                        static_cast<float>(World::viewWidth),
+                        static_cast<float>(World::viewHeight),
+                    } + receiverMargin,
+                    incrementalSkyRebuild
+                        ? &pendingSkySolidDirty_
+                        : nullptr);
+                skyRayBuildMilliseconds[rayIndex] =
+                    std::chrono::duration<float, std::milli>(
+                        RenderClock::now() - horizonBegin)
+                        .count();
+            });
+        if (!skyRayBuildMilliseconds.empty()) {
+            skyHorizonBuildMs =
+                *std::max_element(
+                    skyRayBuildMilliseconds.begin(),
+                    skyRayBuildMilliseconds.end());
+        }
+    }
+    if (rebuildSunHorizon) {
         cachedSunDirection_ = currentCelestial.sunDirection;
         cachedSunCamera_ = camera;
         cachedSunSolidRevision_ = world.solidRevision();
         lastSunOcclusionTicks_ = particleTicks;
         sunVisibilityCacheValid_ = true;
+        pendingSunSolidDirty_ = {};
+    }
+    if (rebuildSkyHorizons) {
+        cachedSkyCamera_ = camera;
+        cachedSkySolidRevision_ = world.solidRevision();
+        cachedSkyRayCount_ = requestedSkyRayCount;
+        lastSkyOcclusionTicks_ = particleTicks;
+        skyVisibilityCacheValid_ = true;
+        pendingSkySolidDirty_ = {};
     }
     if (lastParticleTicks_ != 0) {
         particleDeltaTime_ = std::clamp(
@@ -4526,6 +4767,7 @@ void VulkanRenderer::draw(World& world) {
             0.0F, 0.05F);
     }
     lastParticleTicks_ = particleTicks;
+    const auto directionalCacheEnd = RenderClock::now();
     uploadParticleSpawns(frame, world);
     prepareMaterialSimulation(world);
 
@@ -4610,6 +4852,7 @@ void VulkanRenderer::draw(World& world) {
           "vkMapMemory");
     std::memcpy(mapped, vertices.data(), static_cast<std::size_t>(byteCount));
     vkUnmapMemory(device_, frame.vertexMemory);
+    const auto sceneBuildEnd = RenderClock::now();
 
     const VkDeviceSize textureBytes =
         static_cast<VkDeviceSize>(textureWidth) *
@@ -4622,47 +4865,124 @@ void VulkanRenderer::draw(World& world) {
     GpuOccupancyHierarchy occupancy{};
     const int originX = static_cast<int>(std::floor(camera.x));
     const int originY = static_cast<int>(std::floor(camera.y));
-    std::array<int, textureWidth + 2U> visibleSkyOccluders{};
+    std::vector<int> visibleSkyOccluders(
+        static_cast<std::size_t>(textureWidth) + 2U, 0);
     for (std::size_t index = 0;
          index < visibleSkyOccluders.size(); ++index) {
         visibleSkyOccluders[index] =
             world.skyOccluderY(
                 originX + static_cast<int>(index) - 1);
     }
-    const auto sunBlockedAt =
-        [&](float sampleX, float sampleY,
+    const auto directionalBlockedAt =
+        [&](Vec2 direction,
+            const std::vector<float>& depths,
+            const std::vector<std::int32_t>& blockers,
+            float minimumPerpendicularCoordinate,
+            float samplesPerCell,
+            float sampleX, float sampleY,
             std::int32_t receiverIndex) {
             const float perpendicular =
-                -cachedSunDirection_.y * sampleX +
-                cachedSunDirection_.x * sampleY;
+                -direction.y * sampleX +
+                direction.x * sampleY;
             const int sample = static_cast<int>(std::floor(
-                (perpendicular - sunHorizonMinimum_) *
-                sunHorizonSamplesPerCell));
+                (perpendicular -
+                 minimumPerpendicularCoordinate) *
+                samplesPerCell));
             if (sample < 0 ||
                 sample >=
-                    static_cast<int>(sunHorizonBlockers_.size())) {
+                    static_cast<int>(blockers.size())) {
                 return false;
             }
             const std::size_t sampleIndex =
                 static_cast<std::size_t>(sample);
             const std::int32_t blocker =
-                sunHorizonBlockers_[sampleIndex];
+                blockers[sampleIndex];
             if (blocker < 0 || blocker == receiverIndex) {
                 return false;
             }
             const float receiverDepth =
-                cachedSunDirection_.x * sampleX +
-                cachedSunDirection_.y * sampleY;
-            return sunHorizonDepths_[sampleIndex] >
+                direction.x * sampleX +
+                direction.y * sampleY;
+            return depths[sampleIndex] >
                    receiverDepth + 0.001F;
         };
+    const auto sunBlockedAt =
+        [&](float sampleX, float sampleY,
+            std::int32_t receiverIndex) {
+            return directionalBlockedAt(
+                cachedSunDirection_,
+                sunHorizonDepths_,
+                sunHorizonBlockers_,
+                sunHorizonMinimum_,
+                sunHorizonSamplesPerCell,
+                sampleX, sampleY, receiverIndex);
+        };
+    const auto skyVisibilityAt =
+        [&](float centerX, float centerY,
+            bool receiverIsSolid,
+            std::int32_t receiverIndex) {
+            if (!skyVisibilityCacheValid_ ||
+                skyHorizons_.empty()) {
+                return 0.0F;
+            }
+            constexpr float faceOffset =
+                0.5F +
+                0.5F / skyHorizonSamplesPerCell +
+                0.001F;
+            float visibleRays = 0.0F;
+            for (const DirectionalHorizon& horizon :
+                 skyHorizons_) {
+                const float sampleX =
+                    centerX +
+                    (receiverIsSolid
+                         ? horizon.direction.x *
+                               faceOffset
+                         : 0.0F);
+                const float sampleY =
+                    centerY +
+                    (receiverIsSolid
+                         ? horizon.direction.y *
+                               faceOffset
+                         : 0.0F);
+                if (!directionalBlockedAt(
+                        horizon.direction,
+                        horizon.depths,
+                        horizon.blockers,
+                        horizon.minimumPerpendicularCoordinate,
+                        skyHorizonSamplesPerCell,
+                        sampleX, sampleY,
+                        receiverIndex)) {
+                    visibleRays += 1.0F;
+                }
+            }
+            return visibleRays /
+                   static_cast<float>(
+                       skyHorizons_.size());
+        };
 
-    for (std::uint32_t textureY = 0; textureY < textureHeight; ++textureY) {
-        const int worldY = std::clamp(
-            originY + static_cast<int>(textureY), 0, World::height - 1);
-        const std::size_t rowStart =
-            static_cast<std::size_t>(worldY) * World::width;
-        for (std::uint32_t textureX = 0; textureX < textureWidth; ++textureX) {
+    // Each job owns one complete occupancy-block row. This keeps material
+    // pixels and the matching occupancy bytes disjoint while spreading the
+    // expensive whole-world sun/skylight horizon lookups across the persistent
+    // worker group. The packed texture is bit-for-bit identical to the serial
+    // path; only its construction is parallel.
+    renderWorkerExecutor_.run(
+        occupancyRows,
+        [&](std::size_t blockRowIndex) {
+            const std::uint32_t firstTextureY =
+                static_cast<std::uint32_t>(blockRowIndex) *
+                occupancyBlockSize;
+            const std::uint32_t lastTextureY =
+                std::min(firstTextureY + occupancyBlockSize,
+                         textureHeight);
+            for (std::uint32_t textureY = firstTextureY;
+                 textureY < lastTextureY; ++textureY) {
+                const int worldY = std::clamp(
+                    originY + static_cast<int>(textureY),
+                    0, World::height - 1);
+                const std::size_t rowStart =
+                    static_cast<std::size_t>(worldY) * World::width;
+                for (std::uint32_t textureX = 0;
+                     textureX < textureWidth; ++textureX) {
             const int worldX = std::clamp(
                 originX + static_cast<int>(textureX), 0, World::width - 1);
             const std::size_t worldIndex =
@@ -4764,13 +5084,22 @@ void VulkanRenderer::draw(World& world) {
                         static_cast<std::int32_t>(worldIndex));
                 }
             }
-            const std::uint8_t worldSun =
-                sunlit ? 255 : 0;
-            const std::uint8_t packedSun7 =
+            const float skyVisibility =
+                skyVisibilityAt(
+                    centerX, centerY,
+                    receiverIsSolid,
+                    static_cast<std::int32_t>(
+                        worldIndex));
+            const std::uint8_t packedSky7 =
                 static_cast<std::uint8_t>(
-                    (static_cast<unsigned>(worldSun) * 127U + 127U) /
-                    255U);
-            texturePixels[textureIndex + 3] = packedSun7;
+                    std::lround(
+                        std::clamp(
+                            skyVisibility, 0.0F, 1.0F) *
+                        127.0F));
+            texturePixels[textureIndex + 3] =
+                static_cast<std::uint8_t>(
+                    (packedSky7 << 1U) |
+                    (sunlit ? 1U : 0U));
 
             const std::size_t skyColumn =
                 static_cast<std::size_t>(textureX) + 1U;
@@ -4778,28 +5107,6 @@ void VulkanRenderer::draw(World& world) {
                 worldY < visibleSkyOccluders[skyColumn] ||
                 (receiverIsSolid &&
                  worldY == visibleSkyOccluders[skyColumn]);
-            const bool leftOpenToSky =
-                worldX > 0 &&
-                worldY <
-                    visibleSkyOccluders[skyColumn - 1U] &&
-                !isSunOccluder(
-                    world.materials()[worldIndex - 1U]);
-            const bool rightOpenToSky =
-                worldX + 1 < World::width &&
-                worldY <
-                    visibleSkyOccluders[skyColumn + 1U] &&
-                !isSunOccluder(
-                    world.materials()[worldIndex + 1U]);
-            const bool skyLightExposed =
-                verticallyOpenToSky ||
-                leftOpenToSky || rightOpenToSky;
-            const bool liquid =
-                material == Material::water ||
-                material == Material::oil;
-            if (skyLightExposed && !liquid) {
-                texturePixels[textureIndex + 3] |= 0x80U;
-            }
-
             if (material == Material::air) {
                 if (verticallyOpenToSky &&
                     !world.hasInteriorBackdrop(worldX, worldY)) {
@@ -4847,18 +5154,22 @@ void VulkanRenderer::draw(World& world) {
                          world.liquidFoam()[worldIndex]) +
                      18U) /
                     36U);
-            const std::uint8_t packedSun4 =
+            const std::uint8_t packedSky4 =
                 static_cast<std::uint8_t>(
-                    (static_cast<unsigned>(worldSun) + 8U) /
-                    17U);
+                    std::lround(
+                        std::clamp(
+                            skyVisibility, 0.0F, 1.0F) *
+                        15.0F));
             texturePixels[textureIndex + 3] =
                 static_cast<std::uint8_t>(
-                    (skyLightExposed ? 0x80U : 0U) |
-                    ((packedFoam & 0x07U) << 4U) |
-                    packedSun4);
-        }
-    }
+                    (packedSky4 << 4U) |
+                    ((packedFoam & 0x07U) << 1U) |
+                    (sunlit ? 1U : 0U));
+                }
+            }
+        });
     vkUnmapMemory(device_, frame.textureStagingMemory);
+    const auto materialTextureEnd = RenderClock::now();
     for (std::uint32_t largeY = 0;
          largeY < occupancyLargeRows; ++largeY) {
         for (std::uint32_t largeX = 0;
@@ -4902,17 +5213,29 @@ void VulkanRenderer::draw(World& world) {
         }
     }
     void* occupancyMapped = nullptr;
+    const VkDeviceSize occupancyBytes =
+        occupancyHierarchyBytes();
     check(vkMapMemory(device_, frame.occupancyMemory, 0,
-                      sizeof(occupancy), 0, &occupancyMapped),
+                      occupancyBytes, 0, &occupancyMapped),
           "vkMapMemory occupancy hierarchy");
-    std::memcpy(occupancyMapped, &occupancy,
-                sizeof(occupancy));
+    auto* occupancyWords =
+        static_cast<std::uint32_t*>(occupancyMapped);
+    std::copy(
+        occupancy.dimensions.begin(),
+        occupancy.dimensions.end(),
+        occupancyWords);
+    std::copy(
+        occupancy.occupied.begin(),
+        occupancy.occupied.end(),
+        occupancyWords + occupancy.dimensions.size());
     vkUnmapMemory(device_, frame.occupancyMemory);
+    const auto occupancyEnd = RenderClock::now();
 
     check(vkResetFences(device_, 1, &frame.inFlight), "vkResetFences");
     check(vkResetCommandBuffer(frame.commandBuffer, 0), "vkResetCommandBuffer");
     recordCommands(frame.commandBuffer, imageIndex,
                    static_cast<std::uint32_t>(vertices.size()), world);
+    const auto commandRecordEnd = RenderClock::now();
 
     constexpr VkPipelineStageFlags waitStage =
         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
@@ -4952,7 +5275,103 @@ void VulkanRenderer::draw(World& world) {
     } else {
         check(presentResult, "vkQueuePresentKHR");
     }
+    const auto presentEnd = RenderClock::now();
+    const auto milliseconds = [](auto begin, auto end) {
+        return std::chrono::duration<float, std::milli>(
+                   end - begin)
+            .count();
+    };
+    const CpuRenderTimings sample{
+        .totalMs = milliseconds(drawBegin, presentEnd),
+        .synchronizeMs =
+            milliseconds(drawBegin, synchronizeEnd),
+        .frameWaitMs =
+            milliseconds(synchronizeEnd, frameWaitEnd),
+        .directionalCacheMs =
+            milliseconds(frameWaitEnd, directionalCacheEnd),
+        .sunHorizonMs = sunHorizonBuildMs,
+        .skyHorizonMs = skyHorizonBuildMs,
+        .sceneBuildMs =
+            milliseconds(directionalCacheEnd, sceneBuildEnd),
+        .materialTextureMs =
+            milliseconds(sceneBuildEnd, materialTextureEnd),
+        .occupancyMs =
+            milliseconds(materialTextureEnd, occupancyEnd),
+        .commandRecordMs =
+            milliseconds(occupancyEnd, commandRecordEnd),
+        .submitPresentMs =
+            milliseconds(commandRecordEnd, presentEnd),
+        .valid = true,
+    };
+    constexpr float cpuTimingBlend = 0.10F;
+    if (!cpuRenderTimings_.valid) {
+        cpuRenderTimings_ = sample;
+    } else {
+        const auto blend = [&](float& value, float next) {
+            value += (next - value) * cpuTimingBlend;
+        };
+        blend(cpuRenderTimings_.totalMs, sample.totalMs);
+        blend(cpuRenderTimings_.synchronizeMs,
+              sample.synchronizeMs);
+        blend(cpuRenderTimings_.frameWaitMs,
+              sample.frameWaitMs);
+        blend(cpuRenderTimings_.directionalCacheMs,
+              sample.directionalCacheMs);
+        blend(cpuRenderTimings_.sunHorizonMs,
+              sample.sunHorizonMs);
+        blend(cpuRenderTimings_.skyHorizonMs,
+              sample.skyHorizonMs);
+        blend(cpuRenderTimings_.sceneBuildMs,
+              sample.sceneBuildMs);
+        blend(cpuRenderTimings_.materialTextureMs,
+              sample.materialTextureMs);
+        blend(cpuRenderTimings_.occupancyMs,
+              sample.occupancyMs);
+        blend(cpuRenderTimings_.commandRecordMs,
+              sample.commandRecordMs);
+        blend(cpuRenderTimings_.submitPresentMs,
+              sample.submitPresentMs);
+    }
     currentFrame_ = (currentFrame_ + 1) % framesInFlight;
+}
+
+void VulkanRenderer::configureGridDimensions() {
+    textureWidth =
+        static_cast<std::uint32_t>(World::viewWidth + 2);
+    textureHeight =
+        static_cast<std::uint32_t>(World::viewHeight + 2);
+    lightingWidth =
+        (textureWidth + lightingResolutionScale - 1) /
+        lightingResolutionScale;
+    lightingHeight =
+        (textureHeight + lightingResolutionScale - 1) /
+        lightingResolutionScale;
+    lightTileColumns =
+        (lightingWidth + lightTileSize - 1) / lightTileSize;
+    lightTileRows =
+        (lightingHeight + lightTileSize - 1) / lightTileSize;
+    lightTileCount = lightTileColumns * lightTileRows;
+    occupancyColumns =
+        (textureWidth + occupancyBlockSize - 1) /
+        occupancyBlockSize;
+    occupancyRows =
+        (textureHeight + occupancyBlockSize - 1) /
+        occupancyBlockSize;
+    occupancyLargeColumns =
+        (textureWidth + occupancyLargeBlockSize - 1) /
+        occupancyLargeBlockSize;
+    occupancyLargeRows =
+        (textureHeight + occupancyLargeBlockSize - 1) /
+        occupancyLargeBlockSize;
+    occupancyBlockCount = occupancyColumns * occupancyRows;
+    occupancyLargeBlockCount =
+        occupancyLargeColumns * occupancyLargeRows;
+}
+
+VkDeviceSize VulkanRenderer::occupancyHierarchyBytes() {
+    return static_cast<VkDeviceSize>(sizeof(std::uint32_t)) *
+           (4U + static_cast<VkDeviceSize>(occupancyBlockCount) +
+            static_cast<VkDeviceSize>(occupancyLargeBlockCount));
 }
 
 void VulkanRenderer::destroySwapchain() {

@@ -1045,7 +1045,7 @@ void main() {
 
     if (material == 4 || material == 5) {
         float fill = float(data.g) / 255.0;
-        float foam = float((data.a >> 4u) & 7u) / 7.0;
+        float foam = float((data.a >> 1u) & 7u) / 7.0;
         vec2 flow =
             metaballLiquidPixel
                 ? metaballFlow
@@ -1360,8 +1360,6 @@ void main() {
         unpackNormalizedPair(camera.fluidMotion.w);
     float liquidCausticStrength =
         packedLiquidEffects.x * 3.0;
-    float liquidDispersionStrength =
-        packedLiquidEffects.y * 2.0;
     float liquidDepth = 0.0;
     vec3 liquidTransmission = vec3(1.0);
     if (isLiquidMaterial(material)) {
@@ -1732,23 +1730,6 @@ void main() {
             liquidScatterDepth *
             (material == 4u ? 0.055 : 0.12);
 
-        float spectralPhase =
-            absoluteWorldPosition.x * 0.34 +
-            absoluteWorldPosition.y * 0.11 +
-            camera.time * 0.12;
-        vec3 spectralColor =
-            0.5 + 0.5 *
-                cos(vec3(0.0, 2.0944, 4.1888) +
-                    spectralPhase);
-        float dispersionScale =
-            material == 5u ? 0.18 : 0.065;
-        specularLighting +=
-            environmentRadiance *
-            spectralColor *
-            liquidDispersionStrength *
-            dispersionScale *
-            shadingSurfaceWeight *
-            (0.24 + fresnel * 0.76);
     }
 
     // The GPU-derived field supplies smoothly averaged local/room density.
@@ -1799,7 +1780,7 @@ void main() {
         // wavelength-dependent transmission. Water adds no opaque blue
         // diffuse body; its blue appearance emerges only as red and green
         // light are absorbed with increasing depth.
-        float refractiveVariation =
+        float transmissionVariation =
             mix(0.96, 1.04,
                 smoothNoise(
                     absoluteWorldPosition *
@@ -1808,11 +1789,11 @@ void main() {
                          -camera.time * 0.009)));
         vec3 emptyRoomColor =
             palette(0u, worldCell) * illumination;
-        vec3 refractedRoom =
+        vec3 transmittedRoom =
             emptyRoomColor *
             liquidTransmission *
-            refractiveVariation;
-        vec3 liquidBody = refractedRoom;
+            transmissionVariation;
+        vec3 liquidBody = transmittedRoom;
         if (material == 5u) {
             // Oil contains suspended pigment and remains visibly denser than
             // clear water, but even it approaches opacity gradually.
@@ -1821,7 +1802,7 @@ void main() {
             float oilOpacity =
                 clamp(oilDepthResponse * 0.64, 0.0, 0.76);
             liquidBody = mix(
-                refractedRoom,
+                transmittedRoom,
                 baseColor * illumination * 0.30,
                 oilOpacity);
         }

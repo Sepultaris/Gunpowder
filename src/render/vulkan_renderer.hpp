@@ -1,5 +1,6 @@
 #pragma once
 
+#include "game/parallel_executor.hpp"
 #include "game/world.hpp"
 
 #include <SDL.h>
@@ -62,6 +63,7 @@ struct RayTracingSettings {
     float sunShadowSoftness = 0.018F;
     float skyIntensity = 0.90F;
     float skyLightIntensity = 0.16F;
+    int skyRays = 5;
 
     float ambientIntensity = 0.002F;
     float daylightAmbientIntensity = 0.018F;
@@ -88,7 +90,6 @@ struct RayTracingSettings {
     float liquidReflectionStrength = 1.0F;
     float liquidSubsurfaceStrength = 0.68F;
     float liquidCausticStrength = 0.55F;
-    float liquidDispersionStrength = 0.24F;
 };
 
 struct GpuRayTimings {
@@ -97,6 +98,21 @@ struct GpuRayTimings {
     float globalIlluminationMs = 0.0F;
     float denoisingMs = 0.0F;
     float totalMs = 0.0F;
+    bool valid = false;
+};
+
+struct CpuRenderTimings {
+    float totalMs = 0.0F;
+    float synchronizeMs = 0.0F;
+    float frameWaitMs = 0.0F;
+    float directionalCacheMs = 0.0F;
+    float sunHorizonMs = 0.0F;
+    float skyHorizonMs = 0.0F;
+    float sceneBuildMs = 0.0F;
+    float materialTextureMs = 0.0F;
+    float occupancyMs = 0.0F;
+    float commandRecordMs = 0.0F;
+    float submitPresentMs = 0.0F;
     bool valid = false;
 };
 
@@ -125,48 +141,34 @@ public:
     [[nodiscard]] const GpuRayTimings& gpuRayTimings() const {
         return gpuRayTimings_;
     }
+    [[nodiscard]] const CpuRenderTimings& cpuRenderTimings() const {
+        return cpuRenderTimings_;
+    }
 
 private:
     static constexpr std::size_t framesInFlight = 2;
     static constexpr VkDeviceSize vertexBufferBytes = 16U * 1024U * 1024U;
-    static constexpr std::uint32_t textureWidth = World::viewWidth + 2;
-    static constexpr std::uint32_t textureHeight = World::viewHeight + 2;
+    inline static std::uint32_t textureWidth = 962;
+    inline static std::uint32_t textureHeight = 542;
     // Lighting matches the material grid exactly. Display resolution remains
     // independent and can upscale both fields together.
     static constexpr std::uint32_t lightingResolutionScale = 1;
-    static constexpr std::uint32_t lightingWidth =
-        (textureWidth + lightingResolutionScale - 1) /
-        lightingResolutionScale;
-    static constexpr std::uint32_t lightingHeight =
-        (textureHeight + lightingResolutionScale - 1) /
-        lightingResolutionScale;
+    inline static std::uint32_t lightingWidth = 962;
+    inline static std::uint32_t lightingHeight = 542;
     static constexpr std::uint32_t maximumGpuParticles = 16'384;
     static constexpr std::size_t maximumFireLights = 64;
     static constexpr std::uint32_t lightTileSize = 8;
-    static constexpr std::uint32_t lightTileColumns =
-        (lightingWidth + lightTileSize - 1) / lightTileSize;
-    static constexpr std::uint32_t lightTileRows =
-        (lightingHeight + lightTileSize - 1) / lightTileSize;
-    static constexpr std::uint32_t lightTileCount =
-        lightTileColumns * lightTileRows;
+    inline static std::uint32_t lightTileColumns = 121;
+    inline static std::uint32_t lightTileRows = 68;
+    inline static std::uint32_t lightTileCount = 8228;
     static constexpr std::uint32_t occupancyBlockSize = 8;
     static constexpr std::uint32_t occupancyLargeBlockSize = 32;
-    static constexpr std::uint32_t occupancyColumns =
-        (textureWidth + occupancyBlockSize - 1) /
-        occupancyBlockSize;
-    static constexpr std::uint32_t occupancyRows =
-        (textureHeight + occupancyBlockSize - 1) /
-        occupancyBlockSize;
-    static constexpr std::uint32_t occupancyLargeColumns =
-        (textureWidth + occupancyLargeBlockSize - 1) /
-        occupancyLargeBlockSize;
-    static constexpr std::uint32_t occupancyLargeRows =
-        (textureHeight + occupancyLargeBlockSize - 1) /
-        occupancyLargeBlockSize;
-    static constexpr std::uint32_t occupancyBlockCount =
-        occupancyColumns * occupancyRows;
-    static constexpr std::uint32_t occupancyLargeBlockCount =
-        occupancyLargeColumns * occupancyLargeRows;
+    inline static std::uint32_t occupancyColumns = 121;
+    inline static std::uint32_t occupancyRows = 68;
+    inline static std::uint32_t occupancyLargeColumns = 31;
+    inline static std::uint32_t occupancyLargeRows = 17;
+    inline static std::uint32_t occupancyBlockCount = 8228;
+    inline static std::uint32_t occupancyLargeBlockCount = 527;
     // Legacy pressure-wave compute storage. The authoritative Noita-style
     // material solver is CPU cellular and does not use this allocation.
     static constexpr std::uint32_t maximumSimulationWidth = 768;
@@ -203,6 +205,9 @@ private:
         VkImage giFinalImage = VK_NULL_HANDLE;
         VkDeviceMemory giFinalMemory = VK_NULL_HANDLE;
         VkImageView giFinalView = VK_NULL_HANDLE;
+        VkImage giScratchImage = VK_NULL_HANDLE;
+        VkDeviceMemory giScratchMemory = VK_NULL_HANDLE;
+        VkImageView giScratchView = VK_NULL_HANDLE;
         VkBuffer particleSpawnBuffer = VK_NULL_HANDLE;
         VkDeviceMemory particleSpawnMemory = VK_NULL_HANDLE;
         VkBuffer sceneLightBuffer = VK_NULL_HANDLE;
@@ -267,11 +272,15 @@ private:
             occupancyLargeColumns,
             occupancyLargeRows,
         };
-        std::array<std::uint32_t,
-                   occupancyBlockCount +
-                       occupancyLargeBlockCount>
-            occupied{};
+        std::vector<std::uint32_t> occupied =
+            std::vector<std::uint32_t>(
+                static_cast<std::size_t>(occupancyBlockCount) +
+                static_cast<std::size_t>(occupancyLargeBlockCount),
+                0U);
     };
+
+    static void configureGridDimensions();
+    [[nodiscard]] static VkDeviceSize occupancyHierarchyBytes();
 
     void createInstance();
     void createSurface();
@@ -344,10 +353,18 @@ private:
     std::uint64_t lastParticleTicks_ = 0;
     std::uint64_t lastDayCycleTicks_ = 0;
     std::uint64_t lastSunOcclusionTicks_ = 0;
+    std::uint64_t lastSkyOcclusionTicks_ = 0;
     std::uint64_t lastSunTransmittanceTicks_ = 0;
     std::uint64_t cachedSunSolidRevision_ =
         std::numeric_limits<std::uint64_t>::max();
+    SolidDirtyRegion pendingSunSolidDirty_{};
     Vec2 cachedSunCamera_{};
+    std::uint64_t cachedSkySolidRevision_ =
+        std::numeric_limits<std::uint64_t>::max();
+    SolidDirtyRegion pendingSkySolidDirty_{};
+    Vec2 cachedSkyCamera_{};
+    std::int32_t cachedSkyRayCount_ = 0;
+    bool skyVisibilityCacheValid_ = false;
     Vec2 sunTransmittanceDirection_{};
     std::int32_t sunTransmittanceOriginX_ = 0;
     std::int32_t sunTransmittanceOriginY_ = 0;
@@ -397,6 +414,13 @@ private:
     std::vector<float> sunHorizonDepths_;
     std::vector<std::int32_t> sunHorizonBlockers_;
     float sunHorizonMinimum_ = 0.0F;
+    struct DirectionalHorizon {
+        Vec2 direction{};
+        std::vector<float> depths;
+        std::vector<std::int32_t> blockers;
+        float minimumPerpendicularCoordinate = 0.0F;
+    };
+    std::vector<DirectionalHorizon> skyHorizons_;
     Vec2 cachedSunDirection_{};
     bool sunVisibilityCacheValid_ = false;
     int playerSpriteWidth_ = 0;
@@ -404,6 +428,8 @@ private:
     bool imguiInitialized_ = false;
     float timestampPeriodNanoseconds_ = 1.0F;
     GpuRayTimings gpuRayTimings_{};
+    CpuRenderTimings cpuRenderTimings_{};
+    ParallelExecutor renderWorkerExecutor_{};
 };
 
 } // namespace gunpowder
